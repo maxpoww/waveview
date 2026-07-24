@@ -1,0 +1,11 @@
+[package]
+name = "waveview-brain"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "waveview_brain"
+crate-type = ["staticlib"]
+
+[profile.release]
+opt-level = 2
