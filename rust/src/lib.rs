@@ -34,8 +34,8 @@ pub unsafe extern "C" fn waveview_workspace_tiles(mw: f64, mh: f64, out: *mut Re
     if mw <= 0.0 || mh <= 0.0 || out.is_null() {
         return 0;
     }
-    let outer = mh * 0.015; // outer margin (tight — fill the screen)
-    let gap = mh * 0.012; // gap between workspaces (the "imaginary lines")
+    let outer = mh * 0.006; // outer margin (tight — fill the screen)
+    let gap = mh * 0.006; // gap between workspaces (the "imaginary lines")
     let aspect = mh / mw;
 
     // Cell width limited by both available width and height, so the 3x3 grid of
