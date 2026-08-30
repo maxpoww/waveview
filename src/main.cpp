@@ -36,6 +36,7 @@
 #include <hyprland/src/managers/animation/DesktopAnimationManager.hpp>
 #include <hyprland/src/managers/eventLoop/EventLoopManager.hpp>
 #include <hyprland/src/managers/eventLoop/EventLoopTimer.hpp>
+#include <hyprland/src/layout/LayoutManager.hpp>
 #include <hyprland/src/managers/CursorManager.hpp>
 #include <hyprland/src/managers/KeybindManager.hpp>
 #include <hyprland/src/managers/input/InputManager.hpp>
@@ -964,6 +965,22 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
                 ws = g_pCompositor->createNewWorkspace(drop + 1, m->m_id);
             if (ws)
                 g_pCompositor->moveWindowToWorkspaceSafe(dw, ws);
+        } else if (drop >= 0) {
+            // Same workspace: REORDER — swap with the window under the
+            // drop point via the layout's own swap (the desktop's
+            // swapwindow), so dragging inside a view re-tiles it exactly
+            // like grabbing the window on the real workspace.
+            PHLWINDOW target;
+            for (auto it = g_wins.rbegin(); it != g_wins.rend(); ++it) {
+                if (it->screen.w <= 0.0 || !it->screen.containsPoint(c))
+                    continue;
+                if (auto w2 = it->win.lock(); w2 && w2 != dw) {
+                    target = w2;
+                    break;
+                }
+            }
+            if (target && !dw->isFullscreen() && !target->isFullscreen())
+                g_layoutManager->switchTargets(dw->layoutTarget(), target->layoutTarget(), true);
         }
         captureWorkspaces(m); // reflect the move immediately
     }
