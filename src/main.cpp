@@ -1137,7 +1137,17 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
         } else {
             endRealDrag(std::nullopt); // dropped outside every view: go home
         }
-        captureWorkspaces(m); // reflect the move immediately
+        // DON'T recapture immediately: the landing re-tile is animating and
+        // an instant snapshot shows every window mid-flight — a blink
+        // across the tiles. Let it settle, then the live timer catches up;
+        // meanwhile drop the dragged window's stale mini so nothing
+        // overlaps the re-tiled siblings.
+        for (auto& cw : g_wins)
+            if (cw.win.lock() == dw && cw.fb)
+                cw.fb->release();
+        std::erase_if(g_wins, [&](const CapWin& cw) { return cw.win.lock() == dw; });
+        if (g_liveTimer)
+            g_liveTimer->updateTimeout(std::chrono::milliseconds(200));
         for (auto& cw : g_wins)
             cw.previewT = 0.f; // the real layout moved — no stale glide-back
     }
