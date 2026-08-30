@@ -144,8 +144,11 @@ static constexpr double CLICK_SLOP = 12.0;
 // chases in onRender); digits 1..9 select within the current page.
 static double          g_scroll       = 0.0;
 static double          g_scrollTarget = 0.0;
+static double          g_scrollFrom   = 0.0; // flip start position
+static float           g_scrollProg   = 1.0; // 0..1 through the flip (1 = settled)
 static int             g_page         = 0; // 0 = workspaces 1-9, 1 = 10-18
 static Time::steady_tp g_pageFlipAt{};     // cooldown: one notch = one flip
+static constexpr float SCROLL_SECONDS = 0.42f; // page-flip duration
 
 // Zoom animation: 0 = zoomed fully into g_zoomTile (that workspace fills the
 // screen), 1 = the whole 3x3 grid at its rest layout. Opening animates 0->1,
@@ -170,6 +173,10 @@ static double mix(double a, double b, double t) {
 static float easeOutCubic(float t) {
     const float u = 1.0f - t;
     return 1.0f - u * u * u;
+}
+// Ease-in-out cubic: gentle start, gentle landing — the page-flip curve.
+static double easeInOutCubic(double t) {
+    return t < 0.5 ? 4.0 * t * t * t : 1.0 - std::pow(-2.0 * t + 2.0, 3.0) / 2.0;
 }
 
 // Defined further down; used by the pointer handlers above their definitions.
@@ -847,6 +854,8 @@ static void onMouseAxis(IPointer::SAxisEvent e, Event::SCallbackInfo& info) {
         return;
     g_page         = next;
     g_pageFlipAt   = now;
+    g_scrollFrom   = g_scroll; // retarget-safe: a mid-flight flip re-eases
+    g_scrollProg   = 0.0f;
     g_scrollTarget = g_page * pageStep(m);
     damageAll();
 }
@@ -941,12 +950,13 @@ static void onRender(eRenderStage stage) {
     else if (g_anim > g_animTarget)
         g_anim = std::max(g_animTarget, g_anim - step);
 
-    // Grid scroll chases its target (exponential ease, dt-based). While it
-    // moves, hover retargets under the stationary cursor and frames keep
-    // coming; it snaps and rests when close.
-    const double sd = g_scrollTarget - g_scroll;
-    if (std::abs(sd) > 0.25) {
-        g_scroll += sd * std::min(1.0, sc<double>(dt) * 14.0);
+    // Page-flip scroll: a fixed-duration ease-in-out glide (dt-based) —
+    // gentle start, gentle landing (the old exponential chase hit max
+    // velocity on frame one and read as a jerk). While it moves, hover
+    // retargets under the stationary cursor and frames keep coming.
+    if (g_scrollProg < 1.0f) {
+        g_scrollProg = std::min(1.0f, g_scrollProg + dt / SCROLL_SECONDS);
+        g_scroll     = mix(g_scrollFrom, g_scrollTarget, easeInOutCubic(g_scrollProg));
         updateHoverAt(m, cursorDrawSpace(m));
         g_pHyprRenderer->damageMonitor(m);
         g_pCompositor->scheduleFrameForMonitor(m);
@@ -1011,8 +1021,10 @@ static void toggle() {
         g_zoomTile       = at >= 0 ? at : 0;
         // Open on the page holding the active workspace, already settled
         // (no flip animation on open — the zoom pivots on-screen).
-        g_page   = g_zoomTile / 9;
-        g_scroll = g_scrollTarget = m ? g_page * pageStep(m) : 0.0;
+        g_page       = g_zoomTile / 9;
+        g_scroll     = g_scrollTarget = m ? g_page * pageStep(m) : 0.0;
+        g_scrollFrom = g_scroll;
+        g_scrollProg = 1.0f; // open lands settled — no flip animation
         captureWorkspaces(m); // snapshot on open, outside the render pass
         if (g_liveTimer)
             g_liveTimer->updateTimeout(REFRESH_MS);
