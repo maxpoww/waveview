@@ -852,7 +852,7 @@ static void drawOverview(PHLMONITOR m, float p, int zoomTile) {
             // slot, anchored by the grab point as a fraction of the box.
             CBox b{g_dragCursor.x - g_grabFracX * g_ghostW, g_dragCursor.y - g_grabFracY * g_ghostH, g_ghostW,
                    g_ghostH};
-            const int round = (int)std::lround(std::min(b.w, b.h) * 0.06);
+            const int round = (int)std::lround(DSN_WIN_ROUND * m->m_scale * p); // same corners as the settled minis
             haloBorder(b, round);
             drawTex(tex, b, round);
             break;
