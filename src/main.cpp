@@ -186,6 +186,10 @@ static double          g_grabFracX = 0.5, g_grabFracY = 0.5;
 // Live-commit state (see the "life reaction" block before updateHoverAt).
 static constexpr auto DWELL           = std::chrono::milliseconds(120);
 static constexpr auto COMMIT_COOLDOWN = std::chrono::milliseconds(150);
+// How long the ~20fps capture boost runs after a commit/regrab/drop: must
+// cover the whole "windows" spring + settle tail. Currently sized for the
+// HALF-SPEED debugging spring (hyprctl eval'd to 2.4; normal 4.79 ≈ 700ms).
+static constexpr auto BOOST_MS        = std::chrono::milliseconds(1400);
 static Time::steady_tp g_lastCommit{};
 struct LiveCommit {
     bool         active = false; // false = no target under the cursor
@@ -1234,7 +1238,7 @@ static void commitAt(PHLMONITOR m, const Vector2D& c, PHLWINDOW dw, const LiveCo
     }
     g_commit     = sig;
     g_lastCommit = Time::steadyNow();
-    g_boostUntil = Time::steadyNow() + std::chrono::milliseconds(700);
+    g_boostUntil = Time::steadyNow() + BOOST_MS;
     captureWorkspaces(m);
     if (g_liveTimer)
         g_liveTimer->updateTimeout(std::chrono::milliseconds(50));
@@ -1250,7 +1254,7 @@ static void regrab(PHLWINDOW dw) {
         return;
     g_commit = {};
     beginRealDrag(dw, false);
-    g_boostUntil = Time::steadyNow() + std::chrono::milliseconds(700);
+    g_boostUntil = Time::steadyNow() + BOOST_MS;
     if (g_liveTimer)
         g_liveTimer->updateTimeout(std::chrono::milliseconds(50));
     damageAll();
@@ -1542,7 +1546,7 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
         g_dragWin.reset();
         g_commit  = {};
         g_origWS  = -1;
-        g_boostUntil = Time::steadyNow() + std::chrono::milliseconds(700);
+        g_boostUntil = Time::steadyNow() + BOOST_MS;
         captureWorkspaces(m);
         if (g_liveTimer)
             g_liveTimer->updateTimeout(std::chrono::milliseconds(50));
@@ -1864,7 +1868,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.10"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.11"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
