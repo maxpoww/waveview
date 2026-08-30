@@ -26,14 +26,16 @@ pub extern "C" fn waveview_hello() -> *const c_char {
 /// with the usable area starting at `top` (below the OPTIONS bar plus its
 /// breathing gap — the shim passes reserved strip + 3 logical px).
 ///
-/// Consistency rules (the visual complaints this layout answers):
-/// - Tiles mirror the FULL monitor aspect (`mh/mw`), not the reduced area's,
-///   so every tile is a faithful miniature and the close-zoom lands exactly.
-/// - ONE `gap` everywhere: between tiles and as the left/right/bottom outer
-///   margins, so no edge reads different from an inner seam. (When height
-///   binds, leftover width splits into the two side margins — symmetric.)
-/// - The grid is TOP-ANCHORED at `top`: the 3 px promise to the bar is kept
-///   exactly, and any vertical slack falls to the bottom.
+/// FULL-BLEED layout (per Max): the grid fills the whole usable area,
+/// edge to edge, with ONE `gap` everywhere — between tiles and as the
+/// left/right/bottom margins; the top margin is `top` itself (bar + 3 px).
+///
+/// Tiles therefore give up exact monitor aspect (cell width fills the
+/// width, cell height fills the height — on a barred monitor that's a
+/// ~2–3% flatter tile). Window minis stay correctly placed (the mapper
+/// scales x and y independently by tile/monitor ratio) and the close-zoom
+/// uses separate x/y scales, so the give is invisible in motion — while
+/// the slack margins it buys back were very visible at rest.
 ///
 /// Writes 9 `Rect`s to `out`; returns the count.
 ///
@@ -46,24 +48,17 @@ pub unsafe extern "C" fn waveview_workspace_tiles(mw: f64, mh: f64, top: f64, ou
     }
     let gap = mh * 0.006; // the one gap (inter-tile AND outer margins)
     let avail_h = mh - top;
-    let aspect = mh / mw; // full-monitor aspect — tiles are true miniatures
 
-    // Cell width limited by both available width and height, so the 3x3 grid of
-    // aspect-correct tiles always fits: 2 side margins + 2 inner gaps across,
-    // 2 inner gaps + 1 bottom margin down (the top is `top` itself).
-    let cw_by_w = (mw - 4.0 * gap) / 3.0;
-    let cw_by_h = ((avail_h - 3.0 * gap) / 3.0) / aspect;
-    let cell_w = cw_by_w.min(cw_by_h).max(1.0);
-    let cell_h = cell_w * aspect;
-
-    let grid_w = 3.0 * cell_w + 2.0 * gap;
-    let left = (mw - grid_w) / 2.0;
+    // Fill both axes exactly: 2 side margins + 2 inner gaps across, 2 inner
+    // gaps + 1 bottom margin down (the top margin is `top` itself).
+    let cell_w = ((mw - 4.0 * gap) / 3.0).max(1.0);
+    let cell_h = ((avail_h - 3.0 * gap) / 3.0).max(1.0);
 
     let tiles = std::slice::from_raw_parts_mut(out, 9);
     for row in 0..3 {
         for col in 0..3 {
             tiles[row * 3 + col] = Rect {
-                x: left + col as f64 * (cell_w + gap),
+                x: gap + col as f64 * (cell_w + gap),
                 y: top + row as f64 * (cell_h + gap),
                 w: cell_w,
                 h: cell_h,
@@ -191,22 +186,21 @@ mod tests {
     }
 
     #[test]
-    fn nine_aspect_correct_tiles_fit_inside_monitor() {
+    fn full_bleed_grid_fills_and_gaps_are_uniform() {
         let mut tiles = [Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 }; 9];
-        let n = unsafe { waveview_workspace_tiles(1920.0, 1080.0, 48.0, tiles.as_mut_ptr()) };
+        let (mw, mh, top) = (1920.0, 1080.0, 48.0);
+        let n = unsafe { waveview_workspace_tiles(mw, mh, top, tiles.as_mut_ptr()) };
         assert_eq!(n, 9);
-        let aspect = 1080.0 / 1920.0;
-        for t in &tiles {
-            assert!(t.x >= 0.0 && t.y >= 48.0 - 1e-6);
-            assert!(t.x + t.w <= 1920.0 + 1e-6 && t.y + t.h <= 1080.0 + 1e-6);
-            assert!((t.h / t.w - aspect).abs() < 1e-6); // full-monitor aspect, not reduced
-        }
+        let gap = mh * 0.006;
         // Top-anchored exactly at `top` (the 3 px promise to the bar).
-        assert!((tiles[0].y - 48.0).abs() < 1e-9);
-        // One uniform gap: inner seams equal each other and the side margins
-        // whenever width binds.
+        assert!((tiles[0].y - top).abs() < 1e-9);
+        // Side and bottom margins equal the inter-tile gap — full bleed.
+        assert!((tiles[0].x - gap).abs() < 1e-9);
+        assert!((mw - (tiles[2].x + tiles[2].w) - gap).abs() < 1e-6);
+        assert!((mh - (tiles[8].y + tiles[8].h) - gap).abs() < 1e-6);
+        // Inner seams both equal the same gap.
         let inner_x = tiles[1].x - (tiles[0].x + tiles[0].w);
         let inner_y = tiles[3].y - (tiles[0].y + tiles[0].h);
-        assert!((inner_x - inner_y).abs() < 1e-6);
+        assert!((inner_x - gap).abs() < 1e-6 && (inner_y - gap).abs() < 1e-6);
     }
 }
