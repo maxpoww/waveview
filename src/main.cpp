@@ -1186,10 +1186,18 @@ static void onKey(IKeyboard::SKeyEvent e, Event::SCallbackInfo& info) {
     }
     if (!g_active || g_animTarget < 0.5f) // only intercept while open (not mid-close)
         return;
-    // Bind combos (Super held) pass through untouched so compositor binds
-    // — Super+R's toggle/tour above all — keep working while we're open.
-    if (g_superHeld)
+    // Super held: digits are OURS — page-relative jump, swallowed so the
+    // compositor's absolute workspace bind can't fight it. This makes the
+    // one-hand chord work: Super+R, Super+R (tour), Super+3 → workspace 12.
+    // Every other bind combo passes through (Super+R's toggle above all).
+    if (g_superHeld) {
+        if (e.keycode >= EVDEV_1 && e.keycode <= EVDEV_9) {
+            if (e.state == WL_KEYBOARD_KEY_STATE_PRESSED)
+                jumpTo(g_page * 9 + static_cast<int>(e.keycode - EVDEV_1 + 1));
+            info.cancelled = true;
+        }
         return;
+    }
     info.cancelled = true; // plain typing never reaches the desktop while open
 
     if (e.keycode >= EVDEV_1 && e.keycode <= EVDEV_9) {
