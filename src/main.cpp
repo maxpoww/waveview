@@ -743,14 +743,13 @@ static void drawOverview(PHLMONITOR m, float p, int zoomTile) {
         if (dragW && g_wins[i].win.lock() == dragW)
             dragIdx = (ssize_t)i;
     }
-    // Live reorder preview (the others react, like grabbing a window on the
-    // real desktop): while the drag hovers a sibling in the SAME view, that
-    // sibling GLIDES into the dragged window's slot (eased, dt-based) and
-    // glides home when the drag moves off — the swap made visible before
-    // the drop commits it.
+    // Live SPLIT preview (matching the real drop semantics): while the drag
+    // hovers any window, that window GLIDES to the half it will keep —
+    // vacating the half the dropped window will take (dwindle insert).
+    // Glides home when the drag moves off.
     if (dragIdx >= 0) {
         for (size_t i = g_wins.size(); i-- > 0;) {
-            if (!ok[i] || (ssize_t)i == dragIdx || g_wins[i].tile != g_wins[dragIdx].tile)
+            if (!ok[i] || (ssize_t)i == dragIdx)
                 continue;
             if (boxes[i].w > 0.0 && boxes[i].containsPoint(g_dragCursor)) {
                 swapIdx = (ssize_t)i;
@@ -764,8 +763,20 @@ static void drawOverview(PHLMONITOR m, float p, int zoomTile) {
             continue;
         auto&       cw     = g_wins[i];
         const float target = (ssize_t)i == swapIdx ? 1.f : 0.f;
-        if ((ssize_t)i == swapIdx && dragIdx >= 0)
-            cw.previewBox = boxes[dragIdx]; // remember where it's headed
+        if ((ssize_t)i == swapIdx) {
+            // The half it keeps: split on the longer axis, away from the
+            // cursor side — mirroring where dwindle puts the newcomer.
+            const CBox& b = boxes[i];
+            if (b.w >= b.h) {
+                const bool left = g_dragCursor.x < b.x + b.w / 2.0;
+                cw.previewBox   = left ? CBox{b.x + b.w / 2.0, b.y, b.w / 2.0, b.h}
+                                       : CBox{b.x, b.y, b.w / 2.0, b.h};
+            } else {
+                const bool top = g_dragCursor.y < b.y + b.h / 2.0;
+                cw.previewBox  = top ? CBox{b.x, b.y + b.h / 2.0, b.w, b.h / 2.0}
+                                     : CBox{b.x, b.y, b.w, b.h / 2.0};
+            }
+        }
         cw.previewT += (target - cw.previewT) * std::min(1.0f, g_frameDt * 14.f);
         if (std::abs(cw.previewT - target) < 0.01f)
             cw.previewT = target;
@@ -1020,28 +1031,36 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
                     drop = i;
                     break;
                 }
-        if (drop >= 0 && dw->workspaceID() != drop + 1) {
-            auto ws = g_pCompositor->getWorkspaceByID(drop + 1);
-            if (!ws)
-                ws = g_pCompositor->createNewWorkspace(drop + 1, m->m_id);
-            if (ws)
-                g_pCompositor->moveWindowToWorkspaceSafe(dw, ws);
-        } else if (drop >= 0) {
-            // Same workspace: REORDER — swap with the window under the
-            // drop point via the layout's own swap (the desktop's
-            // swapwindow), so dragging inside a view re-tiles it exactly
-            // like grabbing the window on the real workspace.
-            PHLWINDOW target;
-            for (auto it = g_wins.rbegin(); it != g_wins.rend(); ++it) {
-                if (it->screen.w <= 0.0 || !it->screen.containsPoint(c))
-                    continue;
-                if (auto w2 = it->win.lock(); w2 && w2 != dw) {
-                    target = w2;
-                    break;
-                }
+        if (drop >= 0) {
+            // The drop point, mapped back into desktop logical coords
+            // within the target view (inverse of the tile mapping).
+            Rect   tiles2[N_TILES];
+            double ux2, uy2, uw3, uh3;
+            usableArea(m, ux2, uy2, uw3, uh3);
+            const Rect&    t = tiles[drop];
+            const Vector2D desk{ux2 + (c.x - t.x) * uw3 / t.w, uy2 + (c.y - t.y) * uh3 / t.h};
+            (void)tiles2;
+            if (dw->workspaceID() != drop + 1) {
+                auto ws = g_pCompositor->getWorkspaceByID(drop + 1);
+                if (!ws)
+                    ws = g_pCompositor->createNewWorkspace(drop + 1, m->m_id);
+                if (ws)
+                    g_pCompositor->moveWindowToWorkspaceSafe(dw, ws);
             }
-            if (target && !dw->isFullscreen() && !target->isFullscreen())
-                g_layoutManager->switchTargets(dw->layoutTarget(), target->layoutTarget(), true);
+            // Re-place through the REAL drag machinery so the drop behaves
+            // exactly like the desktop's: pull-out re-tiles the rest, and
+            // dropping on a window SPLITS its space (dwindle insert), not a
+            // swap. The cursor is warped under the covered overview (our
+            // motion-swallow mutes side effects) and restored after.
+            if (!dw->isFullscreen()) {
+                const Vector2D savedCursor = g_pInputManager->getMouseCoordsInternal();
+                g_pCompositor->warpCursorTo(desk, true);
+                g_layoutManager->beginDragTarget(dw->layoutTarget(), MBIND_MOVE);
+                g_layoutManager->moveMouse(desk + Vector2D(2, 2));
+                g_layoutManager->moveMouse(desk);
+                g_layoutManager->endDragTarget();
+                g_pCompositor->warpCursorTo(savedCursor, true);
+            }
         }
         captureWorkspaces(m); // reflect the move immediately
         for (auto& cw : g_wins)
