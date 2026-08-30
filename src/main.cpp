@@ -167,6 +167,11 @@ static constexpr float SCROLL_SECONDS = 0.42f; // page-flip duration
 static bool            g_tourDone     = false;
 // Wall-clock dt of the current frame (set in onRender), for the preview glide.
 static float           g_frameDt      = 0.016f;
+// A REAL compositor drag is running for the overview drag (begun at grab so
+// the siblings re-tile live — no hole where the window was). Ended at drop,
+// or back at home on cancel/close.
+static bool            g_dragReal       = false;
+static Vector2D        g_dragHomeCenter = {};
 
 // Zoom animation: 0 = zoomed fully into g_zoomTile (that workspace fills the
 // screen), 1 = the whole 3x3 grid at its rest layout. Opening animates 0->1,
@@ -202,6 +207,8 @@ static void jumpTo(int wsId);
 static void jumpToWindow(PHLWINDOW w);
 static void updateHoverAt(PHLMONITOR m, const Vector2D& c);
 static void closeOverview();
+static void beginRealDrag(PHLWINDOW dw);
+static void endRealDrag(std::optional<Vector2D> at);
 
 static void damageAll() {
     for (auto& m : g_pCompositor->m_monitors) {
@@ -900,12 +907,53 @@ static void onMouseMove(Vector2D, Event::SCallbackInfo& info) {
     updateHoverAt(m, cursorDrawSpace(m));
 }
 
+// Begin the compositor's own drag for `dw` at GRAB time: the layout floats
+// the window out and re-tiles the siblings immediately (the live thumbnails
+// show it — no hole). The cursor warps to the window's desktop centre to
+// seed the drag, then returns; our motion-swallow mutes the side effects.
+static void beginRealDrag(PHLWINDOW dw) {
+    if (g_dragReal || !dw || dw->isFullscreen())
+        return;
+    const CBox     wb = dw->getWindowMainSurfaceBox();
+    const Vector2D home{wb.x + wb.w / 2.0, wb.y + wb.h / 2.0};
+    const Vector2D saved = g_pInputManager->getMouseCoordsInternal();
+    g_dragHomeCenter     = home;
+    g_pCompositor->warpCursorTo(home, true);
+    g_layoutManager->beginDragTarget(dw->layoutTarget(), MBIND_MOVE);
+    g_layoutManager->moveMouse(home + Vector2D(3, 3)); // trip the drag threshold
+    g_layoutManager->moveMouse(home);
+    g_pCompositor->warpCursorTo(saved, true);
+    g_dragReal = true;
+    if (const auto m = g_captureMon.lock())
+        captureWorkspaces(m); // show the re-tile right away
+}
+
+// End the running real drag at `at` (desktop coords) — the dwindle insert
+// splits whatever is under that point — or back at home when cancelled.
+static void endRealDrag(std::optional<Vector2D> at) {
+    if (!g_dragReal)
+        return;
+    g_dragReal           = false;
+    const Vector2D dest  = at.value_or(g_dragHomeCenter);
+    const Vector2D saved = g_pInputManager->getMouseCoordsInternal();
+    g_pCompositor->warpCursorTo(dest, true);
+    g_layoutManager->moveMouse(dest);
+    g_layoutManager->endDragTarget();
+    g_pCompositor->warpCursorTo(saved, true);
+}
+
 // Shared by motion and grid-scroll: recompute hover/drag targets at cursor `c`
 // (a scroll moves the tiles under a stationary cursor, so hover must follow).
 static void updateHoverAt(PHLMONITOR m, const Vector2D& c) {
     // Any pending press (window or empty tile) that leaves the slop is a drag.
-    if ((g_dragWin.lock() || g_pressTile >= 0) && !g_dragMoved && (c - g_pressPos).size() > CLICK_SLOP)
+    if ((g_dragWin.lock() || g_pressTile >= 0) && !g_dragMoved && (c - g_pressPos).size() > CLICK_SLOP) {
         g_dragMoved = true;
+        // The grab is real from frame one: the compositor pulls the window
+        // out of the layout NOW, so the siblings re-tile live (the
+        // thumbnails show it — no hole where the window was).
+        if (const auto dw = g_dragWin.lock())
+            beginRealDrag(dw);
+    }
 
     if (g_dragWin.lock()) {
         g_dragCursor = c;
@@ -1047,20 +1095,12 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
                 if (ws)
                     g_pCompositor->moveWindowToWorkspaceSafe(dw, ws);
             }
-            // Re-place through the REAL drag machinery so the drop behaves
-            // exactly like the desktop's: pull-out re-tiles the rest, and
-            // dropping on a window SPLITS its space (dwindle insert), not a
-            // swap. The cursor is warped under the covered overview (our
-            // motion-swallow mutes side effects) and restored after.
-            if (!dw->isFullscreen()) {
-                const Vector2D savedCursor = g_pInputManager->getMouseCoordsInternal();
-                g_pCompositor->warpCursorTo(desk, true);
-                g_layoutManager->beginDragTarget(dw->layoutTarget(), MBIND_MOVE);
-                g_layoutManager->moveMouse(desk + Vector2D(2, 2));
-                g_layoutManager->moveMouse(desk);
-                g_layoutManager->endDragTarget();
-                g_pCompositor->warpCursorTo(savedCursor, true);
-            }
+            // Finish the drag begun at grab: end it at the drop point —
+            // the dwindle insert splits whatever sits under it, exactly
+            // like releasing the drag on the real desktop.
+            endRealDrag(desk);
+        } else {
+            endRealDrag(std::nullopt); // dropped outside every view: go home
         }
         captureWorkspaces(m); // reflect the move immediately
         for (auto& cw : g_wins)
@@ -1173,6 +1213,9 @@ static void flipToPage(int page) {
 static void closeOverview() {
     if (g_animTarget < 0.5f)
         return;
+    endRealDrag(std::nullopt); // never leave a real drag dangling
+    g_dragWin.reset();
+    g_dragMoved  = false;
     g_animTarget = 0.0f;
     g_animLastT  = Time::steadyNow();
     notifyWaverunner(false);
@@ -1191,6 +1234,11 @@ static void toggle() {
             flipToPage(other);
             return;
         }
+    }
+    if (!opening) {
+        endRealDrag(std::nullopt); // never leave a real drag dangling
+        g_dragWin.reset();
+        g_dragMoved = false;
     }
     g_animTarget = opening ? 1.0f : 0.0f;
     notifyWaverunner(opening);
