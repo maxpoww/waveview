@@ -923,6 +923,24 @@ static void beginRealDrag(PHLWINDOW dw) {
         captureWorkspaces(m); // show the re-tile right away
 }
 
+// A clean synthetic re-place: begin+end a whole drag around a KNOWN static
+// window state, splitting `under` at `desk` (dwindle insert). Used after a
+// cross-workspace move — running the positional insert while the original
+// grab-drag was still alive made moves and inserts fight over the space.
+static void placeAt(PHLWINDOW dw, const Vector2D& desk, PHLWINDOW under) {
+    if (!dw || dw->isFullscreen())
+        return;
+    const Vector2D saved = g_pInputManager->getMouseCoordsInternal();
+    g_pCompositor->warpCursorTo(desk, true);
+    if (under)
+        Desktop::focusState()->fullWindowFocus(under, Desktop::FOCUS_REASON_DESKTOP_STATE_CHANGE);
+    g_layoutManager->beginDragTarget(dw->layoutTarget(), MBIND_MOVE);
+    g_layoutManager->moveMouse(desk + Vector2D(3, 3));
+    g_layoutManager->moveMouse(desk);
+    g_layoutManager->endDragTarget();
+    g_pCompositor->warpCursorTo(saved, true);
+}
+
 // End the running real drag at `at` (desktop coords) — the dwindle insert
 // splits whatever is under that point — or back at home when cancelled.
 // `splitTarget`: dwindle's use_active_for_splits keys the insert off the
@@ -1091,17 +1109,6 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
             const Rect&    t = tiles[drop];
             const Vector2D desk{ux2 + (c.x - t.x) * uw3 / t.w, uy2 + (c.y - t.y) * uh3 / t.h};
             (void)tiles2;
-            if (dw->workspaceID() != drop + 1) {
-                auto ws = g_pCompositor->getWorkspaceByID(drop + 1);
-                if (!ws)
-                    ws = g_pCompositor->createNewWorkspace(drop + 1, m->m_id);
-                if (ws)
-                    g_pCompositor->moveWindowToWorkspaceSafe(dw, ws);
-            }
-            // Finish the drag begun at grab: end it at the drop point —
-            // the dwindle insert splits whatever sits under it, exactly
-            // like releasing the drag on the real desktop. Pass the window
-            // under the drop as the split target (see endRealDrag).
             for (auto it = g_wins.rbegin(); it != g_wins.rend(); ++it) {
                 if (it->screen.w <= 0.0 || !it->screen.containsPoint(c))
                     continue;
@@ -1110,7 +1117,26 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
                     break;
                 }
             }
-            endRealDrag(desk, under);
+            if (dw->workspaceID() == drop + 1) {
+                // Same view: end the grab-drag right at the drop point —
+                // the dwindle insert splits `under` exactly like the desktop.
+                endRealDrag(desk, under);
+            } else {
+                // Cross-view: NEVER move a workspace while the drag is
+                // alive (they fight over the space — empty-view drops
+                // silently failed). Close the drag at home, move, then a
+                // clean synthetic re-place lands it at the drop point;
+                // an empty view needs no re-place (sole window = full view).
+                endRealDrag(std::nullopt);
+                auto ws = g_pCompositor->getWorkspaceByID(drop + 1);
+                if (!ws)
+                    ws = g_pCompositor->createNewWorkspace(drop + 1, m->m_id);
+                if (ws) {
+                    g_pCompositor->moveWindowToWorkspaceSafe(dw, ws);
+                    if (under)
+                        placeAt(dw, desk, under);
+                }
+            }
         } else {
             endRealDrag(std::nullopt); // dropped outside every view: go home
         }
