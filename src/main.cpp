@@ -696,10 +696,11 @@ static void drawOverview(PHLMONITOR m, float p, int zoomTile) {
     const auto hoverW = g_hoverWin.lock();
     // Only treat it as a drag once the cursor has left the click slop — before that
     // a press is still a potential click, so the window stays put in its tile.
-    // And only while the compositor actually HOLDS it: in a committed state
-    // (live commit) the window really lives in its target view, is part of
-    // the capture like any sibling, and needs no ghost.
-    const auto dragW  = (g_dragMoved && g_dragReal) ? g_dragWin.lock() : PHLWINDOW{};
+    // For the WHOLE gesture (held AND committed): the window is hidden from
+    // the tiles — a committed slot shows as a live HOLE among the really
+    // squeezed siblings — and the ghost stays on the cursor, so the hand
+    // never appears to lose it.
+    const auto dragW  = g_dragMoved ? g_dragWin.lock() : PHLWINDOW{};
 
     // NO rest-shrink (per Max, round 3): windows draw at their true mapped
     // size — a maximized/smart-gaps window touches its tile edges exactly
@@ -975,11 +976,7 @@ static void onLiveTimer(SP<CEventLoopTimer> self, void*) {
         return;
     }
     if (const auto m = g_captureMon.lock()) {
-        // Freeze-frame during a drag gesture: the tiles hold the last
-        // committed intention; a periodic capture would reveal the
-        // pulled-out reality hiding behind it.
-        if (!(g_dragWin.lock() && g_dragMoved))
-            captureWorkspaces(m);
+        captureWorkspaces(m);
         maybeCommit(m); // the dwell can expire with the cursor at rest
         damageAll();
     }
@@ -1040,19 +1037,6 @@ static void onMouseMove(Vector2D, Event::SCallbackInfo& info) {
     updateHoverAt(m, cursorDrawSpace(m));
 }
 
-// Snap every window's geometry spring on workspace `wsID` to its target NOW.
-// The commit cycle captures exactly one SETTLED frame per intention (the
-// freeze-frame the tiles hold until the next one) — mid-flight pixels would
-// bake into it and stick.
-static void warpWS(int wsID) {
-    for (auto& w : g_pCompositor->m_windows) {
-        if (!w || !w->m_isMapped || w->workspaceID() != wsID)
-            continue;
-        w->m_realPosition->warp();
-        w->m_realSize->warp();
-    }
-}
-
 // Begin the compositor's own drag for `dw` at GRAB time: the layout floats
 // the window out and re-tiles the siblings immediately (the live thumbnails
 // show it — no hole). The cursor warps to the window's desktop centre to
@@ -1084,11 +1068,11 @@ static void beginRealDrag(PHLWINDOW dw, bool capture) {
     g_layoutManager->setTargetGeom(CBox{-20000.0, -20000.0, wb.w, wb.h}, dw->layoutTarget());
     g_pCompositor->warpCursorTo(saved, true);
     g_dragReal = true;
-    // Reality settles instantly at every hold: captures during the gesture
-    // are one-per-intention freeze-frames, never mid-flight.
-    warpWS(dw->workspaceID());
-    // capture=false inside a commit cycle: the pulled-out state is the
-    // hidden HALF of the illusion — only the landed state gets captured.
+    // A re-commit passes capture=false: it re-inserts immediately after and
+    // captures THEN — snapshotting the pulled-out intermediate made every
+    // re-placement read as a double bounce. (NO geometry warping here: a
+    // warped capture freezes client buffers that haven't redrawn at their
+    // new sizes — that was v0.9's "content all mixed between windows".)
     if (capture)
         if (const auto m = g_captureMon.lock())
             captureWorkspaces(m); // show the re-tile right away
@@ -1219,13 +1203,12 @@ static bool sameCommit(const LiveCommit& a, const LiveCommit& b) {
     return a.active == b.active && a.tile == b.tile && a.under.lock() == b.under.lock() && a.side == b.side;
 }
 
-// One commit CYCLE: really land the held window at `c` (the same machinery
-// as the drop), snap the springs, capture that settled truth — then pull it
-// straight back into the hand, uncaptured. The tiles hold the frozen landed
-// frame (real squeezed siblings, real content, and — because the dragged
-// window is skipped in the draw — a HOLE where it would land), while the
-// ghost never leaves the cursor: the workspaces react to the INTENTION, the
-// grab is never lost.
+// Really place the held window at `c` — the same machinery as the drop —
+// then capture fast so the tiles show the actual re-tile springing with
+// clients re-rendering at their true new sizes. The landed window itself is
+// HIDDEN from the tile draws for the whole gesture (a live HOLE marks the
+// spot) and the ghost stays on the cursor: the workspaces react to the
+// intention, the hand never loses the window.
 static void commitAt(PHLMONITOR m, const Vector2D& c, PHLWINDOW dw, const LiveCommit& sig) {
     if (!g_dragReal || !sig.active)
         return;
@@ -1234,8 +1217,7 @@ static void commitAt(PHLMONITOR m, const Vector2D& c, PHLWINDOW dw, const LiveCo
         return;
     const Vector2D desk  = deskAt(m, tiles[sig.tile], c);
     const auto     under = sig.under.lock();
-    const int      oldWS = dw->workspaceID();
-    if (oldWS == sig.tile + 1)
+    if (dw->workspaceID() == sig.tile + 1)
         endRealDrag(desk, under);
     else {
         // Same rule as the drop: never move a workspace while the drag is
@@ -1250,23 +1232,27 @@ static void commitAt(PHLMONITOR m, const Vector2D& c, PHLWINDOW dw, const LiveCo
         if (under)
             placeAt(dw, desk, under);
     }
-    warpWS(sig.tile + 1);
-    warpWS(oldWS);
-    captureWorkspaces(m);          // the ONE frame the tiles will hold
-    beginRealDrag(dw, false);      // straight back into the hand (warps, no capture)
     g_commit     = sig;
     g_lastCommit = Time::steadyNow();
+    g_boostUntil = Time::steadyNow() + std::chrono::milliseconds(700);
+    captureWorkspaces(m);
+    if (g_liveTimer)
+        g_liveTimer->updateTimeout(std::chrono::milliseconds(50));
     damageAll();
 }
 
-// The hover moved somewhere targetless while an intention was shown: the
-// window is already in hand (the cycle always re-grabs), reality is already
-// pulled out and settled — just let the tiles show it (hole closes).
-static void uncommitVisual(PHLMONITOR m) {
+// The hover left the committed spot: pull the window back out of its slot.
+// beginRealDrag floats it out and the siblings re-tile back. No synchronous
+// capture — a re-commit inserts (and captures) right behind this, and the
+// boosted timer covers the pulled-out case within 50ms.
+static void regrab(PHLWINDOW dw) {
     if (!g_commit.active)
         return;
     g_commit = {};
-    captureWorkspaces(m);
+    beginRealDrag(dw, false);
+    g_boostUntil = Time::steadyNow() + std::chrono::milliseconds(700);
+    if (g_liveTimer)
+        g_liveTimer->updateTimeout(std::chrono::milliseconds(50));
     damageAll();
 }
 
@@ -1305,18 +1291,18 @@ static void maybeCommit(PHLMONITOR m) {
         return;
     if (Time::steadyNow() - g_lastCommit < COMMIT_COOLDOWN)
         return;
+    if (g_commit.active)
+        regrab(dw);
     if (sig.active)
-        commitAt(m, g_dragCursor, dw, sig); // the cycle lands, captures, re-grabs
-    else
-        uncommitVisual(m);
+        commitAt(m, g_dragCursor, dw, sig);
 }
 
 // Cancel from any state: the window goes back to the workspace and spot the
 // gesture started from.
 static void restoreOriginal() {
     const auto dw = g_dragWin.lock();
-    // The commit cycle always re-grabs, so a shown intention is visual only —
-    // the window is in hand; ending the held drag at the origin restores all.
+    if (dw && g_commit.active)
+        regrab(dw); // one mechanism: a held drag we end at the original spot
     g_commit  = {};
     g_pending = {};
     if (!g_dragReal)
@@ -1487,6 +1473,19 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
         return;
     }
     if (dw) {
+        // Released while the intention is REALLY placed under the cursor
+        // (the cursor sits on the live hole, or on the committed target):
+        // reveal the window in place — nothing to end, move, or fake.
+        if (g_commit.active && (winAt(c).lock() == dw || sameCommit(signatureAt(m, c, dw), g_commit))) {
+            g_dragWin.reset();
+            g_commit  = {};
+            g_pending = {};
+            g_origWS  = -1;
+            damageAll();
+            return;
+        }
+        if (g_commit.active)
+            regrab(dw); // released elsewhere before the dwell: pull out, classic drop below
         g_pending = {};
         Rect      tiles[N_TILES];
         int       drop = -1;
@@ -1514,12 +1513,6 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
                     break;
                 }
             }
-            // Released over the shown intention's HOLE: the under-search
-            // finds nothing there (the held window is skipped in draws but
-            // present in the capture at that very slot) — the freeze-frame
-            // promised a specific split, honor it.
-            if (!under && g_commit.active && drop == g_commit.tile)
-                under = g_commit.under.lock();
             if (dw->workspaceID() == drop + 1) {
                 // Same view: end the grab-drag right at the drop point —
                 // the dwindle insert splits `under` exactly like the desktop.
@@ -1871,7 +1864,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.9"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.10"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
