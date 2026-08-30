@@ -36,6 +36,7 @@
 #include <hyprland/src/managers/animation/DesktopAnimationManager.hpp>
 #include <hyprland/src/managers/eventLoop/EventLoopManager.hpp>
 #include <hyprland/src/managers/eventLoop/EventLoopTimer.hpp>
+#include <hyprland/src/managers/CursorManager.hpp>
 #include <hyprland/src/managers/KeybindManager.hpp>
 #include <hyprland/src/managers/input/InputManager.hpp>
 #include <hyprland/src/devices/IKeyboard.hpp>
@@ -1100,6 +1101,13 @@ static void toggle() {
         g_scrollProg = 1.0f; // open lands settled — no flip animation
         g_tourDone   = false;
         captureWorkspaces(m); // snapshot on open, outside the render pass
+        // The pointer must exist over the overview: the capture's workspace
+        // juggling can leave the cursor surfaceless (shouldRenderCursor
+        // needs one), and the motion-cancel delays the natural re-arm —
+        // "overview opens sometimes with no pointer". Unhide and pin the
+        // default arrow for the overview's lifetime.
+        g_pHyprRenderer->setCursorHidden(false);
+        g_pCursorManager->setCursorFromName("left_ptr");
         if (g_liveTimer)
             g_liveTimer->updateTimeout(REFRESH_MS);
     }
