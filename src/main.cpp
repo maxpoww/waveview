@@ -543,14 +543,6 @@ static void drawOverview(PHLMONITOR m, float p, int zoomTile) {
     // Hovered empty workspace: outline it as a click-to-jump target.
     if (!dragW && g_hoverTile >= 0)
         drawBorder(tileBox(g_hoverTile), kHoverCol, std::max(2.0, tiles[g_hoverTile].h * 0.01));
-    // Per-tile window counts: the design's gap exaggeration applies only to
-    // multi-window workspaces (solo/maximized stays full-bleed, smart-gaps
-    // style — the mockup's workspace 1).
-    int tileWins[N_TILES] = {};
-    for (auto& cw : g_wins)
-        if (cw.tile >= 0 && cw.tile < N_TILES)
-            tileWins[cw.tile]++;
-
     for (auto& cw : g_wins) {
         const auto tex = cw.fb ? cw.fb->getTexture() : nullptr;
         if (!tex)
@@ -565,17 +557,27 @@ static void drawOverview(PHLMONITOR m, float p, int zoomTile) {
             continue;
         }
 
-        // Design gap exaggeration (DSN_WIN_GAP): the literal miniature of the
-        // desktop gaps is ~3x too subtle to read; multi-window tiles inset
-        // each window by half the design gap per side. Scales with p so the
+        // Edge-aware gaps (Max's rule): a window edge NEAR the view bound
+        // (within the mapped desktop outer-gap) SNAPS FLUSH to it — no
+        // per-window outer gaps, ever — while INNER edges (seams between
+        // windows) inset by half the design gap. Solo and multi-window
+        // views therefore share the same envelope (the full tile), and
+        // only seams carry visible gap. Everything lerps with `p` so the
         // close-zoom still lands pixel-exact on the real desktop.
-        if (tileWins[cw.tile] >= 2) {
-            const double dx = DSN_WIN_GAP * 0.5 * tiles[cw.tile].w * p;
-            const double dy = DSN_WIN_GAP * 0.5 * tiles[cw.tile].h * p;
-            mini.x += dx;
-            mini.y += dy;
-            mini.w = std::max(1.0, mini.w - 2.0 * dx);
-            mini.h = std::max(1.0, mini.h - 2.0 * dy);
+        {
+            const Rect&  t    = tiles[cw.tile];
+            const double thrX = t.w * 0.02, thrY = t.h * 0.02;
+            const double sX   = DSN_WIN_GAP * 0.5 * t.w, sY = DSN_WIN_GAP * 0.5 * t.h;
+            double x0 = mini.x, y0 = mini.y, x1 = mini.x + mini.w, y1 = mini.y + mini.h;
+            const double tx0 = (x0 - t.x < thrX) ? t.x : x0 + sX;
+            const double ty0 = (y0 - t.y < thrY) ? t.y : y0 + sY;
+            const double tx1 = (t.x + t.w - x1 < thrX) ? t.x + t.w : x1 - sX;
+            const double ty1 = (t.y + t.h - y1 < thrY) ? t.y + t.h : y1 - sY;
+            x0 = mix(x0, tx0, p);
+            y0 = mix(y0, ty0, p);
+            x1 = mix(x1, tx1, p);
+            y1 = mix(y1, ty1, p);
+            mini = Rect{x0, y0, std::max(1.0, x1 - x0), std::max(1.0, y1 - y0)};
         }
         const CBox box  = dispRect(CBox{mini.x, mini.y, mini.w, mini.h});
         cw.screen       = box; // remembered for pointer hit-testing
