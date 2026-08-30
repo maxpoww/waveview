@@ -231,16 +231,24 @@ static Time::steady_tp g_boostUntil{};  // fast recapture while a real re-tile s
 static PHLWINDOWREF    g_watchWin;
 static bool            g_watchFloatExpect = false;
 static Time::steady_tp g_watchSince{};
-// Right-drag resize (v0.24): no drag-controller session and no cursor warps
-// — resizeTarget() applies scaled deltas directly (dwindle adjusts ratios,
-// floats change size), so none of the warp-feedback hazards of the move
-// machinery exist here. The grab quadrant on the THUMBNAIL picks the corner,
-// exactly like grabbing near a corner on the desktop.
+// Border resize (v0.25): hovering a thumbnail's edge flips the pointer to a
+// resize shape; the LEFT press then resizes instead of moving — exactly the
+// desktop's resize_on_border, scaled into the tile. No drag-controller
+// session and no cursor warps — resizeTarget() applies scaled deltas
+// directly (dwindle adjusts ratios, floats change size), so none of the
+// warp-feedback hazards of the move machinery exist here. Edges resize one
+// axis (the mask zeroes the other), corners both.
 static bool                g_resizing     = false;
 static PHLWINDOWREF        g_resizeWin;
 static Layout::eRectCorner g_resizeCorner = Layout::CORNER_NONE;
+static Vector2D            g_resizeMask;  // 1/0 per axis: which deltas this zone applies
 static Vector2D            g_resizeLast;  // drawn-space cursor at the last applied step
 static Vector2D            g_resizeScale; // drawn px -> desktop logical px for the window's tile
+// Hover side of it: the zone under the pointer, live between motions.
+static PHLWINDOWREF        g_edgeWin;
+static Layout::eRectCorner g_edgeCorner = Layout::CORNER_NONE;
+static Vector2D            g_edgeMask;
+static std::string         g_edgeShape; // resize cursor we set; empty = not ours
 
 // Zoom animation: 0 = zoomed fully into g_zoomTile (that workspace fills the
 // screen), 1 = the whole 3x3 grid at its rest layout. Opening animates 0->1,
@@ -1226,7 +1234,7 @@ static void onMouseMove(Vector2D, Event::SCallbackInfo& info) {
             return;
         }
         const Vector2D c = cursorDrawSpace(m);
-        const Vector2D d{(c.x - g_resizeLast.x) * g_resizeScale.x, (c.y - g_resizeLast.y) * g_resizeScale.y};
+        const Vector2D d{(c.x - g_resizeLast.x) * g_resizeScale.x * g_resizeMask.x, (c.y - g_resizeLast.y) * g_resizeScale.y * g_resizeMask.y};
         g_resizeLast     = c;
         if (d.x != 0.0 || d.y != 0.0) {
             g_layoutManager->resizeTarget(d, rw->layoutTarget(), g_resizeCorner);
@@ -1660,6 +1668,43 @@ static void restoreOriginal() {
     armFloatWatch(dw); // cancels are gesture ends too
 }
 
+// Which border zone of drawn rect `r` is `c` in? Fills the corner Hyprland's
+// resize should push, the per-axis mask (edges move one axis, corners both)
+// and the cursor-spec shape name. The zone hugs the INSIDE of the rect —
+// outside it is the seam, or a sibling. Capped so tiny thumbnails keep a
+// grabbable interior for the move gesture.
+static constexpr double EDGE_ZONE = 8.0; // drawn px
+static const char*      edgeZoneAt(const CBox& r, const Vector2D& c, Layout::eRectCorner& corner, Vector2D& mask) {
+    const double zx = std::min(EDGE_ZONE, r.w / 4.0), zy = std::min(EDGE_ZONE, r.h / 4.0);
+    const bool   L = c.x - r.x < zx, R = r.x + r.w - c.x < zx;
+    const bool   T = c.y - r.y < zy, B = r.y + r.h - c.y < zy;
+    corner         = Layout::CORNER_NONE;
+    if (!L && !R && !T && !B)
+        return nullptr;
+    mask = {L || R ? 1.0 : 0.0, T || B ? 1.0 : 0.0};
+    if (T)
+        corner = L ? Layout::CORNER_TOPLEFT : Layout::CORNER_TOPRIGHT;
+    else if (B)
+        corner = R ? Layout::CORNER_BOTTOMRIGHT : Layout::CORNER_BOTTOMLEFT;
+    else
+        corner = L ? Layout::CORNER_BOTTOMLEFT : Layout::CORNER_BOTTOMRIGHT;
+    if (mask.x == 0.0)
+        return "ns-resize";
+    if (mask.y == 0.0)
+        return "ew-resize";
+    return (corner == Layout::CORNER_TOPLEFT || corner == Layout::CORNER_BOTTOMRIGHT) ? "nwse-resize" : "nesw-resize";
+}
+
+// Leave the zone: drop hover state and give the pointer back its default.
+static void resetEdgeCursor() {
+    g_edgeWin.reset();
+    g_edgeCorner = Layout::CORNER_NONE;
+    if (!g_edgeShape.empty()) {
+        g_pCursorManager->setCursorFromName("left_ptr");
+        g_edgeShape.clear();
+    }
+}
+
 // Shared by motion and grid-scroll: recompute hover/drag targets at cursor `c`
 // (a scroll moves the tiles under a stationary cursor, so hover must follow).
 static void updateHoverAt(PHLMONITOR m, const Vector2D& c) {
@@ -1706,6 +1751,24 @@ static void updateHoverAt(PHLMONITOR m, const Vector2D& c) {
         g_hoverTile = tile;
         damageAll();
     }
+
+    // Border zones: near a thumbnail's edge the pointer flips to a resize
+    // shape and the next press resizes instead of moving.
+    const char* shape = nullptr;
+    if (const auto hw = hov.lock(); hw && !hw->isFullscreen())
+        for (auto it = g_wins.rbegin(); it != g_wins.rend(); ++it)
+            if (it->win.lock() == hw && it->screen.w > 0.0) {
+                shape = edgeZoneAt(it->screen, c, g_edgeCorner, g_edgeMask);
+                break;
+            }
+    if (shape) {
+        g_edgeWin = hov;
+        if (g_edgeShape != shape) {
+            g_pCursorManager->setCursorFromName(shape);
+            g_edgeShape = shape;
+        }
+    } else
+        resetEdgeCursor();
 }
 
 // Scroll while open flips between the two pages, clamped — never a loop.
@@ -1756,7 +1819,7 @@ static void onMouseAxis(IPointer::SAxisEvent e, Event::SCallbackInfo& info) {
 // tile under the cursor, moving it to that workspace. All left-clicks are swallowed
 // so nothing leaks through to the desktop underneath.
 static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) {
-    if (!g_active || g_animTarget < 0.5f || (e.button != BTN_LEFT && e.button != BTN_RIGHT))
+    if (!g_active || g_animTarget < 0.5f || e.button != BTN_LEFT)
         return;
     const auto m = g_captureMon.lock();
     if (!m)
@@ -1764,44 +1827,33 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
     info.cancelled = true;
 
     const Vector2D c = cursorDrawSpace(m);
-    if (e.button == BTN_RIGHT) {
-        if (e.state != WL_POINTER_BUTTON_STATE_PRESSED) {
-            endRealResize();
-            return;
-        }
-        if (g_resizing || g_dragWin.lock())
-            return; // one hand, one gesture
-        const auto w = winAt(c).lock();
-        if (!w || w->isFullscreen())
-            return;
-        Rect tiles[N_TILES];
-        if (computeTiles(m, tiles) != N_TILES)
-            return;
-        const int t = waveview_tile_for_workspace(w->workspaceID());
-        if (t < 0 || tiles[t].w <= 0.0 || tiles[t].h <= 0.0)
-            return;
-        double ux, uy, uw, uh;
-        usableArea(m, ux, uy, uw, uh);
-        g_resizeCorner = Layout::CORNER_BOTTOMRIGHT;
-        for (auto it = g_wins.rbegin(); it != g_wins.rend(); ++it)
-            if (it->win.lock() == w && it->screen.w > 0.0) {
-                g_resizeCorner = Layout::cornerFromBox(CBox{it->screen.x, it->screen.y, it->screen.w, it->screen.h}, c);
-                break;
-            }
-        g_resizing    = true;
-        g_resizeWin   = w;
-        g_resizeLast  = c;
-        g_resizeScale = {uw / tiles[t].w, uh / tiles[t].h};
-        g_watchWin.reset(); // dwindle ratio pushes are not float leaks
-        trace("resize grab ws=%d corner=%d", (int)w->workspaceID(), (int)g_resizeCorner);
-        g_boostUntil = Time::steadyNow() + BOOST_MS;
-        if (g_liveTimer)
-            g_liveTimer->updateTimeout(std::chrono::milliseconds(50));
-        return;
-    }
     if (e.state == WL_POINTER_BUTTON_STATE_PRESSED) {
         if (g_resizing)
-            return; // one hand, one gesture
+            return; // already mid-resize (stray second press)
+        // Border press: the pointer sits on a resize zone — this gesture
+        // resizes. The interior grab below moves.
+        if (const auto ew = g_edgeWin.lock(); ew && !ew->isFullscreen() && !g_dragWin.lock()) {
+            Rect      tiles[N_TILES];
+            const int t = waveview_tile_for_workspace(ew->workspaceID());
+            if (t >= 0 && computeTiles(m, tiles) == N_TILES && tiles[t].w > 0.0 && tiles[t].h > 0.0) {
+                double ux, uy, uw, uh;
+                usableArea(m, ux, uy, uw, uh);
+                (void)ux;
+                (void)uy;
+                g_resizing     = true;
+                g_resizeWin    = ew;
+                g_resizeLast   = c;
+                g_resizeCorner = g_edgeCorner;
+                g_resizeMask   = g_edgeMask;
+                g_resizeScale  = {uw / tiles[t].w, uh / tiles[t].h};
+                g_watchWin.reset(); // dwindle ratio pushes are not float leaks
+                trace("resize grab ws=%d corner=%d mask=(%.0f,%.0f)", (int)ew->workspaceID(), (int)g_resizeCorner, g_resizeMask.x, g_resizeMask.y);
+                g_boostUntil = Time::steadyNow() + BOOST_MS;
+                if (g_liveTimer)
+                    g_liveTimer->updateTimeout(std::chrono::milliseconds(50));
+                return;
+            }
+        }
         g_pressPos  = c;
         g_dragMoved = false;
         g_pressTile = -1;
@@ -1829,6 +1881,13 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
         return;
     }
 
+    // Released mid-resize: sizes applied live are final — settle and re-read
+    // the zone (the border may have moved out from under the pointer).
+    if (g_resizing) {
+        endRealResize();
+        updateHoverAt(m, c);
+        return;
+    }
     // Released: a click (never left the slop) jumps — to the window, or to an empty
     // workspace; a real drag drops the window onto the tile under the cursor.
     const auto dw        = g_dragWin.lock();
@@ -1994,6 +2053,7 @@ static void onRender(eRenderStage stage) {
         g_dragWin.reset();
         g_resizing = false;
         g_resizeWin.reset();
+        resetEdgeCursor();
         g_hoverTile = -1;
         g_pressTile = -1;
         if (g_liveTimer)
@@ -2058,6 +2118,8 @@ static void flipToPage(int page) {
 static void closeOverview() {
     if (g_animTarget < 0.5f)
         return;
+    endRealResize();   // sizes applied live are final; just settle
+    resetEdgeCursor(); // the desktop must not inherit a resize pointer
     restoreOriginal(); // never leave a real drag dangling; a commit is undone
     g_dragWin.reset();
     g_dragMoved  = false;
@@ -2266,7 +2328,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.24"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.25"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
@@ -2287,6 +2349,7 @@ APICALL EXPORT void PLUGIN_EXIT() {
     g_watchWin.reset();
     g_resizing = false;
     g_resizeWin.reset();
+    resetEdgeCursor();
     g_commit  = {};
     g_pending = {};
     g_renderListener.reset();
