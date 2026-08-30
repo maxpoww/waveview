@@ -884,17 +884,15 @@ static void drawOverview(PHLMONITOR m, float p, int zoomTile) {
                 break;
             // Shapeshifting ghost: eased dims previewing the destination
             // slot, anchored by the grab point as a fraction of the box.
-            // The SHAPE reads from the frosted plate + border; the window
-            // content never stretches — it keeps its own aspect, uniformly
-            // scaled to fit inside, so it can't balloon or squash mid-morph.
+            // The WINDOW ITSELF morphs (per Max — the frosted-plate stand-in
+            // read as an abstract colored shape): its content fills the whole
+            // eased box, the same treatment as the sibling halves gliding
+            // beneath it.
             CBox b{g_dragCursor.x - g_grabFracX * g_ghostW, g_dragCursor.y - g_grabFracY * g_ghostH, g_ghostW,
                    g_ghostH};
             const int round = (int)std::lround(DSN_WIN_ROUND * m->m_scale * p); // same corners as the settled minis
             haloBorder(b, round);
-            renderRect(b, CHyprColor(0.10, 0.10, 0.12, 0.65), round);
-            const double sc = std::min(b.w / std::max(1.0, cw.screen.w), b.h / std::max(1.0, cw.screen.h));
-            const double cwd = cw.screen.w * sc, chd = cw.screen.h * sc;
-            drawTex(tex, CBox{b.x + (b.w - cwd) / 2.0, b.y + (b.h - chd) / 2.0, cwd, chd}, round);
+            drawTex(tex, b, round);
             break;
         }
     }
@@ -984,6 +982,13 @@ static void beginRealDrag(PHLWINDOW dw) {
     g_dragHomeCenter     = home;
     g_pCompositor->warpCursorTo(home, true);
     g_layoutManager->beginDragTarget(dw->layoutTarget(), MBIND_MOVE);
+    // The controller can reject the grab (no target kept). Claiming
+    // g_dragReal anyway means the release later ends a drag the
+    // compositor never held — dragEnd() derefs null and crashes.
+    if (!g_layoutManager->dragController()->target()) {
+        g_pCompositor->warpCursorTo(saved, true);
+        return;
+    }
     g_layoutManager->moveMouse(home + Vector2D(3, 3)); // trip the drag threshold
     g_layoutManager->moveMouse(home);
     // Park the float far offscreen for the drag's duration: it floats at
@@ -1011,9 +1016,16 @@ static void placeAt(PHLWINDOW dw, const Vector2D& desk, PHLWINDOW under) {
     if (under)
         Desktop::focusState()->fullWindowFocus(under, Desktop::FOCUS_REASON_DESKTOP_STATE_CHANGE);
     g_layoutManager->beginDragTarget(dw->layoutTarget(), MBIND_MOVE);
-    g_layoutManager->moveMouse(desk + Vector2D(3, 3));
-    g_layoutManager->moveMouse(desk);
-    g_layoutManager->endDragTarget();
+    // The begin can silently reject (the controller keeps no target); ending
+    // a targetless drag segfaults inside dragEnd() — compositor down.
+    if (g_layoutManager->dragController()->target()) {
+        g_layoutManager->moveMouse(desk + Vector2D(3, 3));
+        g_layoutManager->moveMouse(desk);
+        // The drag motion itself can drop the target (the controller aborts
+        // mid-drag); the earlier check is stale by now. Re-check or crash.
+        if (g_layoutManager->dragController()->target())
+            g_layoutManager->endDragTarget();
+    }
     g_pCompositor->warpCursorTo(saved, true);
 }
 
@@ -1027,14 +1039,25 @@ static void placeAt(PHLWINDOW dw, const Vector2D& desk, PHLWINDOW under) {
 static void endRealDrag(std::optional<Vector2D> at, PHLWINDOW splitTarget) {
     if (!g_dragReal)
         return;
-    g_dragReal           = false;
+    g_dragReal = false;
+    // The compositor's drag target can die while we hold the grab (the
+    // window closes mid-drag); dragEnd() dereferences it without a check
+    // and takes Hyprland down. No live target → nothing to end.
+    if (!g_layoutManager->dragController()->target())
+        return;
+
     const Vector2D dest  = at.value_or(g_dragHomeCenter);
     const Vector2D saved = g_pInputManager->getMouseCoordsInternal();
     g_pCompositor->warpCursorTo(dest, true);
     if (splitTarget)
         Desktop::focusState()->fullWindowFocus(splitTarget, Desktop::FOCUS_REASON_DESKTOP_STATE_CHANGE);
     g_layoutManager->moveMouse(dest);
-    g_layoutManager->endDragTarget();
+    // The check at the top is stale by now: the focus change and the drag
+    // motion at the drop point both run through the controller and can drop
+    // the target themselves (this exact gap took the compositor down twice
+    // on 2026-08-30 — dragEnd() on a target freed during moveMouse).
+    if (g_layoutManager->dragController()->target())
+        g_layoutManager->endDragTarget();
     g_pCompositor->warpCursorTo(saved, true);
 }
 
@@ -1168,6 +1191,10 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
     }
     if (!dw && !moved && pressTile >= 0) {
         jumpTo(pressTile + 1); // click on an empty workspace → jump there, closing the overview
+        return;
+    }
+    if (!dw && moved) {
+        endRealDrag(std::nullopt); // grabbed window died mid-drag: fold the grab, keep no state
         return;
     }
     if (dw) {
@@ -1583,7 +1610,9 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     g_pEventLoopManager->addTimer(g_liveTimer);
     HyprlandAPI::addNotification(handle, std::string("[waveview] loaded -- ") + waveview_hello(),
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.2"};
+    // Bump on every behavior change: crash reports print this, and it's the
+    // only way to tell a stale loaded .so from the freshly built one.
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.3"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
