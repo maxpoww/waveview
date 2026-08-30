@@ -71,12 +71,12 @@ static constexpr int N_TILES = 18;
 // cards / dim / numbers), breathing margins, soft corners, and in-tile
 // window gaps ~3x their literal miniature (solo windows stay full-bleed —
 // smart gaps).
-static constexpr double DSN_GAP        = 16.0; // between tiles
+static constexpr double DSN_GAP        = 20.0; // between tiles
 static constexpr double DSN_OUTER      = 35.0; // side + bottom margins
 static constexpr double DSN_TOP_GAP    = 12.0; // below the bar
 static constexpr double DSN_TILE_ROUND = 28.0; // hover/drop frame corners
 static constexpr double DSN_WIN_ROUND  = 20.0; // window mini corners
-static constexpr double DSN_WIN_GAP    = 0.022; // in-tile gap, fraction of tile
+static constexpr double DSN_WIN_GAP    = 0.028; // in-tile gap, fraction of tile
 
 inline HANDLE              PHANDLE = nullptr;
 static bool                g_active = false;
