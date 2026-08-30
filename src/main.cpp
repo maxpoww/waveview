@@ -1079,6 +1079,24 @@ static void onMouseMove(Vector2D, Event::SCallbackInfo& info) {
     updateHoverAt(m, cursorDrawSpace(m));
 }
 
+// Focus hops with every commit (dwindle needs the split target focused), and
+// the dim / border-fade / alpha transitions it triggers keep animating across
+// several captures — reading as glows ("lightnings") on OTHER tiles while a
+// window is being moved somewhere else. All of these are compositor-side
+// cosmetics with no client-redraw dependency (unlike geometry — the
+// freeze-frame lesson), so snapping them everywhere is safe.
+static void warpFocusFx() {
+    for (auto& w : g_pCompositor->m_windows) {
+        if (!w || !w->m_isMapped)
+            continue;
+        w->m_alpha.warp();
+        w->m_dimPercent->warp();
+        w->m_borderFadeAnimationProgress->warp();
+        w->m_realShadowColor->warp();
+        w->m_realGlowColor->warp();
+    }
+}
+
 // Begin the compositor's own drag for `dw` at GRAB time: the layout floats
 // the window out and re-tiles the siblings immediately (the live thumbnails
 // show it — no hole). The cursor warps to the window's desktop centre to
@@ -1110,6 +1128,7 @@ static void beginRealDrag(PHLWINDOW dw, bool capture) {
     g_layoutManager->setTargetGeom(CBox{-20000.0, -20000.0, wb.w, wb.h}, dw->layoutTarget());
     g_pCompositor->warpCursorTo(saved, true);
     g_dragReal = true;
+    warpFocusFx(); // grab/regrab focus churn must not glow through captures
     // A re-commit passes capture=false: it re-inserts immediately after and
     // captures THEN — snapshotting the pulled-out intermediate made every
     // re-placement read as a double bounce. (NO geometry warping here: a
@@ -1281,6 +1300,7 @@ static void commitAt(PHLMONITOR m, const Vector2D& c, PHLWINDOW dw, const LiveCo
     g_commit     = sig;
     g_lastCommit = Time::steadyNow();
     g_boostUntil = Time::steadyNow() + BOOST_MS;
+    warpFocusFx();
     captureWorkspaces(m);
     if (g_liveTimer)
         g_liveTimer->updateTimeout(std::chrono::milliseconds(50));
@@ -1591,6 +1611,7 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
         g_commit  = {};
         g_origWS  = -1;
         g_boostUntil = Time::steadyNow() + BOOST_MS;
+        warpFocusFx(); // the drop's focus churn must not glow through the settle captures
         captureWorkspaces(m);
         if (g_liveTimer)
             g_liveTimer->updateTimeout(std::chrono::milliseconds(50));
@@ -1912,7 +1933,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.12"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.13"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
