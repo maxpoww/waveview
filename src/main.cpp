@@ -447,15 +447,37 @@ static void captureWindows(PHLMONITOR m, uint32_t mask = ALL_TILES) {
                 cw.fb = std::move(pb.second.fb); // last cycle's FB, storage intact
                 break;
             }
+        // Mid-spring, windows genuinely OVERLAP in the workspace snapshot
+        // (the landed window slides over the target's kept half; siblings
+        // cross while re-tiling) — a crop taken then contains slivers of
+        // the neighbour ("the content gets mixed"). While this window
+        // overlaps any sibling, hold its last clean crop; the refresh
+        // resumes the moment they separate.
+        bool overlapped = false;
+        for (auto& o : g_pCompositor->m_windows) {
+            if (!o || o == w || !o->m_isMapped || o->isHidden() || o->workspaceID() != w->workspaceID())
+                continue;
+            const CBox   ob = o->getWindowMainSurfaceBox();
+            const double ix = std::min(wb.x + wb.w, ob.x + ob.w) - std::max(wb.x, ob.x);
+            const double iy = std::min(wb.y + wb.h, ob.y + ob.h) - std::max(wb.y, ob.y);
+            if (ix > 1.0 && iy > 1.0) {
+                overlapped = true;
+                break;
+            }
+        }
+
         // Off-mask windows keep last cycle's crop untouched (their tile's
         // snapshot wasn't re-rendered either) — unless the FB is missing or
         // wrong-sized, which forces a fresh crop regardless.
         bool fresh = (mask & (1u << tile)) != 0;
         if (!cw.fb) {
             cw.fb = g_pHyprRenderer->createFB("waveview-win");
-            fresh  = true;
-        }
-        if (cw.fb->m_size != Vector2D(fbw, fbh)) {
+            cw.fb->alloc(fbw, fbh, DRM_FORMAT_ABGR8888);
+            fresh      = true;
+            overlapped = false; // no clean crop to keep — even a mixed one beats a blank
+        } else if (overlapped) {
+            fresh = false; // hold the last clean crop (size drift bridged by cover-crop)
+        } else if (cw.fb->m_size != Vector2D(fbw, fbh)) {
             cw.fb->release();
             cw.fb->alloc(fbw, fbh, DRM_FORMAT_ABGR8888);
             fresh = true;
@@ -2073,7 +2095,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.18"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.19"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
