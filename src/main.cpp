@@ -207,6 +207,12 @@ static int             g_origWS = -1;   // cancel restores these
 static Vector2D        g_origHome{};
 static bool            g_origFloating = false; // float state at gesture start
 static uint32_t        g_dirtyTiles   = 0;     // tiles touched since the last full capture
+// The commit machinery warps the cursor (beginRealDrag / endRealDrag seed
+// their drags with warps); each warp fires a SYNTHETIC motion event that
+// re-entered updateHoverAt and overwrote g_dragCursor mid-commit — the
+// trace showed a commit with desk=(-579,-622), an off-screen drop point,
+// which is how dwindle got fed garbage (and windows came out floating).
+static bool            g_busy = false;
 static Time::steady_tp g_boostUntil{};  // fast recapture while a real re-tile springs
 
 // Zoom animation: 0 = zoomed fully into g_zoomTile (that workspace fills the
@@ -246,6 +252,7 @@ static void closeOverview();
 static void beginRealDrag(PHLWINDOW dw, bool capture = true);
 static void endRealDrag(std::optional<Vector2D> at, PHLWINDOW splitTarget = nullptr);
 static void maybeCommit(PHLMONITOR m);
+static void restoreFloatState(PHLWINDOW dw);
 
 static void damageAll() {
     for (auto& m : g_pCompositor->m_monitors) {
@@ -1135,6 +1142,8 @@ static void onMouseMove(Vector2D, Event::SCallbackInfo& info) {
     if (!m)
         return;
     info.cancelled   = true;
+    if (g_busy)
+        return; // the machinery's own cursor warps must not feed back into it
     updateHoverAt(m, cursorDrawSpace(m));
 }
 
@@ -1171,8 +1180,10 @@ static void beginRealDrag(PHLWINDOW dw, bool capture) {
     g_layoutManager->beginDragTarget(dw->layoutTarget(), MBIND_MOVE);
     // The controller can reject the grab (no target kept). Claiming
     // g_dragReal anyway means the release later ends a drag the
-    // compositor never held — dragEnd() derefs null and crashes.
+    // compositor never held — dragEnd() derefs null and crashes. The
+    // begin may still have floated the window before rejecting: undo it.
     if (!g_layoutManager->dragController()->target()) {
+        restoreFloatState(dw);
         g_pCompositor->warpCursorTo(saved, true);
         return;
     }
@@ -1373,6 +1384,11 @@ static void commitAt(PHLMONITOR m, const Vector2D& c, PHLWINDOW dw, const LiveCo
     Rect tiles[N_TILES];
     if (computeTiles(m, tiles) != N_TILES)
         return;
+    // Stale-signature net: if the aim point no longer sits in the signature's
+    // tile, the mapping would extrapolate to nonsense coordinates — abort and
+    // let the next tick re-read the world.
+    if (!CBox{tiles[sig.tile].x, tiles[sig.tile].y, tiles[sig.tile].w, tiles[sig.tile].h}.containsPoint(c))
+        return;
     const auto     under = sig.under.lock();
     const Vector2D desk  = under ? dropPointFor(under, sig.side) : deskAt(m, tiles[sig.tile], c);
     trace("commit tile=%d side=%d under=%p ws=%d desk=(%.0f,%.0f)", sig.tile, sig.side, (void*)under.get(),
@@ -1460,10 +1476,14 @@ static void maybeCommit(PHLMONITOR m) {
         return;
     if (Time::steadyNow() - g_lastCommit < COMMIT_COOLDOWN)
         return;
+    // Freeze the aim before the machinery runs — its warps must not move it.
+    const Vector2D at = g_dragCursor;
+    g_busy             = true;
     if (g_commit.active)
         regrab(dw);
     if (sig.active)
-        commitAt(m, g_dragCursor, dw, sig);
+        commitAt(m, at, dw, sig);
+    g_busy = false;
 }
 
 // Cancel from any state: the window goes back to the workspace and spot the
@@ -1729,6 +1749,7 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
         g_dragWin.reset();
         g_commit  = {};
         g_origWS  = -1;
+        restoreFloatState(dw); // last-resort net: no gesture may leak a float
         g_boostUntil = Time::steadyNow() + BOOST_MS;
         warpFocusFx(); // the drop's focus churn must not glow through the settle captures
         captureWorkspaces(m, g_dirtyTiles ? g_dirtyTiles : ALL_TILES);
@@ -2052,7 +2073,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.17"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.18"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
