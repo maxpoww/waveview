@@ -203,6 +203,7 @@ static LiveCommit      g_pending;       // last seen hover signature
 static Time::steady_tp g_pendingSince{};
 static int             g_origWS = -1;   // cancel restores these
 static Vector2D        g_origHome{};
+static bool            g_origFloating = false; // float state at gesture start
 static Time::steady_tp g_boostUntil{};  // fast recapture while a real re-tile springs
 
 // Zoom animation: 0 = zoomed fully into g_zoomTile (that workspace fills the
@@ -1154,6 +1155,16 @@ static void beginRealDrag(PHLWINDOW dw, bool capture) {
             captureWorkspaces(m); // show the re-tile right away
 }
 
+// The grab floats the window out of the layout; endDragTarget() re-tiles
+// it. Every guarded path that SKIPS the end (dead drag target — the crash
+// guards) leaks that float ("i grabbed a window and it became floating").
+// Called after every end attempt: restores whatever the window was when
+// the gesture started, and no-ops when the end completed normally.
+static void restoreFloatState(PHLWINDOW dw) {
+    if (dw && dw->m_isMapped && !dw->isFullscreen() && dw->m_isFloating != g_origFloating)
+        g_layoutManager->changeFloatingMode(dw->layoutTarget());
+}
+
 // A clean synthetic re-place: begin+end a whole drag around a KNOWN static
 // window state, splitting `under` at `desk` (dwindle insert). Used after a
 // cross-workspace move — running the positional insert while the original
@@ -1176,6 +1187,7 @@ static void placeAt(PHLWINDOW dw, const Vector2D& desk, PHLWINDOW under) {
         if (g_layoutManager->dragController()->target())
             g_layoutManager->endDragTarget();
     }
+    restoreFloatState(dw);
     g_pCompositor->warpCursorTo(saved, true);
 }
 
@@ -1192,9 +1204,12 @@ static void endRealDrag(std::optional<Vector2D> at, PHLWINDOW splitTarget) {
     g_dragReal = false;
     // The compositor's drag target can die while we hold the grab (the
     // window closes mid-drag); dragEnd() dereferences it without a check
-    // and takes Hyprland down. No live target → nothing to end.
-    if (!g_layoutManager->dragController()->target())
+    // and takes Hyprland down. No live target → nothing to end — but the
+    // grab already floated the window out, so undo that much.
+    if (!g_layoutManager->dragController()->target()) {
+        restoreFloatState(g_dragWin.lock());
         return;
+    }
 
     const Vector2D dest  = at.value_or(g_dragHomeCenter);
     const Vector2D saved = g_pInputManager->getMouseCoordsInternal();
@@ -1216,6 +1231,7 @@ static void endRealDrag(std::optional<Vector2D> at, PHLWINDOW splitTarget) {
     // on 2026-08-30 — dragEnd() on a target freed during moveMouse).
     if (g_layoutManager->dragController()->target())
         g_layoutManager->endDragTarget();
+    restoreFloatState(g_dragWin.lock());
     g_pCompositor->warpCursorTo(saved, true);
 }
 
@@ -1416,6 +1432,7 @@ static void updateHoverAt(PHLMONITOR m, const Vector2D& c) {
             // The gesture's true origin, for cancel — every later re-grab
             // overwrites g_dragHomeCenter with the last committed slot.
             g_origWS         = dw->workspaceID();
+            g_origFloating   = dw->m_isFloating;
             const CBox wb    = dw->getWindowMainSurfaceBox();
             g_origHome       = {wb.x + wb.w / 2.0, wb.y + wb.h / 2.0};
             g_pending        = {};
@@ -1948,7 +1965,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.14"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.15"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
