@@ -756,17 +756,20 @@ static void drawOverview(PHLMONITOR m, float p, int zoomTile) {
         auto&       cw     = g_wins[i];
         const float target = (cw.holdPreview || (ssize_t)i == swapIdx) ? 1.f : 0.f;
         if ((ssize_t)i == swapIdx) {
-            // The half it keeps: split on the longer axis, away from the
+            // The half it keeps (seam included — matches the settled
+            // geometry exactly): split on the longer axis, away from the
             // cursor side — mirroring where dwindle puts the newcomer.
-            const CBox& b = boxes[i];
+            const CBox&  b  = boxes[i];
+            const double gX = DSN_WIN_GAP * tiles[cw.tile].w / 2.0;
+            const double gY = DSN_WIN_GAP * tiles[cw.tile].h / 2.0;
             if (b.w >= b.h) {
                 const bool left = g_dragCursor.x < b.x + b.w / 2.0;
-                cw.previewBox   = left ? CBox{b.x + b.w / 2.0, b.y, b.w / 2.0, b.h}
-                                       : CBox{b.x, b.y, b.w / 2.0, b.h};
+                cw.previewBox   = left ? CBox{b.x + b.w / 2.0 + gX, b.y, b.w / 2.0 - gX, b.h}
+                                       : CBox{b.x, b.y, b.w / 2.0 - gX, b.h};
             } else {
                 const bool top = g_dragCursor.y < b.y + b.h / 2.0;
-                cw.previewBox  = top ? CBox{b.x, b.y + b.h / 2.0, b.w, b.h / 2.0}
-                                     : CBox{b.x, b.y, b.w, b.h / 2.0};
+                cw.previewBox  = top ? CBox{b.x, b.y + b.h / 2.0 + gY, b.w, b.h / 2.0 - gY}
+                                     : CBox{b.x, b.y, b.w, b.h / 2.0 - gY};
             }
         }
         cw.previewT += (target - cw.previewT) * std::min(1.0f, g_frameDt * 14.f);
@@ -1129,16 +1132,26 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
                 for (auto& cw : g_wins) {
                     if (cw.win.lock() != under)
                         continue;
-                    const CBox& b = cw.screen;
-                    CBox        kept, given;
+                    // Halves WITH the design seam between them (each side
+                    // gives half the gap) — raw halves touched, so the pair
+                    // read slightly bigger than the settled result and
+                    // visibly 'landed' when the recapture corrected it.
+                    const CBox&  b  = cw.screen;
+                    const double gX = DSN_WIN_GAP * tiles[drop].w / 2.0;
+                    const double gY = DSN_WIN_GAP * tiles[drop].h / 2.0;
+                    CBox         kept, given;
                     if (b.w >= b.h) {
                         const bool left = c.x < b.x + b.w / 2.0;
-                        kept  = left ? CBox{b.x + b.w / 2.0, b.y, b.w / 2.0, b.h} : CBox{b.x, b.y, b.w / 2.0, b.h};
-                        given = left ? CBox{b.x, b.y, b.w / 2.0, b.h} : CBox{b.x + b.w / 2.0, b.y, b.w / 2.0, b.h};
+                        const CBox lh{b.x, b.y, b.w / 2.0 - gX, b.h};
+                        const CBox rh{b.x + b.w / 2.0 + gX, b.y, b.w / 2.0 - gX, b.h};
+                        kept  = left ? rh : lh;
+                        given = left ? lh : rh;
                     } else {
                         const bool top = c.y < b.y + b.h / 2.0;
-                        kept  = top ? CBox{b.x, b.y + b.h / 2.0, b.w, b.h / 2.0} : CBox{b.x, b.y, b.w, b.h / 2.0};
-                        given = top ? CBox{b.x, b.y, b.w, b.h / 2.0} : CBox{b.x, b.y + b.h / 2.0, b.w, b.h / 2.0};
+                        const CBox th{b.x, b.y, b.w, b.h / 2.0 - gY};
+                        const CBox bh{b.x, b.y + b.h / 2.0 + gY, b.w, b.h / 2.0 - gY};
+                        kept  = top ? bh : th;
+                        given = top ? th : bh;
                     }
                     cw.previewBox  = kept;
                     cw.previewT    = 1.f;
