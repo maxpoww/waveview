@@ -5,10 +5,15 @@
 #include <any>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <sstream>
 #include <string>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <thread>
+#include <unistd.h>
 #include <vector>
 
 // beginRender()/renderWorkspace() are protected on IHyprRenderer; capturing
@@ -712,9 +717,32 @@ static void onRender(eRenderStage stage) {
     }
 }
 
+// Tell waverunner (the dock/topbar daemon) the overview state, so it
+// conceals its surfaces while we own the screen. Fire-and-forget over its
+// control socket on a detached thread; a dead daemon = nothing to conceal.
+static void notifyWaverunner(bool on) {
+    std::thread([on] {
+        const char* rt = getenv("XDG_RUNTIME_DIR");
+        if (!rt)
+            return;
+        const int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (fd < 0)
+            return;
+        sockaddr_un addr{};
+        addr.sun_family = AF_UNIX;
+        snprintf(addr.sun_path, sizeof(addr.sun_path), "%s/waverunner.sock", rt);
+        if (connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0) {
+            const char* msg = on ? "overview-on\n" : "overview-off\n";
+            (void)!write(fd, msg, strlen(msg));
+        }
+        close(fd);
+    }).detach();
+}
+
 static void toggle() {
     const bool opening = g_animTarget < 0.5f; // currently closed/closing -> open
     g_animTarget       = opening ? 1.0f : 0.0f;
+    notifyWaverunner(opening);
     g_animLastT        = Time::steadyNow();
     if (opening) {
         g_active         = true;
@@ -772,6 +800,7 @@ static void jumpTo(int wsId) {
     g_zoomTile   = t;    // close animation pivots on (zooms into) the chosen tile
     g_animTarget = 0.0f; // animate closed
     g_animLastT  = Time::steadyNow();
+    notifyWaverunner(false);
 
     if (g_pKeybindManager) {
         const auto it = g_pKeybindManager->m_dispatchers.find("workspace");
