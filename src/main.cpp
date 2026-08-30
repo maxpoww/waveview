@@ -245,9 +245,13 @@ static void renderRect(const CBox& box, const CHyprColor& color, int round = 0) 
 // sentinel so nothing drawn later inherits the crop.
 class CUVResetElement : public IPassElement {
   public:
+    SP<Render::ITexture> tex; // whose minFilter to restore (may be null)
+    CUVResetElement(SP<Render::ITexture> t) : tex(t) {}
     virtual std::vector<UP<IPassElement>> draw() {
         g_pHyprRenderer->m_renderData.primarySurfaceUVTopLeft     = Vector2D(-1, -1);
         g_pHyprRenderer->m_renderData.primarySurfaceUVBottomRight = Vector2D(-1, -1);
+        if (tex)
+            tex->minFilter = GL_LINEAR;
         return {};
     }
     virtual bool needsLiveBlur() {
@@ -273,9 +277,17 @@ class CUVTexElement : public IPassElement {
         g_pHyprRenderer->m_renderData.primarySurfaceUVTopLeft     = uvTL;
         g_pHyprRenderer->m_renderData.primarySurfaceUVBottomRight = uvBR;
         data.allowCustomUV                                        = true;
+        // Trilinear only while morphing: these draws animate the capture
+        // through arbitrary downscales, where single-tap bilinear reduces
+        // text to crawling aliasing. The reset element restores bilinear so
+        // the settled minis keep their exact approved sharpness. The mip
+        // chain is generated at capture time — the filter must never see a
+        // texture without one (incomplete texture samples black).
+        if (data.tex)
+            data.tex->minFilter = GL_LINEAR_MIPMAP_LINEAR;
         std::vector<UP<IPassElement>> out;
         out.emplace_back(makeUnique<CTexPassElement>(data));
-        out.emplace_back(makeUnique<CUVResetElement>());
+        out.emplace_back(makeUnique<CUVResetElement>(data.tex));
         return out;
     }
     virtual bool needsLiveBlur() {
@@ -405,6 +417,16 @@ static void captureWindows(PHLMONITOR m) {
 
         g_pHyprRenderer->m_renderData.blockScreenShader = true;
         g_pHyprRenderer->endRender();
+
+        // Build the mip chain the morph draws sample through (they switch
+        // this texture to GL_LINEAR_MIPMAP_LINEAR — an incomplete texture
+        // would sample black). Redone here on every recapture because the
+        // pixels just changed. EGL is current inside the capture flow.
+        if (const auto t = cw.fb->getTexture()) {
+            t->bind();
+            glGenerateMipmap(GL_TEXTURE_2D);
+            t->unbind();
+        }
 
         for (auto& pb : prevBoxes) // carry hit-box + preview glide forward across the rebuild
             if (pb.first.lock() == w) {
@@ -1691,7 +1713,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.4"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.5"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
