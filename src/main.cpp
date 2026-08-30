@@ -213,6 +213,16 @@ static uint32_t        g_dirtyTiles   = 0;     // tiles touched since the last f
 // trace showed a commit with desk=(-579,-622), an off-screen drop point,
 // which is how dwindle got fed garbage (and windows came out floating).
 static bool            g_busy = false;
+// Every machinery function guards itself: the 2026-08-30 ws3 float leak was
+// the RELEASE path running endRealDrag/placeAt unguarded — their warps fed
+// back into updateHoverAt, which re-captured g_origFloating mid-machinery
+// (window transiently floating) and re-entered beginRealDrag. Save/restore
+// nests, so guarded functions can call each other.
+struct SBusyScope {
+    bool prev;
+    SBusyScope() : prev(g_busy) { g_busy = true; }
+    ~SBusyScope() { g_busy = prev; }
+};
 static Time::steady_tp g_boostUntil{};  // fast recapture while a real re-tile springs
 // Float-leak watch (diagnosis, v0.21): every gesture end arms this; the live
 // timer then compares the window's float state against what the gesture
@@ -1206,6 +1216,7 @@ static void warpFocusFx() {
 static void beginRealDrag(PHLWINDOW dw, bool capture) {
     if (g_dragReal || !dw || dw->isFullscreen())
         return;
+    const SBusyScope busy;
     const CBox     wb = dw->getWindowMainSurfaceBox();
     const Vector2D home{wb.x + wb.w / 2.0, wb.y + wb.h / 2.0};
     const Vector2D saved = g_pInputManager->getMouseCoordsInternal();
@@ -1294,6 +1305,7 @@ static void checkFloatWatch() {
 static void placeAt(PHLWINDOW dw, const Vector2D& desk, PHLWINDOW under) {
     if (!dw || dw->isFullscreen())
         return;
+    const SBusyScope busy;
     const Vector2D saved = g_pInputManager->getMouseCoordsInternal();
     g_pCompositor->warpCursorTo(desk, true);
     if (under)
@@ -1328,6 +1340,7 @@ static void placeAt(PHLWINDOW dw, const Vector2D& desk, PHLWINDOW under) {
 static void endRealDrag(std::optional<Vector2D> at, PHLWINDOW splitTarget) {
     if (!g_dragReal)
         return;
+    const SBusyScope busy;
     g_dragReal = false;
     // The compositor's drag target can die while we hold the grab (the
     // window closes mid-drag); dragEnd() dereferences it without a check
@@ -1458,6 +1471,7 @@ static bool sameCommit(const LiveCommit& a, const LiveCommit& b) {
 static void commitAt(PHLMONITOR m, const Vector2D& c, PHLWINDOW dw, const LiveCommit& sig) {
     if (!g_dragReal || !sig.active)
         return;
+    const SBusyScope busy;
     Rect tiles[N_TILES];
     if (computeTiles(m, tiles) != N_TILES)
         return;
@@ -1509,6 +1523,7 @@ static void commitAt(PHLMONITOR m, const Vector2D& c, PHLWINDOW dw, const LiveCo
 static void regrab(PHLWINDOW dw) {
     if (!g_commit.active)
         return;
+    const SBusyScope busy;
     trace("regrab ws=%d", (int)dw->workspaceID());
     g_commit = {};
     beginRealDrag(dw, false);
@@ -1554,19 +1569,19 @@ static void maybeCommit(PHLMONITOR m) {
     if (Time::steadyNow() - g_lastCommit < COMMIT_COOLDOWN)
         return;
     // Freeze the aim before the machinery runs — its warps must not move it.
-    const Vector2D at = g_dragCursor;
-    g_busy             = true;
+    const Vector2D   at = g_dragCursor;
+    const SBusyScope busy;
     if (g_commit.active)
         regrab(dw);
     if (sig.active)
         commitAt(m, at, dw, sig);
-    g_busy = false;
 }
 
 // Cancel from any state: the window goes back to the workspace and spot the
 // gesture started from.
 static void restoreOriginal() {
-    const auto dw = g_dragWin.lock();
+    const SBusyScope busy;
+    const auto       dw = g_dragWin.lock();
     if (dw) {
         trace("restore ws=%d -> %d", (int)dw->workspaceID(), g_origWS);
         if (const int ct = waveview_tile_for_workspace(dw->workspaceID()); ct >= 0)
@@ -1600,7 +1615,11 @@ static void restoreOriginal() {
 // (a scroll moves the tiles under a stationary cursor, so hover must follow).
 static void updateHoverAt(PHLMONITOR m, const Vector2D& c) {
     // Any pending press (window or empty tile) that leaves the slop is a drag.
-    if ((g_dragWin.lock() || g_pressTile >= 0) && !g_dragMoved && (c - g_pressPos).size() > CLICK_SLOP) {
+    // !g_dragReal: a live real drag means the origin was already captured —
+    // this block must never refire mid-gesture (it would poison g_origFloating
+    // and nest a second controller drag; the busy scopes make that impossible,
+    // this is the structural belt on top).
+    if ((g_dragWin.lock() || g_pressTile >= 0) && !g_dragMoved && !g_dragReal && (c - g_pressPos).size() > CLICK_SLOP) {
         g_dragMoved = true;
         // The grab is real from frame one: the compositor pulls the window
         // out of the layout NOW, so the siblings re-tile live (the
@@ -1700,6 +1719,8 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
         g_pressPos  = c;
         g_dragMoved = false;
         g_pressTile = -1;
+        g_watchWin.reset(); // a fresh gesture takes over: the grab's own
+                            // float-out must not read as a leak
         if (const auto w = winAt(c).lock()) {
             g_dragWin    = w;
             g_dragCursor = c;
@@ -2157,7 +2178,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.22"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.23"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
