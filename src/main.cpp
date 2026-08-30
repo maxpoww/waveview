@@ -231,6 +231,16 @@ static Time::steady_tp g_boostUntil{};  // fast recapture while a real re-tile s
 static PHLWINDOWREF    g_watchWin;
 static bool            g_watchFloatExpect = false;
 static Time::steady_tp g_watchSince{};
+// Right-drag resize (v0.24): no drag-controller session and no cursor warps
+// — resizeTarget() applies scaled deltas directly (dwindle adjusts ratios,
+// floats change size), so none of the warp-feedback hazards of the move
+// machinery exist here. The grab quadrant on the THUMBNAIL picks the corner,
+// exactly like grabbing near a corner on the desktop.
+static bool                g_resizing     = false;
+static PHLWINDOWREF        g_resizeWin;
+static Layout::eRectCorner g_resizeCorner = Layout::CORNER_NONE;
+static Vector2D            g_resizeLast;  // drawn-space cursor at the last applied step
+static Vector2D            g_resizeScale; // drawn px -> desktop logical px for the window's tile
 
 // Zoom animation: 0 = zoomed fully into g_zoomTile (that workspace fills the
 // screen), 1 = the whole 3x3 grid at its rest layout. Opening animates 0->1,
@@ -1177,6 +1187,27 @@ static bool tileEmpty(int tile) {
 // runs before the hook fires (verified in InputManager.cpp::onMouseMoved), so
 // the sprite keeps moving; what cancelling stops is focus-follows-mouse and
 // surface motion reaching the desktop underneath — which used to leak (windows
+// The resize gesture is stateless beyond its grab: sizes applied live are
+// final, so ending is just bookkeeping + a settle capture.
+static void endRealResize() {
+    if (!g_resizing)
+        return;
+    g_resizing   = false;
+    const auto w = g_resizeWin.lock();
+    g_resizeWin.reset();
+    if (!w)
+        return;
+    trace("resize end ws=%d", (int)w->workspaceID());
+    if (const int t = waveview_tile_for_workspace(w->workspaceID()); t >= 0)
+        g_dirtyTiles |= (1u << t);
+    g_boostUntil = Time::steadyNow() + BOOST_MS;
+    if (const auto m = g_captureMon.lock())
+        captureWorkspaces(m, g_dirtyTiles);
+    if (g_liveTimer)
+        g_liveTimer->updateTimeout(std::chrono::milliseconds(50));
+    damageAll();
+}
+
 // refocused, the dock revealed, topbar pills lit while the overview was open).
 // The first uncancelled motion after close re-focuses under the cursor.
 static void onMouseMove(Vector2D, Event::SCallbackInfo& info) {
@@ -1188,6 +1219,24 @@ static void onMouseMove(Vector2D, Event::SCallbackInfo& info) {
     info.cancelled   = true;
     if (g_busy)
         return; // the machinery's own cursor warps must not feed back into it
+    if (g_resizing) {
+        const auto rw = g_resizeWin.lock();
+        if (!rw || rw->isFullscreen()) {
+            endRealResize(); // window died / went fullscreen mid-gesture
+            return;
+        }
+        const Vector2D c = cursorDrawSpace(m);
+        const Vector2D d{(c.x - g_resizeLast.x) * g_resizeScale.x, (c.y - g_resizeLast.y) * g_resizeScale.y};
+        g_resizeLast     = c;
+        if (d.x != 0.0 || d.y != 0.0) {
+            g_layoutManager->resizeTarget(d, rw->layoutTarget(), g_resizeCorner);
+            if (const int t = waveview_tile_for_workspace(rw->workspaceID()); t >= 0)
+                g_dirtyTiles |= (1u << t);
+            g_boostUntil = Time::steadyNow() + BOOST_MS; // captures track the live resize
+            damageAll();
+        }
+        return;
+    }
     updateHoverAt(m, cursorDrawSpace(m));
 }
 
@@ -1707,7 +1756,7 @@ static void onMouseAxis(IPointer::SAxisEvent e, Event::SCallbackInfo& info) {
 // tile under the cursor, moving it to that workspace. All left-clicks are swallowed
 // so nothing leaks through to the desktop underneath.
 static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) {
-    if (!g_active || g_animTarget < 0.5f || e.button != BTN_LEFT)
+    if (!g_active || g_animTarget < 0.5f || (e.button != BTN_LEFT && e.button != BTN_RIGHT))
         return;
     const auto m = g_captureMon.lock();
     if (!m)
@@ -1715,7 +1764,44 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
     info.cancelled = true;
 
     const Vector2D c = cursorDrawSpace(m);
+    if (e.button == BTN_RIGHT) {
+        if (e.state != WL_POINTER_BUTTON_STATE_PRESSED) {
+            endRealResize();
+            return;
+        }
+        if (g_resizing || g_dragWin.lock())
+            return; // one hand, one gesture
+        const auto w = winAt(c).lock();
+        if (!w || w->isFullscreen())
+            return;
+        Rect tiles[N_TILES];
+        if (computeTiles(m, tiles) != N_TILES)
+            return;
+        const int t = waveview_tile_for_workspace(w->workspaceID());
+        if (t < 0 || tiles[t].w <= 0.0 || tiles[t].h <= 0.0)
+            return;
+        double ux, uy, uw, uh;
+        usableArea(m, ux, uy, uw, uh);
+        g_resizeCorner = Layout::CORNER_BOTTOMRIGHT;
+        for (auto it = g_wins.rbegin(); it != g_wins.rend(); ++it)
+            if (it->win.lock() == w && it->screen.w > 0.0) {
+                g_resizeCorner = Layout::cornerFromBox(CBox{it->screen.x, it->screen.y, it->screen.w, it->screen.h}, c);
+                break;
+            }
+        g_resizing    = true;
+        g_resizeWin   = w;
+        g_resizeLast  = c;
+        g_resizeScale = {uw / tiles[t].w, uh / tiles[t].h};
+        g_watchWin.reset(); // dwindle ratio pushes are not float leaks
+        trace("resize grab ws=%d corner=%d", (int)w->workspaceID(), (int)g_resizeCorner);
+        g_boostUntil = Time::steadyNow() + BOOST_MS;
+        if (g_liveTimer)
+            g_liveTimer->updateTimeout(std::chrono::milliseconds(50));
+        return;
+    }
     if (e.state == WL_POINTER_BUTTON_STATE_PRESSED) {
+        if (g_resizing)
+            return; // one hand, one gesture
         g_pressPos  = c;
         g_dragMoved = false;
         g_pressTile = -1;
@@ -1906,6 +1992,8 @@ static void onRender(eRenderStage stage) {
         g_active = false;
         g_hoverWin.reset();
         g_dragWin.reset();
+        g_resizing = false;
+        g_resizeWin.reset();
         g_hoverTile = -1;
         g_pressTile = -1;
         if (g_liveTimer)
@@ -2178,7 +2266,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.23"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.24"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
@@ -2197,6 +2285,8 @@ APICALL EXPORT void PLUGIN_EXIT() {
     g_dragWin.reset();
     g_hoverWin.reset();
     g_watchWin.reset();
+    g_resizing = false;
+    g_resizeWin.reset();
     g_commit  = {};
     g_pending = {};
     g_renderListener.reset();
