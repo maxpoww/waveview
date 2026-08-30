@@ -133,8 +133,13 @@ struct CapWin {
     CBox                     screen;  // last-drawn box in draw space (for hit-testing)
     float                    previewT    = 0.f; // split-preview glide: 0 = home, 1 = at its kept half
     CBox                     previewBox;        // the half it glides toward (kept for the ease-back)
+    CBox                     previewCur;        // eased chase of previewBox — crossing a split diagonal glides, never snaps
     bool                     holdPreview = false; // drop landed here: hold the preview until recapture
 };
+// One shared ease rate for every drag-preview chase (sibling halves, ghost
+// dims) — slowed from the original 14/s snap to sit closer to the desktop's
+// window spring, so reactions read as motion, not as teleports.
+static constexpr float PREVIEW_RATE = 9.f;
 static std::vector<CapWin> g_wins;
 
 // Pointer interaction, all in "draw space" (whole monitor = [0,0,transformedSize]).
@@ -273,6 +278,7 @@ static void captureWindows(PHLMONITOR m) {
         CBox  screen;
         float previewT;
         CBox  previewBox;
+        CBox  previewCur;
     };
     std::vector<std::pair<PHLWINDOWREF, Carry>> prevBoxes;
     prevBoxes.reserve(g_wins.size());
@@ -280,7 +286,7 @@ static void captureWindows(PHLMONITOR m) {
     // would blank the cursor ghost. Stash its whole capture and reuse it.
     std::optional<CapWin> stashDragged;
     for (auto& cw : g_wins) {
-        prevBoxes.emplace_back(cw.win, Carry{cw.screen, cw.previewT, cw.previewBox});
+        prevBoxes.emplace_back(cw.win, Carry{cw.screen, cw.previewT, cw.previewBox, cw.previewCur});
         if (g_dragReal && cw.win.lock() && cw.win.lock() == g_dragWin.lock()) {
             stashDragged = cw; // keep its fb alive
             continue;
@@ -347,6 +353,7 @@ static void captureWindows(PHLMONITOR m) {
                 cw.screen     = pb.second.screen;
                 cw.previewT   = pb.second.previewT;
                 cw.previewBox = pb.second.previewBox;
+                cw.previewCur = pb.second.previewCur;
                 break;
             }
 
@@ -794,20 +801,34 @@ static void drawOverview(PHLMONITOR m, float p, int zoomTile) {
             const double gY = DSN_WIN_GAP * tiles[cw.tile].h / 2.0;
             CBox         kept, given;
             quadrantSplit(b, g_dragCursor, gX, gY, kept, given);
+            // Fresh hover: previewT carries the glide from home, so the
+            // chase starts already at the half. Mid-hover the chase does
+            // the gliding — crossing a diagonal re-aims it, never snaps.
+            if (cw.previewT < 0.01f || cw.previewCur.w <= 0.0)
+                cw.previewCur = kept;
             cw.previewBox = kept;
             g_ghostWantW  = given.w; // the ghost previews ITS half
             g_ghostWantH  = given.h;
         }
-        cw.previewT += (target - cw.previewT) * std::min(1.0f, g_frameDt * 14.f);
+        cw.previewT += (target - cw.previewT) * std::min(1.0f, g_frameDt * PREVIEW_RATE);
         if (std::abs(cw.previewT - target) < 0.01f)
             cw.previewT = target;
         else
             previewMoving = true;
-        if (cw.previewT > 0.001f && cw.previewBox.w > 0.0) {
+        if (cw.previewT > 0.001f && cw.previewCur.w > 0.0) {
+            const double kc = std::min(1.0, (double)g_frameDt * PREVIEW_RATE);
+            cw.previewCur   = CBox{cw.previewCur.x + (cw.previewBox.x - cw.previewCur.x) * kc,
+                                   cw.previewCur.y + (cw.previewBox.y - cw.previewCur.y) * kc,
+                                   cw.previewCur.w + (cw.previewBox.w - cw.previewCur.w) * kc,
+                                   cw.previewCur.h + (cw.previewBox.h - cw.previewCur.h) * kc};
+            if (std::abs(cw.previewCur.x - cw.previewBox.x) + std::abs(cw.previewCur.y - cw.previewBox.y) +
+                    std::abs(cw.previewCur.w - cw.previewBox.w) + std::abs(cw.previewCur.h - cw.previewBox.h) >
+                1.0)
+                previewMoving = true;
             const double e = easeInOutCubic(cw.previewT);
             const CBox&  h = boxes[i];
-            boxes[i]       = CBox{mix(h.x, cw.previewBox.x, e), mix(h.y, cw.previewBox.y, e),
-                                  mix(h.w, cw.previewBox.w, e), mix(h.h, cw.previewBox.h, e)};
+            boxes[i]       = CBox{mix(h.x, cw.previewCur.x, e), mix(h.y, cw.previewCur.y, e),
+                                  mix(h.w, cw.previewCur.w, e), mix(h.h, cw.previewCur.h, e)};
         }
     }
     // Ghost shape chase: over an empty view it wants the full tile; over
@@ -824,7 +845,7 @@ static void drawOverview(PHLMONITOR m, float p, int zoomTile) {
                 g_ghostWantH = boxes[dragIdx].h;
             }
         }
-        const double k = std::min(1.0, (double)g_frameDt * 14.0);
+        const double k = std::min(1.0, (double)g_frameDt * PREVIEW_RATE);
         g_ghostW += (g_ghostWantW - g_ghostW) * k;
         g_ghostH += (g_ghostWantH - g_ghostH) * k;
         if (std::abs(g_ghostW - g_ghostWantW) > 0.5 || std::abs(g_ghostH - g_ghostWantH) > 0.5)
@@ -863,11 +884,17 @@ static void drawOverview(PHLMONITOR m, float p, int zoomTile) {
                 break;
             // Shapeshifting ghost: eased dims previewing the destination
             // slot, anchored by the grab point as a fraction of the box.
+            // The SHAPE reads from the frosted plate + border; the window
+            // content never stretches — it keeps its own aspect, uniformly
+            // scaled to fit inside, so it can't balloon or squash mid-morph.
             CBox b{g_dragCursor.x - g_grabFracX * g_ghostW, g_dragCursor.y - g_grabFracY * g_ghostH, g_ghostW,
                    g_ghostH};
             const int round = (int)std::lround(DSN_WIN_ROUND * m->m_scale * p); // same corners as the settled minis
             haloBorder(b, round);
-            drawTex(tex, b, round);
+            renderRect(b, CHyprColor(0.10, 0.10, 0.12, 0.65), round);
+            const double sc = std::min(b.w / std::max(1.0, cw.screen.w), b.h / std::max(1.0, cw.screen.h));
+            const double cwd = cw.screen.w * sc, chd = cw.screen.h * sc;
+            drawTex(tex, CBox{b.x + (b.w - cwd) / 2.0, b.y + (b.h - chd) / 2.0, cwd, chd}, round);
             break;
         }
     }
@@ -1221,6 +1248,7 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
                     CBox         kept, given;
                     quadrantSplit(b, c, gX, gY, kept, given);
                     cw.previewBox  = kept;
+                    cw.previewCur  = kept; // held landing: no residual glide
                     cw.previewT    = 1.f;
                     cw.holdPreview = true;
                     landBox        = given;
@@ -1230,6 +1258,7 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
             for (auto& cw : g_wins) {
                 if (cw.win.lock() == dw) {
                     cw.previewBox  = landBox; // the newcomer lands NOW, visually
+                    cw.previewCur  = landBox;
                     cw.previewT    = 1.f;
                     cw.holdPreview = true;
                 } else if (cw.win.lock() != under) {
