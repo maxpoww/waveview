@@ -363,11 +363,12 @@ static void captureWindows(PHLMONITOR m) {
     // box until the next drawOverview, and a pointer move in that gap drops the
     // hover (the border blinks ~every REFRESH_MS).
     struct Carry {
-        CBox  screen;
-        float previewT;
-        CBox  previewBox;
-        CBox  previewCur;
-        CBox  drawCur;
+        CBox                     screen;
+        float                    previewT;
+        CBox                     previewBox;
+        CBox                     previewCur;
+        CBox                     drawCur;
+        SP<Render::IFramebuffer> fb; // reused next cycle — see below
     };
     std::vector<std::pair<PHLWINDOWREF, Carry>> prevBoxes;
     prevBoxes.reserve(g_wins.size());
@@ -375,13 +376,15 @@ static void captureWindows(PHLMONITOR m) {
     // would blank the cursor ghost. Stash its whole capture and reuse it.
     std::optional<CapWin> stashDragged;
     for (auto& cw : g_wins) {
-        prevBoxes.emplace_back(cw.win, Carry{cw.screen, cw.previewT, cw.previewBox, cw.previewCur, cw.drawCur});
-        if (g_dragReal && cw.win.lock() && cw.win.lock() == g_dragWin.lock()) {
+        const bool isDragged = g_dragReal && cw.win.lock() && cw.win.lock() == g_dragWin.lock();
+        // Each window's FB rides along to the rebuild: creating a fresh GL
+        // framebuffer per window on EVERY capture (up to 20/s each during
+        // the boost) churned the driver into a progressive mid-drag
+        // slowdown ("after a few movements all gets slowed down").
+        prevBoxes.emplace_back(cw.win, Carry{cw.screen, cw.previewT, cw.previewBox, cw.previewCur, cw.drawCur,
+                                             isDragged ? nullptr : cw.fb});
+        if (isDragged)
             stashDragged = cw; // keep its fb alive
-            continue;
-        }
-        if (cw.fb) // free last cycle's textures before rebuilding
-            cw.fb->release();
     }
     g_wins.clear();
 
@@ -428,8 +431,17 @@ static void captureWindows(PHLMONITOR m) {
 
         const int fbw = std::max(1, (int)std::lround(wb.w * scale));
         const int fbh = std::max(1, (int)std::lround(wb.h * scale));
-        cw.fb         = g_pHyprRenderer->createFB("waveview-win");
-        cw.fb->alloc(fbw, fbh, DRM_FORMAT_ABGR8888);
+        for (auto& pb : prevBoxes)
+            if (pb.first.lock() == w && pb.second.fb) {
+                cw.fb = std::move(pb.second.fb); // last cycle's FB, storage intact
+                break;
+            }
+        if (!cw.fb)
+            cw.fb = g_pHyprRenderer->createFB("waveview-win");
+        if (cw.fb->m_size != Vector2D(fbw, fbh)) {
+            cw.fb->release();
+            cw.fb->alloc(fbw, fbh, DRM_FORMAT_ABGR8888);
+        }
 
         CRegion fakeDamage{0, 0, INT16_MAX, INT16_MAX};
         g_pHyprRenderer->beginRender(m, fakeDamage, Render::RENDER_MODE_FULL_FAKE, nullptr, cw.fb);
@@ -457,6 +469,9 @@ static void captureWindows(PHLMONITOR m) {
 
         g_wins.push_back(std::move(cw));
     }
+    for (auto& pb : prevBoxes)
+        if (pb.second.fb)
+            pb.second.fb->release(); // window vanished: free its texture storage
 }
 
 // Render each of the 9 workspaces into its own framebuffer thumbnail. This does
@@ -1933,7 +1948,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.13"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.14"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
