@@ -559,44 +559,84 @@ static void drawOverview(PHLMONITOR m, float p, int zoomTile) {
     // Hovered empty workspace: outline it as a click-to-jump target.
     if (!dragW && g_hoverTile >= 0)
         drawBorder(tileBox(g_hoverTile), kHoverCol, std::max(2.0, tiles[g_hoverTile].h * 0.01));
-    for (auto& cw : g_wins) {
-        const auto tex = cw.fb ? cw.fb->getTexture() : nullptr;
-        if (!tex)
-            continue;
-
-        Rect   mini;
-        double ux, uy, uw, uh;
-        usableArea(m, ux, uy, uw, uh);
-        waveview_map_window(tiles[cw.tile].x, tiles[cw.tile].y, tiles[cw.tile].w, tiles[cw.tile].h, ux, uy, uw, uh,
+    // Window boxes in three passes so identical desktop twins stay
+    // identical in the overview (per-window heuristics broke that —
+    // Max's ws5 twins rendered unequal):
+    //   A) map each window into its tile (usable-area space) and SNAP
+    //      edges near the tile bound flush to it (no outer gaps, ever);
+    //   B) PAIRWISE SEAM CENTERING: every adjacent pair shares its seam
+    //      at the midpoint between them, each side giving exactly half
+    //      the design gap — symmetric by construction;
+    //   C) lerp real→target by `p` (pixel-exact close) and draw.
+    struct MiniBox {
+        double x0, y0, x1, y1;
+    };
+    std::vector<MiniBox> real(g_wins.size()), tgt(g_wins.size());
+    std::vector<bool>    ok(g_wins.size(), false);
+    double               ux, uy, uw2, uh2;
+    usableArea(m, ux, uy, uw2, uh2);
+    for (size_t i = 0; i < g_wins.size(); ++i) {
+        auto& cw = g_wins[i];
+        Rect  mini;
+        waveview_map_window(tiles[cw.tile].x, tiles[cw.tile].y, tiles[cw.tile].w, tiles[cw.tile].h, ux, uy, uw2, uh2,
                             cw.logical.x, cw.logical.y, cw.logical.w, cw.logical.h, &mini);
         if (mini.w <= 0.0 || mini.h <= 0.0) {
             cw.screen = CBox{};
             continue;
         }
-
-        // Edge-aware gaps (Max's rule): a window edge NEAR the view bound
-        // (within the mapped desktop outer-gap) SNAPS FLUSH to it — no
-        // per-window outer gaps, ever — while INNER edges (seams between
-        // windows) inset by half the design gap. Solo and multi-window
-        // views therefore share the same envelope (the full tile), and
-        // only seams carry visible gap. Everything lerps with `p` so the
-        // close-zoom still lands pixel-exact on the real desktop.
-        {
-            const Rect&  t    = tiles[cw.tile];
-            const double thrX = t.w * 0.02, thrY = t.h * 0.02;
-            const double sX   = DSN_WIN_GAP * 0.5 * t.w, sY = DSN_WIN_GAP * 0.5 * t.h;
-            double x0 = mini.x, y0 = mini.y, x1 = mini.x + mini.w, y1 = mini.y + mini.h;
-            const double tx0 = (x0 - t.x < thrX) ? t.x : x0 + sX;
-            const double ty0 = (y0 - t.y < thrY) ? t.y : y0 + sY;
-            const double tx1 = (t.x + t.w - x1 < thrX) ? t.x + t.w : x1 - sX;
-            const double ty1 = (t.y + t.h - y1 < thrY) ? t.y + t.h : y1 - sY;
-            x0 = mix(x0, tx0, p);
-            y0 = mix(y0, ty0, p);
-            x1 = mix(x1, tx1, p);
-            y1 = mix(y1, ty1, p);
-            mini = Rect{x0, y0, std::max(1.0, x1 - x0), std::max(1.0, y1 - y0)};
+        ok[i]           = true;
+        real[i]         = {mini.x, mini.y, mini.x + mini.w, mini.y + mini.h};
+        const Rect&  t  = tiles[cw.tile];
+        const double thrX = t.w * 0.02, thrY = t.h * 0.02;
+        tgt[i]      = real[i];
+        tgt[i].x0   = (tgt[i].x0 - t.x < thrX) ? t.x : tgt[i].x0;
+        tgt[i].y0   = (tgt[i].y0 - t.y < thrY) ? t.y : tgt[i].y0;
+        tgt[i].x1   = (t.x + t.w - tgt[i].x1 < thrX) ? t.x + t.w : tgt[i].x1;
+        tgt[i].y1   = (t.y + t.h - tgt[i].y1 < thrY) ? t.y + t.h : tgt[i].y1;
+    }
+    for (size_t i = 0; i < g_wins.size(); ++i) {
+        if (!ok[i])
+            continue;
+        for (size_t j = i + 1; j < g_wins.size(); ++j) {
+            if (!ok[j] || g_wins[i].tile != g_wins[j].tile)
+                continue;
+            const Rect&  t   = tiles[g_wins[i].tile];
+            const double eps = std::max(t.w, t.h) * 0.03;
+            const double gX  = DSN_WIN_GAP * t.w, gY = DSN_WIN_GAP * t.h;
+            auto&        a   = tgt[i];
+            auto&        b   = tgt[j];
+            const bool   ovY = std::min(a.y1, b.y1) - std::max(a.y0, b.y0) > 1.0;
+            const bool   ovX = std::min(a.x1, b.x1) - std::max(a.x0, b.x0) > 1.0;
+            if (ovY && std::abs(b.x0 - a.x1) < eps) { // a left of b
+                const double mid = (a.x1 + b.x0) / 2.0;
+                a.x1 = mid - gX / 2.0;
+                b.x0 = mid + gX / 2.0;
+            } else if (ovY && std::abs(a.x0 - b.x1) < eps) { // b left of a
+                const double mid = (b.x1 + a.x0) / 2.0;
+                b.x1 = mid - gX / 2.0;
+                a.x0 = mid + gX / 2.0;
+            }
+            if (ovX && std::abs(b.y0 - a.y1) < eps) { // a above b
+                const double mid = (a.y1 + b.y0) / 2.0;
+                a.y1 = mid - gY / 2.0;
+                b.y0 = mid + gY / 2.0;
+            } else if (ovX && std::abs(a.y0 - b.y1) < eps) { // b above a
+                const double mid = (b.y1 + a.y0) / 2.0;
+                b.y1 = mid - gY / 2.0;
+                a.y0 = mid + gY / 2.0;
+            }
         }
-        const CBox box  = dispRect(CBox{mini.x, mini.y, mini.w, mini.h});
+    }
+    for (size_t i = 0; i < g_wins.size(); ++i) {
+        auto& cw = g_wins[i];
+        if (!ok[i])
+            continue;
+        const auto tex = cw.fb ? cw.fb->getTexture() : nullptr;
+        if (!tex)
+            continue;
+        const double x0 = mix(real[i].x0, tgt[i].x0, p), y0 = mix(real[i].y0, tgt[i].y0, p);
+        const double x1 = mix(real[i].x1, tgt[i].x1, p), y1 = mix(real[i].y1, tgt[i].y1, p);
+        const CBox box  = dispRect(CBox{x0, y0, std::max(1.0, x1 - x0), std::max(1.0, y1 - y0)});
         cw.screen       = box; // remembered for pointer hit-testing
         const int round = (int)std::lround(DSN_WIN_ROUND * m->m_scale * p);
         const auto w    = cw.win.lock();
