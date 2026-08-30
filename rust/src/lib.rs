@@ -26,21 +26,26 @@ pub extern "C" fn waveview_hello() -> *const c_char {
 /// with the usable area starting at `top` (below the OPTIONS bar plus its
 /// breathing gap — the shim passes reserved strip + 3 logical px).
 ///
-/// FULL-BLEED layout (per Max): the grid fills the whole usable area,
-/// edge to edge, with ONE `gap` everywhere — between tiles and as the
-/// left/right/bottom margins; the top margin is `top` itself (bar + 3 px).
+/// Number of overview workspaces: a 3x6 grid, the lower rows revealed by
+/// scrolling (the shim owns the scroll offset; tiles here are unscrolled).
+pub const N_TILES: usize = 18;
+
+/// FULL-BLEED scrollable layout (per Max): 3 columns x 6 rows. The first
+/// three rows fill the usable area edge to edge with ONE `gap` everywhere —
+/// between tiles and as the left/right/bottom margins; the top margin is
+/// `top` itself (bar + 3 px). Rows 4-6 continue below the fold at the same
+/// rhythm; the shim scrolls them into view.
 ///
-/// Tiles therefore give up exact monitor aspect (cell width fills the
-/// width, cell height fills the height — on a barred monitor that's a
-/// ~2–3% flatter tile). Window minis stay correctly placed (the mapper
-/// scales x and y independently by tile/monitor ratio) and the close-zoom
-/// uses separate x/y scales, so the give is invisible in motion — while
-/// the slack margins it buys back were very visible at rest.
+/// Tiles give up exact monitor aspect (cell width fills the width, cell
+/// height makes three rows fill the height — ~2-3% flatter on a barred
+/// monitor). Window minis stay correctly placed (the mapper scales x and y
+/// independently) and the close-zoom uses separate x/y scales, so the give
+/// is invisible in motion.
 ///
-/// Writes 9 `Rect`s to `out`; returns the count.
+/// Writes [`N_TILES`] `Rect`s to `out`; returns the count.
 ///
 /// # Safety
-/// `out` must point to space for at least 9 `Rect`s.
+/// `out` must point to space for at least [`N_TILES`] `Rect`s.
 #[no_mangle]
 pub unsafe extern "C" fn waveview_workspace_tiles(mw: f64, mh: f64, top: f64, out: *mut Rect) -> c_int {
     if mw <= 0.0 || mh <= 0.0 || !(0.0..mh).contains(&top) || out.is_null() {
@@ -49,13 +54,14 @@ pub unsafe extern "C" fn waveview_workspace_tiles(mw: f64, mh: f64, top: f64, ou
     let gap = mh * 0.006; // the one gap (inter-tile AND outer margins)
     let avail_h = mh - top;
 
-    // Fill both axes exactly: 2 side margins + 2 inner gaps across, 2 inner
-    // gaps + 1 bottom margin down (the top margin is `top` itself).
+    // Fill both axes exactly with the VISIBLE 3 rows: 2 side margins +
+    // 2 inner gaps across, 2 inner gaps + 1 bottom margin down (the top
+    // margin is `top` itself). Rows 4-6 continue the same rhythm below.
     let cell_w = ((mw - 4.0 * gap) / 3.0).max(1.0);
     let cell_h = ((avail_h - 3.0 * gap) / 3.0).max(1.0);
 
-    let tiles = std::slice::from_raw_parts_mut(out, 9);
-    for row in 0..3 {
+    let tiles = std::slice::from_raw_parts_mut(out, N_TILES);
+    for row in 0..6 {
         for col in 0..3 {
             tiles[row * 3 + col] = Rect {
                 x: gap + col as f64 * (cell_w + gap),
@@ -65,17 +71,17 @@ pub unsafe extern "C" fn waveview_workspace_tiles(mw: f64, mh: f64, top: f64, ou
             };
         }
     }
-    9
+    N_TILES as c_int
 }
 
-/// Which of the 9 tiles a workspace maps to, or -1 if it's outside the grid.
-/// Workspaces 1..=9 map row-major to tiles 0..=8; specials/scratchpads (<= 0)
-/// and anything beyond 9 are not shown. This is the one place that owns the
-/// workspace→tile policy, so the mapping can grow (paged grids, per-monitor
-/// sets) without touching the shim.
+/// Which of the [`N_TILES`] tiles a workspace maps to, or -1 if it's outside
+/// the grid. Workspaces 1..=18 map row-major to tiles 0..=17; specials /
+/// scratchpads (<= 0) and anything beyond are not shown. This is the one
+/// place that owns the workspace→tile policy, so the mapping can grow
+/// (paged grids, per-monitor sets) without touching the shim.
 #[no_mangle]
 pub extern "C" fn waveview_tile_for_workspace(ws_id: WorkspaceId) -> c_int {
-    if (1..=9).contains(&ws_id) {
+    if (1..=N_TILES as WorkspaceId).contains(&ws_id) {
         (ws_id - 1) as c_int
     } else {
         -1
@@ -136,11 +142,12 @@ mod tests {
     }
 
     #[test]
-    fn tile_index_only_covers_1_through_9() {
+    fn tile_index_only_covers_1_through_18() {
         assert_eq!(waveview_tile_for_workspace(1), 0);
         assert_eq!(waveview_tile_for_workspace(9), 8);
+        assert_eq!(waveview_tile_for_workspace(18), 17);
         assert_eq!(waveview_tile_for_workspace(0), -1);
-        assert_eq!(waveview_tile_for_workspace(10), -1);
+        assert_eq!(waveview_tile_for_workspace(19), -1);
         assert_eq!(waveview_tile_for_workspace(-99), -1); // scratchpad/special
     }
 
@@ -187,20 +194,27 @@ mod tests {
 
     #[test]
     fn full_bleed_grid_fills_and_gaps_are_uniform() {
-        let mut tiles = [Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 }; 9];
+        let mut tiles = [Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 }; N_TILES];
         let (mw, mh, top) = (1920.0, 1080.0, 48.0);
         let n = unsafe { waveview_workspace_tiles(mw, mh, top, tiles.as_mut_ptr()) };
-        assert_eq!(n, 9);
+        assert_eq!(n, N_TILES as c_int);
         let gap = mh * 0.006;
         // Top-anchored exactly at `top` (the 3 px promise to the bar).
         assert!((tiles[0].y - top).abs() < 1e-9);
-        // Side and bottom margins equal the inter-tile gap — full bleed.
+        // Side and bottom margins equal the inter-tile gap — full bleed for
+        // the visible 3 rows (row 3 ends one gap above the bottom edge).
         assert!((tiles[0].x - gap).abs() < 1e-9);
         assert!((mw - (tiles[2].x + tiles[2].w) - gap).abs() < 1e-6);
         assert!((mh - (tiles[8].y + tiles[8].h) - gap).abs() < 1e-6);
-        // Inner seams both equal the same gap.
+        // Inner seams both equal the same gap, and rows 4-6 continue the
+        // exact rhythm below the fold.
         let inner_x = tiles[1].x - (tiles[0].x + tiles[0].w);
         let inner_y = tiles[3].y - (tiles[0].y + tiles[0].h);
         assert!((inner_x - gap).abs() < 1e-6 && (inner_y - gap).abs() < 1e-6);
+        let row_step = tiles[3].y - tiles[0].y;
+        for r in 1..6 {
+            assert!((tiles[r * 3].y - tiles[0].y - r as f64 * row_step).abs() < 1e-6);
+        }
+        assert!(tiles[17].y + tiles[17].h > mh); // below the fold, scroll reveals
     }
 }

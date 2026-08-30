@@ -62,6 +62,10 @@ void        waveview_map_window(double tx, double ty, double tw, double th, doub
                                 double mon_h, double wx, double wy, double ww, double wh, Rect* out);
 }
 
+// 3x6 workspace grid (18 workspaces); rows 4-6 live below the fold and
+// scroll into view. Must match the brain's N_TILES.
+static constexpr int N_TILES = 18;
+
 inline HANDLE              PHANDLE = nullptr;
 static bool                g_active = false;
 static bool                g_capturing = false; // true while rendering thumbnails, so the render hook doesn't paint the overview into them (grid-in-grid recursion)
@@ -72,6 +76,7 @@ static CHyprSignalListener g_buttonListener; // left-click to pick up / drop a w
 static CHyprSignalListener g_swipeBeginListener;  // 3-finger swipe up/down toggles the overview (see onSwipe*)
 static CHyprSignalListener g_swipeUpdateListener;
 static CHyprSignalListener g_swipeEndListener;
+static CHyprSignalListener g_axisListener; // wheel while open scrolls the 3x6 grid (see onMouseAxis)
 static SP<CEventLoopTimer> g_liveTimer; // re-arms every REFRESH_MS while open to keep thumbnails live
 
 // evdev keycodes as delivered by the input event (xkb code = evdev + 8). Digit
@@ -87,7 +92,7 @@ static constexpr auto REFRESH_MS = std::chrono::milliseconds(150);
 // snapshots belong to — thumbnails are only valid on that monitor. These full
 // workspace snapshots are no longer drawn directly; they're the SOURCE pixels we
 // crop individual windows out of (see captureWindows).
-static SP<Render::IFramebuffer> g_fbs[9];
+static SP<Render::IFramebuffer> g_fbs[N_TILES];
 static PHLMONITORREF            g_captureMon;
 
 // The single wallpaper-only backdrop (no windows, no bars) drawn behind
@@ -122,6 +127,11 @@ static int          g_pressTile = -1;        // empty tile a press landed on (re
 static constexpr double CLICK_SLOP = 12.0;
 // BTN_LEFT (0x110) comes from linux/input-event-codes.h, pulled in transitively.
 
+// Grid scroll: the 3x6 grid is taller than the screen; the wheel scrolls it
+// (eased, dt-based — target set by input, position chases in onRender).
+static double g_scroll       = 0.0;
+static double g_scrollTarget = 0.0;
+
 // Zoom animation: 0 = zoomed fully into g_zoomTile (that workspace fills the
 // screen), 1 = the whole 3x3 grid at its rest layout. Opening animates 0->1,
 // closing 1->0. g_zoomTile is the tile the zoom pivots on.
@@ -150,6 +160,7 @@ static float easeOutCubic(float t) {
 // Defined further down; used by the pointer handlers above their definitions.
 static void jumpTo(int wsId);
 static void jumpToWindow(PHLWINDOW w);
+static void updateHoverAt(PHLMONITOR m, const Vector2D& c);
 
 static void damageAll() {
     for (auto& m : g_pCompositor->m_monitors) {
@@ -286,21 +297,39 @@ static double topInset(PHLMONITOR m) {
     return std::round(m->m_reservedArea.top() * m->m_scale);
 }
 
-// 3x3 tiles below the reserved strip plus Max's 3-logical-px window top-gap
-// (the same breathing room his windows keep to the bar) — the ONE tile source
-// shared by draw, capture, hit-testing, and the schematic, so they can't
-// disagree. The brain top-anchors the grid there and keeps every gap uniform.
+// 3x6 tiles below the reserved strip plus Max's 3-logical-px window top-gap
+// (the same breathing room his windows keep to the bar), shifted up by the
+// current grid scroll — the ONE tile source shared by draw, capture,
+// hit-testing, and the schematic, so they can't disagree. The brain
+// top-anchors the grid there and keeps every gap uniform.
 static int computeTiles(PHLMONITOR m, Rect* out) {
     const double top = topInset(m) + std::round(3.0 * m->m_scale);
-    return waveview_workspace_tiles(m->m_transformedSize.x, m->m_transformedSize.y, top, out);
+    const int    n   = waveview_workspace_tiles(m->m_transformedSize.x, m->m_transformedSize.y, top, out);
+    for (int i = 0; i < n && i < N_TILES; ++i)
+        out[i].y -= g_scroll;
+    return n;
+}
+
+// How far the grid can scroll: the last row's bottom plus one gap must be
+// able to reach the screen bottom.
+static double maxScroll(PHLMONITOR m) {
+    const double saved = g_scroll;
+    g_scroll           = 0.0;
+    Rect tiles[N_TILES];
+    const int n = computeTiles(m, tiles);
+    g_scroll    = saved;
+    if (n < N_TILES)
+        return 0.0;
+    const double gap = m->m_transformedSize.y * 0.006;
+    return std::max(0.0, tiles[N_TILES - 1].y + tiles[N_TILES - 1].h + gap - m->m_transformedSize.y);
 }
 
 static void captureWorkspaces(PHLMONITOR m) {
     if (!m)
         return;
 
-    Rect tiles[9];
-    if (computeTiles(m, tiles) < 9)
+    Rect tiles[N_TILES];
+    if (computeTiles(m, tiles) < N_TILES)
         return;
 
     Render::GL::g_pHyprOpenGL->makeEGLCurrent();
@@ -317,7 +346,7 @@ static void captureWorkspaces(PHLMONITOR m) {
     if (startedOn)
         startedOn->m_visible = false; // hide the real active ws; otherwise its on-screen windows bleed into every tile
 
-    for (int i = 0; i < 9; ++i) {
+    for (int i = 0; i < N_TILES; ++i) {
         auto& fb = g_fbs[i];
         if (!fb)
             fb = g_pHyprRenderer->createFB("waveview");
@@ -364,7 +393,7 @@ static void captureWorkspaces(PHLMONITOR m) {
     // producing frames — otherwise their thumbnails would freeze (Wayland only
     // renders visible surfaces). This is what makes all tiles live, at the cost
     // of keeping background apps awake while the overview is open.
-    for (int i = 0; i < 9; ++i)
+    for (int i = 0; i < N_TILES; ++i)
         if (const auto ws = g_pCompositor->getWorkspaceByID(i + 1))
             g_pHyprRenderer->sendFrameEventsToWorkspace(m, ws, Time::steadyNow());
 
@@ -375,8 +404,8 @@ static void captureWorkspaces(PHLMONITOR m) {
 // tile (focused window highlighted). Used on monitors we haven't captured
 // thumbnails for. Tiles are pixel-space; window boxes are logical — the brain
 // reconciles the two.
-static void drawSchematic(PHLMONITOR m, const Rect tiles[9]) {
-    for (int i = 0; i < 9; ++i)
+static void drawSchematic(PHLMONITOR m, const Rect tiles[N_TILES]) {
+    for (int i = 0; i < N_TILES; ++i)
         renderRect(CBox{tiles[i].x, tiles[i].y, tiles[i].w, tiles[i].h}, CHyprColor(0.0, 0.0, 0.0, 0.35));
 
     for (auto& w : g_pCompositor->m_windows) {
@@ -407,8 +436,8 @@ static void drawOverview(PHLMONITOR m, float p, int zoomTile) {
     if (!m)
         return;
 
-    Rect tiles[9];
-    if (computeTiles(m, tiles) < 9)
+    Rect tiles[N_TILES];
+    if (computeTiles(m, tiles) < N_TILES)
         return;
 
     // No captures for this monitor: fall back to the flat schematic.
@@ -478,25 +507,33 @@ static void drawOverview(PHLMONITOR m, float p, int zoomTile) {
     // p=0 (zoomed fully into the active workspace) they're pixel-exact and the
     // close animation lands seamlessly on the real desktop.
     const double shrink = mix(1.0, 0.975, p);
-    // Tile outlines (drop target, empty-hover) get the SAME shrink as the
-    // windows, so an empty workspace never reads bigger than a full one.
-    auto shrunkTile = [&](int i) -> CBox {
-        const Rect&  r  = tiles[i];
-        const double cx = r.x + r.w / 2.0, cy = r.y + r.h / 2.0;
-        return dispRect(CBox{cx - r.w * shrink / 2.0, cy - r.h * shrink / 2.0, r.w * shrink, r.h * shrink});
+    // Tile outlines (drop target, empty-hover) mirror the DESKTOP's window
+    // gaps inside the tile — the exact footprint this workspace's windows
+    // occupy (mapped gaps_out: top 3, sides/bottom 10 logical; values from
+    // hyprland.lua) — plus the same shrink the windows get. An empty
+    // workspace therefore reads exactly like a full one ("equal the out
+    // gaps with the in gaps").
+    auto contentBox = [&](int i) -> CBox {
+        const Rect&  r   = tiles[i];
+        const double gx  = 10.0 * (r.w / m->m_size.x); // gaps_out sides, mapped
+        const double gyt = 3.0 * (r.h / m->m_size.y);  // gaps_out top
+        const double gyb = 10.0 * (r.h / m->m_size.y); // gaps_out bottom
+        CBox         b{r.x + gx, r.y + gyt, r.w - 2.0 * gx, r.h - gyt - gyb};
+        const double cx = b.x + b.w / 2.0, cy = b.y + b.h / 2.0;
+        return dispRect(CBox{cx - b.w * shrink / 2.0, cy - b.h * shrink / 2.0, b.w * shrink, b.h * shrink});
     };
 
     // While dragging, outline the tile the cursor is over — the drop target.
     if (dragW) {
-        for (int i = 0; i < 9; ++i) {
+        for (int i = 0; i < N_TILES; ++i) {
             if (dispRect(CBox{tiles[i].x, tiles[i].y, tiles[i].w, tiles[i].h}).containsPoint(g_dragCursor))
-                drawBorder(shrunkTile(i), CHyprColor(0.40, 0.70, 1.0, 0.55), std::max(2.0, tiles[i].h * 0.008));
+                drawBorder(contentBox(i), CHyprColor(0.40, 0.70, 1.0, 0.55), std::max(2.0, tiles[i].h * 0.008));
         }
     }
 
     // Hovered empty workspace: outline it as a click-to-jump target.
     if (!dragW && g_hoverTile >= 0)
-        drawBorder(shrunkTile(g_hoverTile), kHoverCol, std::max(2.0, tiles[g_hoverTile].h * 0.01));
+        drawBorder(contentBox(g_hoverTile), kHoverCol, std::max(2.0, tiles[g_hoverTile].h * 0.01));
     for (auto& cw : g_wins) {
         const auto tex = cw.fb ? cw.fb->getTexture() : nullptr;
         if (!tex)
@@ -572,10 +609,10 @@ static PHLWINDOWREF winAt(const Vector2D& c) {
 // Grid slot (0..8) whose rest rect contains draw-space point `c`, or -1. Uses the
 // rest layout (matches interaction at p≈1, same hit test as the drag drop logic).
 static int tileAt(PHLMONITOR m, const Vector2D& c) {
-    Rect tiles[9];
-    if (computeTiles(m, tiles) != 9)
+    Rect tiles[N_TILES];
+    if (computeTiles(m, tiles) != N_TILES)
         return -1;
-    for (int i = 0; i < 9; ++i)
+    for (int i = 0; i < N_TILES; ++i)
         if (CBox{tiles[i].x, tiles[i].y, tiles[i].w, tiles[i].h}.containsPoint(c))
             return i;
     return -1;
@@ -603,8 +640,12 @@ static void onMouseMove(Vector2D, Event::SCallbackInfo& info) {
     if (!m)
         return;
     info.cancelled   = true;
-    const Vector2D c = cursorDrawSpace(m);
+    updateHoverAt(m, cursorDrawSpace(m));
+}
 
+// Shared by motion and grid-scroll: recompute hover/drag targets at cursor `c`
+// (a scroll moves the tiles under a stationary cursor, so hover must follow).
+static void updateHoverAt(PHLMONITOR m, const Vector2D& c) {
     // Any pending press (window or empty tile) that leaves the slop is a drag.
     if ((g_dragWin.lock() || g_pressTile >= 0) && !g_dragMoved && (c - g_pressPos).size() > CLICK_SLOP)
         g_dragMoved = true;
@@ -628,6 +669,23 @@ static void onMouseMove(Vector2D, Event::SCallbackInfo& info) {
         g_hoverTile = tile;
         damageAll();
     }
+}
+
+// Wheel while open: scroll the 3x6 grid (rows 4-6 live below the fold).
+// Swallowed so the desktop underneath never scrolls; the eased chase runs in
+// onRender (dt-based).
+static void onMouseAxis(IPointer::SAxisEvent e, Event::SCallbackInfo& info) {
+    if (!g_active || g_animTarget < 0.5f)
+        return;
+    const auto m = g_captureMon.lock();
+    if (!m)
+        return;
+    info.cancelled = true;
+    if (e.axis != WL_POINTER_AXIS_VERTICAL_SCROLL)
+        return;
+    // ~1/3 of a row per wheel notch (delta ±10 per notch, row ≈ 640px).
+    g_scrollTarget = std::clamp(g_scrollTarget + e.delta * 22.0, 0.0, maxScroll(m));
+    damageAll();
 }
 
 // Left-click while open: press over a window picks it up; release drops it onto the
@@ -681,10 +739,10 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
         return;
     }
     if (dw) {
-        Rect tiles[9];
+        Rect tiles[N_TILES];
         int  drop = -1;
-        if (computeTiles(m, tiles) == 9)
-            for (int i = 0; i < 9; ++i)
+        if (computeTiles(m, tiles) == N_TILES)
+            for (int i = 0; i < N_TILES; ++i)
                 if (CBox{tiles[i].x, tiles[i].y, tiles[i].w, tiles[i].h}.containsPoint(c)) {
                     drop = i;
                     break;
@@ -719,6 +777,20 @@ static void onRender(eRenderStage stage) {
         g_anim = std::min(g_animTarget, g_anim + step);
     else if (g_anim > g_animTarget)
         g_anim = std::max(g_animTarget, g_anim - step);
+
+    // Grid scroll chases its target (exponential ease, dt-based). While it
+    // moves, hover retargets under the stationary cursor and frames keep
+    // coming; it snaps and rests when close.
+    const double sd = g_scrollTarget - g_scroll;
+    if (std::abs(sd) > 0.25) {
+        g_scroll += sd * std::min(1.0, sc<double>(dt) * 14.0);
+        updateHoverAt(m, cursorDrawSpace(m));
+        g_pHyprRenderer->damageMonitor(m);
+        g_pCompositor->scheduleFrameForMonitor(m);
+    } else if (g_scroll != g_scrollTarget) {
+        g_scroll = g_scrollTarget;
+        g_pHyprRenderer->damageMonitor(m);
+    }
 
     // Fully closed: disengage and stop the live timer.
     if (g_animTarget <= 0.f && g_anim <= 0.f) {
@@ -774,6 +846,18 @@ static void toggle() {
         const auto m     = g_pCompositor->getMonitorFromCursor();
         const int  at    = waveview_tile_for_workspace(m ? m->activeWorkspaceID() : -1);
         g_zoomTile       = at >= 0 ? at : 0;
+        // Land with the active workspace's row in view: rows 0-2 open at the
+        // top; deeper rows pre-scroll so the zoom-out pivots on-screen.
+        g_scroll = g_scrollTarget = 0.0;
+        if (m && g_zoomTile >= 9) {
+            Rect tiles[N_TILES];
+            if (computeTiles(m, tiles) == N_TILES) {
+                const double gap = m->m_transformedSize.y * 0.006;
+                const double over =
+                    tiles[g_zoomTile].y + tiles[g_zoomTile].h + gap - m->m_transformedSize.y;
+                g_scroll = g_scrollTarget = std::clamp(over, 0.0, maxScroll(m));
+            }
+        }
         captureWorkspaces(m); // snapshot on open, outside the render pass
         if (g_liveTimer)
             g_liveTimer->updateTimeout(REFRESH_MS);
@@ -896,6 +980,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     g_keyListener    = Event::bus()->m_events.input.keyboard.key.listen(onKey);
     g_moveListener   = Event::bus()->m_events.input.mouse.move.listen(onMouseMove);
     g_buttonListener = Event::bus()->m_events.input.mouse.button.listen(onMouseButton);
+    g_axisListener   = Event::bus()->m_events.input.mouse.axis.listen(onMouseAxis);
     g_swipeBeginListener  = Event::bus()->m_events.gesture.swipe.begin.listen(onSwipeBegin);
     g_swipeUpdateListener = Event::bus()->m_events.gesture.swipe.update.listen(onSwipeUpdate);
     g_swipeEndListener    = Event::bus()->m_events.gesture.swipe.end.listen(onSwipeEnd);
