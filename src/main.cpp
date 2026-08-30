@@ -93,10 +93,13 @@ static SP<CEventLoopTimer> g_liveTimer; // re-arms every REFRESH_MS while open t
 
 // evdev keycodes as delivered by the input event (xkb code = evdev + 8). Digit
 // row is contiguous: KEY_1..KEY_9 = 2..10, so workspace N is keycode N + 1.
-static constexpr uint32_t EVDEV_ESC = 1;
-static constexpr uint32_t EVDEV_1   = 2;
-static constexpr uint32_t EVDEV_9   = 10;
-static constexpr uint32_t EVDEV_Q   = 16; // KEY_Q — close the hovered window
+static constexpr uint32_t EVDEV_ESC   = 1;
+static constexpr uint32_t EVDEV_1     = 2;
+static constexpr uint32_t EVDEV_9     = 10;
+static constexpr uint32_t EVDEV_Q     = 16;  // KEY_Q — close the hovered window
+static constexpr uint32_t EVDEV_LMETA = 125; // Super, tracked so bind combos
+static constexpr uint32_t EVDEV_RMETA = 126; // pass through the key swallow
+static bool               g_superHeld = false;
 
 static constexpr auto REFRESH_MS = std::chrono::milliseconds(150);
 
@@ -186,6 +189,7 @@ static double easeInOutCubic(double t) {
 static void jumpTo(int wsId);
 static void jumpToWindow(PHLWINDOW w);
 static void updateHoverAt(PHLMONITOR m, const Vector2D& c);
+static void closeOverview();
 
 static void damageAll() {
     for (auto& m : g_pCompositor->m_monitors) {
@@ -1041,6 +1045,16 @@ static void flipToPage(int page) {
     damageAll();
 }
 
+// Close unconditionally (Escape's path — no touring).
+static void closeOverview() {
+    if (g_animTarget < 0.5f)
+        return;
+    g_animTarget = 0.0f;
+    g_animLastT  = Time::steadyNow();
+    notifyWaverunner(false);
+    damageAll();
+}
+
 static void toggle() {
     const bool opening = g_animTarget < 0.5f; // currently closed/closing -> open
     // The Super+R tour: pressed while open, and the other page holds
@@ -1147,9 +1161,19 @@ static void jumpToWindow(PHLWINDOW w) {
 // (Max: "focus is on the last window still"). While the overview owns the
 // screen it owns the keyboard. Closed: we're transparent.
 static void onKey(IKeyboard::SKeyEvent e, Event::SCallbackInfo& info) {
+    // Track Super ALWAYS (even while closed — the press that precedes an
+    // opening Super+R happens before we're active).
+    if (e.keycode == EVDEV_LMETA || e.keycode == EVDEV_RMETA) {
+        g_superHeld = e.state == WL_KEYBOARD_KEY_STATE_PRESSED;
+        return;
+    }
     if (!g_active || g_animTarget < 0.5f) // only intercept while open (not mid-close)
         return;
-    info.cancelled = true; // nothing reaches the desktop while we're open
+    // Bind combos (Super held) pass through untouched so compositor binds
+    // — Super+R's toggle/tour above all — keep working while we're open.
+    if (g_superHeld)
+        return;
+    info.cancelled = true; // plain typing never reaches the desktop while open
 
     if (e.keycode >= EVDEV_1 && e.keycode <= EVDEV_9) {
         if (e.state == WL_KEYBOARD_KEY_STATE_PRESSED)
@@ -1165,7 +1189,7 @@ static void onKey(IKeyboard::SKeyEvent e, Event::SCallbackInfo& info) {
     }
 
     if (e.keycode == EVDEV_ESC && e.state == WL_KEYBOARD_KEY_STATE_PRESSED)
-        toggle(); // close without jumping
+        closeOverview(); // Escape means ESCAPE — never the tour
 }
 
 static int luaToggle(lua_State*) {
