@@ -64,6 +64,9 @@ static CHyprSignalListener g_renderListener;
 static CHyprSignalListener g_keyListener;    // swallows digit/Escape presses while the overview is open (see onKey)
 static CHyprSignalListener g_moveListener;   // tracks the cursor for hover/drag (see onMouseMove)
 static CHyprSignalListener g_buttonListener; // left-click to pick up / drop a window (see onMouseButton)
+static CHyprSignalListener g_swipeBeginListener;  // 3-finger swipe up/down toggles the overview (see onSwipe*)
+static CHyprSignalListener g_swipeUpdateListener;
+static CHyprSignalListener g_swipeEndListener;
 static SP<CEventLoopTimer> g_liveTimer; // re-arms every REFRESH_MS while open to keep thumbnails live
 
 // evdev keycodes as delivered by the input event (xkb code = evdev + 8). Digit
@@ -107,6 +110,8 @@ static Vector2D     g_dragCursor;            // current cursor in draw space (wh
 static Vector2D     g_dragGrab;              // cursor→box-topleft offset captured at grab
 static Vector2D     g_pressPos;              // cursor at button-press (draw space) — to tell a click from a drag
 static bool         g_dragMoved = false;     // cursor left the CLICK_SLOP radius since press → treat as a drag, not a click
+static int          g_hoverTile = -1;        // empty workspace tile under the cursor (gets a border), or -1
+static int          g_pressTile = -1;        // empty tile a press landed on (release within slop → jump), or -1
 // A press that releases within this radius (draw-space px) is a click (jump to
 // the window), not a drag (move it to another workspace).
 static constexpr double CLICK_SLOP = 12.0;
@@ -120,6 +125,14 @@ static float           g_animTarget = 0.0f;
 static int             g_zoomTile   = 0;
 static Time::steady_tp g_animLastT;
 static constexpr float ANIM_SECONDS = 0.28f;
+
+// Trackpad gesture: a 3-finger vertical swipe toggles the overview (up = open,
+// down = close). Deltas accumulate over the gesture; once the dominant axis is
+// vertical and past SWIPE_TRIGGER we fire once and latch until the gesture ends.
+static uint32_t         g_swipeFingers = 0;
+static Vector2D         g_swipeAcc;
+static bool             g_swipeFired   = false;
+static constexpr double SWIPE_TRIGGER  = 120.0; // accumulated px of vertical travel
 
 static double mix(double a, double b, double t) {
     return a + (b - a) * t;
@@ -444,6 +457,12 @@ static void drawOverview(PHLMONITOR m, float p, int zoomTile) {
         }
     }
 
+    // Hovered empty workspace: outline it as a click-to-jump target.
+    if (!dragW && g_hoverTile >= 0) {
+        const CBox t = dispRect(CBox{tiles[g_hoverTile].x, tiles[g_hoverTile].y, tiles[g_hoverTile].w, tiles[g_hoverTile].h});
+        drawBorder(t, kHoverCol, std::max(2.0, t.h * 0.01));
+    }
+
     // Windows shrink toward their centers and round as the grid zooms out — so at
     // p=0 (zoomed fully into the active workspace) they're pixel-exact and the
     // close animation lands seamlessly on the real desktop.
@@ -520,27 +539,63 @@ static PHLWINDOWREF winAt(const Vector2D& c) {
     return {};
 }
 
-// Cursor motion while open: update the hovered window, or the drag position. We do
-// NOT cancel move events — cancelling can freeze the cursor; a stray hover on the
-// desktop underneath is harmless and clears on close.
-static void onMouseMove(Vector2D, Event::SCallbackInfo&) {
+// Grid slot (0..8) whose rest rect contains draw-space point `c`, or -1. Uses the
+// rest layout (matches interaction at p≈1, same hit test as the drag drop logic).
+static int tileAt(PHLMONITOR m, const Vector2D& c) {
+    Rect tiles[9];
+    if (waveview_workspace_tiles(m->m_transformedSize.x, m->m_transformedSize.y, tiles) != 9)
+        return -1;
+    for (int i = 0; i < 9; ++i)
+        if (CBox{tiles[i].x, tiles[i].y, tiles[i].w, tiles[i].h}.containsPoint(c))
+            return i;
+    return -1;
+}
+
+// True if no captured window sits in `tile` — i.e. that workspace is empty.
+static bool tileEmpty(int tile) {
+    for (auto& cw : g_wins)
+        if (cw.tile == tile)
+            return false;
+    return true;
+}
+
+// Cursor motion while open: update the hovered window, or the drag position —
+// then SWALLOW the event. Cancelling is safe in this fork: PointerManager::move
+// runs before the hook fires (verified in InputManager.cpp::onMouseMoved), so
+// the sprite keeps moving; what cancelling stops is focus-follows-mouse and
+// surface motion reaching the desktop underneath — which used to leak (windows
+// refocused, the dock revealed, topbar pills lit while the overview was open).
+// The first uncancelled motion after close re-focuses under the cursor.
+static void onMouseMove(Vector2D, Event::SCallbackInfo& info) {
     if (!g_active || g_animTarget < 0.5f)
         return;
     const auto m = g_captureMon.lock();
     if (!m)
         return;
+    info.cancelled   = true;
     const Vector2D c = cursorDrawSpace(m);
+
+    // Any pending press (window or empty tile) that leaves the slop is a drag.
+    if ((g_dragWin.lock() || g_pressTile >= 0) && !g_dragMoved && (c - g_pressPos).size() > CLICK_SLOP)
+        g_dragMoved = true;
 
     if (g_dragWin.lock()) {
         g_dragCursor = c;
-        if (!g_dragMoved && (c - g_pressPos).size() > CLICK_SLOP)
-            g_dragMoved = true; // past the slop → this is a drag, not a click
         damageAll();
         return;
     }
+
+    // Hover: a window under the cursor, else an empty workspace tile (jump target).
     PHLWINDOWREF hov = winAt(c);
-    if (hov.lock() != g_hoverWin.lock()) {
-        g_hoverWin = hov;
+    int          tile = -1;
+    if (!hov.lock()) {
+        const int t = tileAt(m, c);
+        if (t >= 0 && tileEmpty(t))
+            tile = t;
+    }
+    if (hov.lock() != g_hoverWin.lock() || tile != g_hoverTile) {
+        g_hoverWin  = hov;
+        g_hoverTile = tile;
         damageAll();
     }
 }
@@ -558,11 +613,12 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
 
     const Vector2D c = cursorDrawSpace(m);
     if (e.state == WL_POINTER_BUTTON_STATE_PRESSED) {
+        g_pressPos  = c;
+        g_dragMoved = false;
+        g_pressTile = -1;
         if (const auto w = winAt(c).lock()) {
             g_dragWin    = w;
             g_dragCursor = c;
-            g_pressPos   = c;
-            g_dragMoved  = false;
             // grab offset from the window's drawn top-left, so it tracks naturally
             for (auto& cw : g_wins)
                 if (cw.win.lock() == w) {
@@ -570,18 +626,28 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
                     break;
                 }
             damageAll();
+        } else {
+            const int t = tileAt(m, c);
+            if (t >= 0 && tileEmpty(t))
+                g_pressTile = t; // press landed on an empty workspace → candidate jump
         }
         return;
     }
 
-    // Released: a click (never left the slop) jumps to the window; a real drag
-    // drops it onto the tile under the cursor.
-    const auto dw    = g_dragWin.lock();
-    const bool moved = g_dragMoved;
+    // Released: a click (never left the slop) jumps — to the window, or to an empty
+    // workspace; a real drag drops the window onto the tile under the cursor.
+    const auto dw        = g_dragWin.lock();
+    const bool moved     = g_dragMoved;
+    const int  pressTile = g_pressTile;
     g_dragWin.reset();
     g_dragMoved = false;
+    g_pressTile = -1;
     if (dw && !moved) {
         jumpToWindow(dw); // click → switch to & focus that window, closing the overview
+        return;
+    }
+    if (!dw && !moved && pressTile >= 0) {
+        jumpTo(pressTile + 1); // click on an empty workspace → jump there, closing the overview
         return;
     }
     if (dw) {
@@ -629,6 +695,8 @@ static void onRender(eRenderStage stage) {
         g_active = false;
         g_hoverWin.reset();
         g_dragWin.reset();
+        g_hoverTile = -1;
+        g_pressTile = -1;
         if (g_liveTimer)
             g_liveTimer->updateTimeout(std::nullopt);
         damageAll();
@@ -658,6 +726,36 @@ static void toggle() {
             g_liveTimer->updateTimeout(REFRESH_MS);
     }
     damageAll();
+}
+
+// A trackpad swipe begins: remember the finger count and reset the accumulator.
+static void onSwipeBegin(IPointer::SSwipeBeginEvent e, Event::SCallbackInfo&) {
+    g_swipeFingers = e.fingers;
+    g_swipeAcc     = Vector2D(0.0, 0.0);
+    g_swipeFired   = false;
+}
+
+// Accumulate the swipe; on a decisive 3-finger vertical move, toggle the overview
+// once (up opens, down closes) and latch g_swipeFired so the rest of the gesture
+// is inert. libinput reports fingers-up as negative dy.
+static void onSwipeUpdate(IPointer::SSwipeUpdateEvent e, Event::SCallbackInfo& info) {
+    if (g_swipeFingers != 3 || g_swipeFired)
+        return;
+    g_swipeAcc += e.delta;
+    if (std::abs(g_swipeAcc.y) < SWIPE_TRIGGER || std::abs(g_swipeAcc.x) > std::abs(g_swipeAcc.y))
+        return; // not yet decisive, or dominantly horizontal
+
+    const bool up     = g_swipeAcc.y < 0.0;
+    const bool opened = g_animTarget > 0.5f; // currently open/opening
+    if (up != opened)                        // up & closed -> open; down & open -> close
+        toggle();
+    g_swipeFired   = true;
+    info.cancelled = true; // consume so no built-in gesture also reacts
+}
+
+static void onSwipeEnd(IPointer::SSwipeEndEvent, Event::SCallbackInfo&) {
+    g_swipeFingers = 0;
+    g_swipeFired   = false;
 }
 
 // Jump to workspace `wsId` (1..9) and close the overview by zooming into that
@@ -744,6 +842,9 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     g_keyListener    = Event::bus()->m_events.input.keyboard.key.listen(onKey);
     g_moveListener   = Event::bus()->m_events.input.mouse.move.listen(onMouseMove);
     g_buttonListener = Event::bus()->m_events.input.mouse.button.listen(onMouseButton);
+    g_swipeBeginListener  = Event::bus()->m_events.gesture.swipe.begin.listen(onSwipeBegin);
+    g_swipeUpdateListener = Event::bus()->m_events.gesture.swipe.update.listen(onSwipeUpdate);
+    g_swipeEndListener    = Event::bus()->m_events.gesture.swipe.end.listen(onSwipeEnd);
     g_liveTimer      = makeShared<CEventLoopTimer>(std::nullopt, onLiveTimer, nullptr);
     g_pEventLoopManager->addTimer(g_liveTimer);
     HyprlandAPI::addNotification(handle, std::string("[waveview] loaded -- ") + waveview_hello(),
@@ -756,6 +857,9 @@ APICALL EXPORT void PLUGIN_EXIT() {
     g_keyListener.reset();
     g_moveListener.reset();
     g_buttonListener.reset();
+    g_swipeBeginListener.reset();
+    g_swipeUpdateListener.reset();
+    g_swipeEndListener.reset();
     if (g_liveTimer) {
         g_pEventLoopManager->removeTimer(g_liveTimer);
         g_liveTimer.reset();
