@@ -84,7 +84,6 @@ static constexpr double DSN_WIN_GAP    = 0.028; // in-tile gap, fraction of tile
 // window regardless of its size, same amber, per Max.
 static constexpr double     DSN_BORDER_W = 3.0; // logical, scaled at use
 static const CHyprColor     DSN_BORDER_COL{1.0, 0.745, 0.596, 1.0};   // #ffbe98
-static const CHyprColor     DSN_BORDER_DIM{1.0, 0.745, 0.596, 0.55};  // drop hint
 
 inline HANDLE              PHANDLE = nullptr;
 static bool                g_active = false;
@@ -563,18 +562,6 @@ static void drawOverview(PHLMONITOR m, float p, int zoomTile) {
         td.clipBox       = stripClip;
         g_pHyprRenderer->m_renderPass.add(makeUnique<CTexPassElement>(td));
     };
-    // A rounded outline (real hollow border, not four rects) for the drop-target
-    // tile. Corner radius scales with the tile so it matches the rounded windows.
-    auto drawBorder = [&](const CBox& b, const CHyprColor& c, double bw) {
-        CBorderPassElement::SBorderData bd;
-        bd.box           = b;
-        bd.grad1         = Config::CGradientValueData(c);
-        bd.borderSize    = std::max(1, (int)std::lround(bw));
-        bd.round         = (int)std::lround(DSN_TILE_ROUND * m->m_scale);
-        bd.roundingPower = 2.0f;
-        bd.a             = 1.0f; // alpha carried by the gradient color; don't double-dim
-        g_pHyprRenderer->m_renderPass.add(makeUnique<CBorderPassElement>(bd));
-    };
     // A rounded border, drawn as a filled rounded rect *behind* the window:
     // the texture (rounded to `round`) covers the interior, leaving a ring.
     // CONSTANT width matching the desktop's borders — never proportional
@@ -593,24 +580,10 @@ static void drawOverview(PHLMONITOR m, float p, int zoomTile) {
     // NO rest-shrink (per Max, round 3): windows draw at their true mapped
     // size — a maximized/smart-gaps window touches its tile edges exactly
     // like it touches the screen, and every visible gap comes from the real
-    // desktop gaps miniaturized. Tile frames (drop target, empty-hover) are
-    // the plain full tile, which is therefore IDENTICAL to a full
-    // workspace's footprint — equal by construction, nothing to tune.
-    auto tileBox = [&](int i) -> CBox {
-        return dispRect(CBox{tiles[i].x, tiles[i].y, tiles[i].w, tiles[i].h});
-    };
+    // desktop gaps miniaturized. NO tile/space frames either (also per
+    // Max): borders live on WINDOWS only — empty views stay bare wallpaper
+    // (they're still clickable jump targets; the cursor is the affordance).
 
-    // While dragging, outline the tile the cursor is over — the drop target.
-    if (dragW) {
-        for (int i = 0; i < N_TILES; ++i) {
-            if (tileBox(i).containsPoint(g_dragCursor))
-                drawBorder(tileBox(i), DSN_BORDER_DIM, bw);
-        }
-    }
-
-    // Hovered empty workspace: outline it as a click-to-jump target.
-    if (!dragW && g_hoverTile >= 0)
-        drawBorder(tileBox(g_hoverTile), DSN_BORDER_COL, bw);
     // Window boxes in three passes so identical desktop twins stay
     // identical in the overview (per-window heuristics broke that —
     // Max's ws5 twins rendered unequal):
