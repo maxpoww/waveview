@@ -149,6 +149,9 @@ static float           g_scrollProg   = 1.0; // 0..1 through the flip (1 = settl
 static int             g_page         = 0; // 0 = workspaces 1-9, 1 = 10-18
 static Time::steady_tp g_pageFlipAt{};     // cooldown: one notch = one flip
 static constexpr float SCROLL_SECONDS = 0.42f; // page-flip duration
+// True once the user has seen the other page this open (wheel or Super+R
+// tour) — the next toggle press then closes (see toggle()).
+static bool            g_tourDone     = false;
 
 // Zoom animation: 0 = zoomed fully into g_zoomTile (that workspace fills the
 // screen), 1 = the whole 3x3 grid at its rest layout. Opening animates 0->1,
@@ -861,6 +864,7 @@ static void onMouseAxis(IPointer::SAxisEvent e, Event::SCallbackInfo& info) {
         return;
     g_page         = next;
     g_pageFlipAt   = now;
+    g_tourDone     = true; // wheel counts as touring — next Super+R closes
     g_scrollFrom   = g_scroll; // retarget-safe: a mid-flight flip re-eases
     g_scrollProg   = 0.0f;
     g_scrollTarget = g_page * pageStep(m);
@@ -1016,11 +1020,43 @@ static void notifyWaverunner(bool on) {
     }).detach();
 }
 
+// Whether any window lives on `page` (0 = workspaces 1-9, 1 = 10-18),
+// judged from the open capture set.
+static bool pageHasWindows(int page) {
+    for (auto& cw : g_wins)
+        if (cw.tile / 9 == page)
+            return true;
+    return false;
+}
+
+// Eased flip to `page` (shared by the wheel and the Super+R tour).
+static void flipToPage(int page) {
+    const auto m = g_captureMon.lock();
+    if (!m || page == g_page)
+        return;
+    g_page         = page;
+    g_scrollFrom   = g_scroll;
+    g_scrollProg   = 0.0f;
+    g_scrollTarget = g_page * pageStep(m);
+    damageAll();
+}
+
 static void toggle() {
     const bool opening = g_animTarget < 0.5f; // currently closed/closing -> open
-    g_animTarget       = opening ? 1.0f : 0.0f;
+    // The Super+R tour: pressed while open, and the other page holds
+    // windows we haven't visited → flip there instead of closing. A third
+    // press (or a second when the other page is empty) closes.
+    if (!opening && !g_tourDone) {
+        const int other = 1 - g_page;
+        if (pageHasWindows(other)) {
+            g_tourDone = true;
+            flipToPage(other);
+            return;
+        }
+    }
+    g_animTarget = opening ? 1.0f : 0.0f;
     notifyWaverunner(opening);
-    g_animLastT        = Time::steadyNow();
+    g_animLastT  = Time::steadyNow();
     if (opening) {
         g_active         = true;
         const auto m     = g_pCompositor->getMonitorFromCursor();
@@ -1032,6 +1068,7 @@ static void toggle() {
         g_scroll     = g_scrollTarget = m ? g_page * pageStep(m) : 0.0;
         g_scrollFrom = g_scroll;
         g_scrollProg = 1.0f; // open lands settled — no flip animation
+        g_tourDone   = false;
         captureWorkspaces(m); // snapshot on open, outside the render pass
         if (g_liveTimer)
             g_liveTimer->updateTimeout(REFRESH_MS);
