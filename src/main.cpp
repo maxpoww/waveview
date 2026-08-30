@@ -78,6 +78,12 @@ static constexpr double DSN_TOP_GAP    = 12.0; // below the bar
 static constexpr double DSN_TILE_ROUND = 28.0; // hover/drop frame corners
 static constexpr double DSN_WIN_ROUND  = 20.0; // window mini corners
 static constexpr double DSN_WIN_GAP    = 0.028; // in-tile gap, fraction of tile
+// Overview borders mirror the DESKTOP's window borders (hyprland.lua:
+// general.border_size 3, active color #ffbe98) — same thickness on every
+// window regardless of its size, same amber, per Max.
+static constexpr double     DSN_BORDER_W = 3.0; // logical, scaled at use
+static const CHyprColor     DSN_BORDER_COL{1.0, 0.745, 0.596, 1.0};   // #ffbe98
+static const CHyprColor     DSN_BORDER_DIM{1.0, 0.745, 0.596, 0.55};  // drop hint
 
 inline HANDLE              PHANDLE = nullptr;
 static bool                g_active = false;
@@ -539,13 +545,14 @@ static void drawOverview(PHLMONITOR m, float p, int zoomTile) {
         bd.a             = 1.0f; // alpha carried by the gradient color; don't double-dim
         g_pHyprRenderer->m_renderPass.add(makeUnique<CBorderPassElement>(bd));
     };
-    // A rounded border, drawn as a filled rounded rect *behind* the window: the
-    // texture (rounded to `round`) covers the interior, leaving a rounded ring.
-    const CHyprColor kHoverCol(0.40, 0.70, 1.0, 1.0);
-    auto             haloBorder = [&](const CBox& box, int round) {
-        const double bw = std::max(2.0, std::min(box.w, box.h) * 0.016);
-        renderRect(CBox{box.x - bw, box.y - bw, box.w + 2.0 * bw, box.h + 2.0 * bw}, kHoverCol,
-                               round + (int)std::lround(bw));
+    // A rounded border, drawn as a filled rounded rect *behind* the window:
+    // the texture (rounded to `round`) covers the interior, leaving a ring.
+    // CONSTANT width matching the desktop's borders — never proportional
+    // (small windows used to get thin halos).
+    const double bw = DSN_BORDER_W * m->m_scale;
+    auto         haloBorder = [&](const CBox& box, int round) {
+        renderRect(CBox{box.x - bw, box.y - bw, box.w + 2.0 * bw, box.h + 2.0 * bw}, DSN_BORDER_COL,
+                   round + (int)std::lround(bw));
     };
 
     const auto hoverW = g_hoverWin.lock();
@@ -567,13 +574,13 @@ static void drawOverview(PHLMONITOR m, float p, int zoomTile) {
     if (dragW) {
         for (int i = 0; i < N_TILES; ++i) {
             if (tileBox(i).containsPoint(g_dragCursor))
-                drawBorder(tileBox(i), CHyprColor(0.40, 0.70, 1.0, 0.55), std::max(2.0, tiles[i].h * 0.008));
+                drawBorder(tileBox(i), DSN_BORDER_DIM, bw);
         }
     }
 
     // Hovered empty workspace: outline it as a click-to-jump target.
     if (!dragW && g_hoverTile >= 0)
-        drawBorder(tileBox(g_hoverTile), kHoverCol, std::max(2.0, tiles[g_hoverTile].h * 0.01));
+        drawBorder(tileBox(g_hoverTile), DSN_BORDER_COL, bw);
     // Window boxes in three passes so identical desktop twins stay
     // identical in the overview (per-window heuristics broke that —
     // Max's ws5 twins rendered unequal):
