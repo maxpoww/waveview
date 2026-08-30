@@ -190,9 +190,9 @@ static double          g_grabFracX = 0.5, g_grabFracY = 0.5;
 static constexpr auto DWELL           = std::chrono::milliseconds(120);
 static constexpr auto COMMIT_COOLDOWN = std::chrono::milliseconds(150);
 // How long the ~20fps capture boost runs after a commit/regrab/drop: must
-// cover the whole "windows" spring + settle tail. Currently sized for the
-// HALF-SPEED debugging spring (hyprctl eval'd to 2.4; normal 4.79 ≈ 700ms).
-static constexpr auto BOOST_MS        = std::chrono::milliseconds(1400);
+// cover the whole "windows" spring + settle tail (spring "easy" ≈ 700ms;
+// double this when slow-mo debugging halves the spring stiffness).
+static constexpr auto BOOST_MS        = std::chrono::milliseconds(700);
 static Time::steady_tp g_lastCommit{};
 struct LiveCommit {
     bool         active = false; // false = no target under the cursor
@@ -2095,7 +2095,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.19"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.20"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
