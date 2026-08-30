@@ -5,6 +5,7 @@
 #include <any>
 #include <chrono>
 #include <cmath>
+#include <cstdarg>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -66,7 +67,8 @@ void        waveview_map_window(double tx, double ty, double tw, double th, doub
 
 // 3x6 workspace grid (18 workspaces); rows 4-6 live below the fold and
 // scroll into view. Must match the brain's N_TILES.
-static constexpr int N_TILES = 18;
+static constexpr int      N_TILES   = 18;
+static constexpr uint32_t ALL_TILES = (1u << N_TILES) - 1;
 
 // The mockup-blessed design (Max, ~/overview-mockup settings 2026-08-30),
 // all in LOGICAL px (scaled to draw space at use): bare wallpaper (no tile
@@ -204,6 +206,7 @@ static Time::steady_tp g_pendingSince{};
 static int             g_origWS = -1;   // cancel restores these
 static Vector2D        g_origHome{};
 static bool            g_origFloating = false; // float state at gesture start
+static uint32_t        g_dirtyTiles   = 0;     // tiles touched since the last full capture
 static Time::steady_tp g_boostUntil{};  // fast recapture while a real re-tile springs
 
 // Zoom animation: 0 = zoomed fully into g_zoomTile (that workspace fills the
@@ -358,7 +361,7 @@ static void captureBackdrop(PHLMONITOR m, const CBox& monbox) {
 // (allowCustomUV) into g_fbs[tile] — the window's normalized rect within the full
 // monitor-resolution snapshot — rather than re-rendering the window, so this
 // reuses the proven workspace capture and needs no standalone-window render.
-static void captureWindows(PHLMONITOR m) {
+static void captureWindows(PHLMONITOR m, uint32_t mask = ALL_TILES) {
     // Remember each window's last-drawn hit-box so pointer hit-testing keeps
     // working across the rebuild — otherwise the fresh entries carry a zeroed
     // box until the next drawOverview, and a pointer move in that gap drops the
@@ -437,26 +440,35 @@ static void captureWindows(PHLMONITOR m) {
                 cw.fb = std::move(pb.second.fb); // last cycle's FB, storage intact
                 break;
             }
-        if (!cw.fb)
+        // Off-mask windows keep last cycle's crop untouched (their tile's
+        // snapshot wasn't re-rendered either) — unless the FB is missing or
+        // wrong-sized, which forces a fresh crop regardless.
+        bool fresh = (mask & (1u << tile)) != 0;
+        if (!cw.fb) {
             cw.fb = g_pHyprRenderer->createFB("waveview-win");
+            fresh  = true;
+        }
         if (cw.fb->m_size != Vector2D(fbw, fbh)) {
             cw.fb->release();
             cw.fb->alloc(fbw, fbh, DRM_FORMAT_ABGR8888);
+            fresh = true;
         }
 
-        CRegion fakeDamage{0, 0, INT16_MAX, INT16_MAX};
-        g_pHyprRenderer->beginRender(m, fakeDamage, Render::RENDER_MODE_FULL_FAKE, nullptr, cw.fb);
-        glClearColor(0.0F, 0.0F, 0.0F, 0.0F); // transparent: only the window's pixels
-        glClear(GL_COLOR_BUFFER_BIT);
+        if (fresh) {
+            CRegion fakeDamage{0, 0, INT16_MAX, INT16_MAX};
+            g_pHyprRenderer->beginRender(m, fakeDamage, Render::RENDER_MODE_FULL_FAKE, nullptr, cw.fb);
+            glClearColor(0.0F, 0.0F, 0.0F, 0.0F); // transparent: only the window's pixels
+            glClear(GL_COLOR_BUFFER_BIT);
 
-        Render::GL::CHyprOpenGLImpl::STextureRenderData td;
-        td.allowCustomUV               = true;
-        td.primarySurfaceUVTopLeft     = Vector2D(u0, v0);
-        td.primarySurfaceUVBottomRight = Vector2D(u1, v1);
-        Render::GL::g_pHyprOpenGL->renderTexture(srcTex, CBox{0.0, 0.0, (double)fbw, (double)fbh}, td);
+            Render::GL::CHyprOpenGLImpl::STextureRenderData td;
+            td.allowCustomUV               = true;
+            td.primarySurfaceUVTopLeft     = Vector2D(u0, v0);
+            td.primarySurfaceUVBottomRight = Vector2D(u1, v1);
+            Render::GL::g_pHyprOpenGL->renderTexture(srcTex, CBox{0.0, 0.0, (double)fbw, (double)fbh}, td);
 
-        g_pHyprRenderer->m_renderData.blockScreenShader = true;
-        g_pHyprRenderer->endRender();
+            g_pHyprRenderer->m_renderData.blockScreenShader = true;
+            g_pHyprRenderer->endRender();
+        }
 
         for (auto& pb : prevBoxes) // carry hit-box + preview glide forward across the rebuild
             if (pb.first.lock() == w) {
@@ -528,13 +540,33 @@ static double pageStep(PHLMONITOR m) {
     return n == N_TILES ? tiles[9].y - tiles[0].y : 0.0;
 }
 
-static void captureWorkspaces(PHLMONITOR m) {
+// Debug trace for the drag rounds (Max reproduces, we read the log):
+// appended to /tmp/waveview-trace.log, ms since plugin load.
+static void trace(const char* fmt, ...) {
+    static FILE* f = fopen("/tmp/waveview-trace.log", "a");
+    if (!f)
+        return;
+    static const auto t0 = Time::steadyNow();
+    fprintf(f, "%9.1f ", std::chrono::duration<double, std::milli>(Time::steadyNow() - t0).count());
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fputc('\n', f);
+    fflush(f);
+}
+
+// `mask`: which tiles to re-render. A commit touches at most two workspaces;
+// re-rendering all 18 at the 20fps boost (~360 workspace renders/s) is what
+// froze the drag after a few movements. Skipped tiles keep their snapshot.
+static void captureWorkspaces(PHLMONITOR m, uint32_t mask = ALL_TILES) {
     if (!m)
         return;
 
     Rect tiles[N_TILES];
     if (computeTiles(m, tiles) < N_TILES)
         return;
+    const auto capT0 = Time::steadyNow();
 
     Render::GL::g_pHyprOpenGL->makeEGLCurrent();
 
@@ -552,6 +584,8 @@ static void captureWorkspaces(PHLMONITOR m) {
 
     for (int i = 0; i < N_TILES; ++i) {
         auto& fb = g_fbs[i];
+        if (!(mask & (1u << i)) && fb && fb->m_size == monbox.size())
+            continue; // not dirty: last snapshot stands
         if (!fb)
             fb = g_pHyprRenderer->createFB("waveview");
         if (fb->m_size != monbox.size()) {
@@ -580,10 +614,12 @@ static void captureWorkspaces(PHLMONITOR m) {
         g_pHyprRenderer->endRender();
     }
 
-    // With all 9 workspace snapshots ready, build the two things we actually draw:
-    // the single wallpaper backdrop, and one cropped texture per window.
-    captureBackdrop(m, monbox);
-    captureWindows(m);
+    // With the workspace snapshots ready, build the two things we actually
+    // draw: the single wallpaper backdrop (skipped on partial captures —
+    // wallpaper doesn't change mid-drag), and one cropped texture per window.
+    if (mask == ALL_TILES || !g_bgFB)
+        captureBackdrop(m, monbox);
+    captureWindows(m, mask);
 
     g_capturing                              = false;
     g_pHyprRenderer->m_bBlockSurfaceFeedback = false;
@@ -602,6 +638,8 @@ static void captureWorkspaces(PHLMONITOR m) {
             g_pHyprRenderer->sendFrameEventsToWorkspace(m, ws, Time::steadyNow());
 
     g_captureMon = m;
+    trace("capture mask=%05x wins=%zu dur=%.1fms", mask, g_wins.size(),
+          std::chrono::duration<double, std::milli>(Time::steadyNow() - capT0).count());
 }
 
 // Schematic fallback: dark tiles + each live window mapped into its workspace
@@ -1034,7 +1072,12 @@ static void onLiveTimer(SP<CEventLoopTimer> self, void*) {
         return;
     }
     if (const auto m = g_captureMon.lock()) {
-        captureWorkspaces(m);
+        // Boost ticks refresh only the tiles a commit touched; the regular
+        // cadence does a full pass and resets the dirty set.
+        const bool boosting = Time::steadyNow() < g_boostUntil;
+        captureWorkspaces(m, boosting && g_dirtyTiles ? g_dirtyTiles : ALL_TILES);
+        if (!boosting)
+            g_dirtyTiles = 0;
         maybeCommit(m); // the dwell can expire with the cursor at rest
         damageAll();
     }
@@ -1145,6 +1188,8 @@ static void beginRealDrag(PHLWINDOW dw, bool capture) {
     g_pCompositor->warpCursorTo(saved, true);
     g_dragReal = true;
     warpFocusFx(); // grab/regrab focus churn must not glow through captures
+    if (const int dt = waveview_tile_for_workspace(dw->workspaceID()); dt >= 0)
+        g_dirtyTiles |= (1u << dt); // the pull-out re-tiled this view
     // A re-commit passes capture=false: it re-inserts immediately after and
     // captures THEN — snapshotting the pulled-out intermediate made every
     // re-placement read as a double bounce. (NO geometry warping here: a
@@ -1152,7 +1197,7 @@ static void beginRealDrag(PHLWINDOW dw, bool capture) {
     // new sizes — that was v0.9's "content all mixed between windows".)
     if (capture)
         if (const auto m = g_captureMon.lock())
-            captureWorkspaces(m); // show the re-tile right away
+            captureWorkspaces(m, g_dirtyTiles); // show the re-tile right away
 }
 
 // The grab floats the window out of the layout; endDragTarget() re-tiles
@@ -1330,6 +1375,11 @@ static void commitAt(PHLMONITOR m, const Vector2D& c, PHLWINDOW dw, const LiveCo
         return;
     const auto     under = sig.under.lock();
     const Vector2D desk  = under ? dropPointFor(under, sig.side) : deskAt(m, tiles[sig.tile], c);
+    trace("commit tile=%d side=%d under=%p ws=%d desk=(%.0f,%.0f)", sig.tile, sig.side, (void*)under.get(),
+          (int)dw->workspaceID(), desk.x, desk.y);
+    if (const int ot = waveview_tile_for_workspace(dw->workspaceID()); ot >= 0)
+        g_dirtyTiles |= (1u << ot);
+    g_dirtyTiles |= (1u << sig.tile);
     if (dw->workspaceID() == sig.tile + 1)
         endRealDrag(desk, under);
     else {
@@ -1353,7 +1403,7 @@ static void commitAt(PHLMONITOR m, const Vector2D& c, PHLWINDOW dw, const LiveCo
     g_lastCommit = Time::steadyNow();
     g_boostUntil = Time::steadyNow() + BOOST_MS;
     warpFocusFx();
-    captureWorkspaces(m);
+    captureWorkspaces(m, g_dirtyTiles);
     if (g_liveTimer)
         g_liveTimer->updateTimeout(std::chrono::milliseconds(50));
     damageAll();
@@ -1366,6 +1416,7 @@ static void commitAt(PHLMONITOR m, const Vector2D& c, PHLWINDOW dw, const LiveCo
 static void regrab(PHLWINDOW dw) {
     if (!g_commit.active)
         return;
+    trace("regrab ws=%d", (int)dw->workspaceID());
     g_commit = {};
     beginRealDrag(dw, false);
     g_boostUntil = Time::steadyNow() + BOOST_MS;
@@ -1419,6 +1470,13 @@ static void maybeCommit(PHLMONITOR m) {
 // gesture started from.
 static void restoreOriginal() {
     const auto dw = g_dragWin.lock();
+    if (dw) {
+        trace("restore ws=%d -> %d", (int)dw->workspaceID(), g_origWS);
+        if (const int ct = waveview_tile_for_workspace(dw->workspaceID()); ct >= 0)
+            g_dirtyTiles |= (1u << ct);
+        if (const int ot = waveview_tile_for_workspace(g_origWS); ot >= 0)
+            g_dirtyTiles |= (1u << ot);
+    }
     if (dw && g_commit.active)
         regrab(dw); // one mechanism: a held drag we end at the original spot
     g_commit  = {};
@@ -1617,6 +1675,10 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
                     break;
                 }
         if (drop >= 0) {
+            trace("drop tile=%d ws=%d", drop, (int)dw->workspaceID());
+            if (const int ot = waveview_tile_for_workspace(dw->workspaceID()); ot >= 0)
+                g_dirtyTiles |= (1u << ot);
+            g_dirtyTiles |= (1u << drop);
             // The drop point, mapped back into desktop logical coords
             // within the target view (inverse of the tile mapping).
             Rect   tiles2[N_TILES];
@@ -1669,7 +1731,7 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
         g_origWS  = -1;
         g_boostUntil = Time::steadyNow() + BOOST_MS;
         warpFocusFx(); // the drop's focus churn must not glow through the settle captures
-        captureWorkspaces(m);
+        captureWorkspaces(m, g_dirtyTiles ? g_dirtyTiles : ALL_TILES);
         if (g_liveTimer)
             g_liveTimer->updateTimeout(std::chrono::milliseconds(50));
         for (auto& cw : g_wins)
@@ -1990,7 +2052,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.16"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.17"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
