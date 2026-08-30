@@ -278,12 +278,30 @@ static void captureWindows(PHLMONITOR m) {
 // tile resolution; CTexPassElement rescales them to the tile box on draw, so the
 // capture size only affects sharpness, never layout. Mirrors hyprexpo's proven
 // flow for the 0.55 render API.
+// The monitor's reserved top strip (the OPTIONS topbar's exclusive zone) in
+// draw-space px. The overview keeps the bar alive in that strip: tiles are
+// laid out below it, so the bar gets its own place instead of overlapping
+// the top row. (Draw space = transformed pixels; the reserve is logical.)
+static double topInset(PHLMONITOR m) {
+    return std::round(m->m_reservedArea.top() * m->m_scale);
+}
+
+// 3x3 tiles inset below the reserved strip — the ONE tile source shared by
+// draw, capture, hit-testing, and the schematic, so they can't disagree.
+static int computeTiles(PHLMONITOR m, Rect* out) {
+    const double inset = topInset(m);
+    const int    n     = waveview_workspace_tiles(m->m_transformedSize.x, m->m_transformedSize.y - inset, out);
+    for (int i = 0; i < n && i < 9; ++i)
+        out[i].y += inset;
+    return n;
+}
+
 static void captureWorkspaces(PHLMONITOR m) {
     if (!m)
         return;
 
     Rect tiles[9];
-    if (waveview_workspace_tiles(m->m_transformedSize.x, m->m_transformedSize.y, tiles) < 9)
+    if (computeTiles(m, tiles) < 9)
         return;
 
     Render::GL::g_pHyprOpenGL->makeEGLCurrent();
@@ -391,7 +409,7 @@ static void drawOverview(PHLMONITOR m, float p, int zoomTile) {
         return;
 
     Rect tiles[9];
-    if (waveview_workspace_tiles(m->m_transformedSize.x, m->m_transformedSize.y, tiles) < 9)
+    if (computeTiles(m, tiles) < 9)
         return;
 
     // No captures for this monitor: fall back to the flat schematic.
@@ -402,12 +420,16 @@ static void drawOverview(PHLMONITOR m, float p, int zoomTile) {
 
     // Zoom transform: scale about zoomTile's top-left so at p=0 that tile becomes
     // the full monitor; mix an arbitrary rest-rect toward its zoomed rect by p.
+    // Separate x/y scales: inset tiles (see computeTiles) are not quite monitor
+    // aspect, and the close must land exactly full-screen (the ~2% stretch while
+    // animating is imperceptible; a 2% pop at the hand-off is not).
     const double mw = m->m_transformedSize.x;
+    const double mh = m->m_transformedSize.y;
     const Rect&  az = tiles[zoomTile];
-    const double s0 = mw / az.w;
+    const double sx = mw / az.w, sy = mh / az.h;
     auto         dispRect = [&](const CBox& r) -> CBox {
-        const double zx = (r.x - az.x) * s0, zy = (r.y - az.y) * s0;
-        const double zw = r.w * s0, zh = r.h * s0;
+        const double zx = (r.x - az.x) * sx, zy = (r.y - az.y) * sy;
+        const double zw = r.w * sx, zh = r.h * sy;
         return CBox{mix(zx, r.x, p), mix(zy, r.y, p), mix(zw, r.w, p), mix(zh, r.h, p)};
     };
 
@@ -548,7 +570,7 @@ static PHLWINDOWREF winAt(const Vector2D& c) {
 // rest layout (matches interaction at p≈1, same hit test as the drag drop logic).
 static int tileAt(PHLMONITOR m, const Vector2D& c) {
     Rect tiles[9];
-    if (waveview_workspace_tiles(m->m_transformedSize.x, m->m_transformedSize.y, tiles) != 9)
+    if (computeTiles(m, tiles) != 9)
         return -1;
     for (int i = 0; i < 9; ++i)
         if (CBox{tiles[i].x, tiles[i].y, tiles[i].w, tiles[i].h}.containsPoint(c))
@@ -658,7 +680,7 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
     if (dw) {
         Rect tiles[9];
         int  drop = -1;
-        if (waveview_workspace_tiles(m->m_transformedSize.x, m->m_transformedSize.y, tiles) == 9)
+        if (computeTiles(m, tiles) == 9)
             for (int i = 0; i < 9; ++i)
                 if (CBox{tiles[i].x, tiles[i].y, tiles[i].w, tiles[i].h}.containsPoint(c)) {
                     drop = i;
