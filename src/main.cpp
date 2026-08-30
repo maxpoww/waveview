@@ -469,12 +469,19 @@ static void drawOverview(PHLMONITOR m, float p, int zoomTile) {
         g_pHyprRenderer->m_renderPass.add(makeUnique<CTexPassElement>(td));
     }
 
+    // Windows never draw into the bar strip: during a page flip the outgoing
+    // page's tiles slide up and used to peek through the bar's transparent
+    // areas (Max saw page 1's bottoms on page 2). The clip relaxes with the
+    // zoom (p→0 = a workspace filling the whole monitor, bar strip included).
+    const double clipTop = topInset(m) * p;
+    const CBox   stripClip{0.0, clipTop, m->m_transformedSize.x, m->m_transformedSize.y - clipTop};
     auto drawTex = [&](SP<Render::ITexture> tex, const CBox& b, int round) {
         CTexPassElement::SRenderData td;
         td.tex           = tex;
         td.box           = b;
         td.round         = round;
         td.roundingPower = 2.0f;
+        td.clipBox       = stripClip;
         g_pHyprRenderer->m_renderPass.add(makeUnique<CTexPassElement>(td));
     };
     // A rounded outline (real hollow border, not four rects) for the drop-target
