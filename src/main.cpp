@@ -184,7 +184,9 @@ static double          g_ghostW = 0.0, g_ghostH = 0.0;
 static double          g_ghostWantW = 0.0, g_ghostWantH = 0.0;
 static double          g_grabFracX = 0.5, g_grabFracY = 0.5;
 // Live-commit state (see the "life reaction" block before updateHoverAt).
-static constexpr auto DWELL = std::chrono::milliseconds(120);
+static constexpr auto DWELL           = std::chrono::milliseconds(120);
+static constexpr auto COMMIT_COOLDOWN = std::chrono::milliseconds(150);
+static Time::steady_tp g_lastCommit{};
 struct LiveCommit {
     bool         active = false; // false = no target under the cursor
     int          tile   = -1;
@@ -1227,6 +1229,7 @@ static void commitAt(PHLMONITOR m, const Vector2D& c, PHLWINDOW dw, const LiveCo
             placeAt(dw, desk, under);
     }
     g_commit     = sig;
+    g_lastCommit = Time::steadyNow();
     g_boostUntil = Time::steadyNow() + std::chrono::milliseconds(700);
     captureWorkspaces(m);
     if (g_liveTimer)
@@ -1268,12 +1271,22 @@ static void maybeCommit(PHLMONITOR m) {
     // split target falls to dwindle's stale-focus default slot).
     if (g_commit.active && sig.active && !sig.under.lock() && sig.tile + 1 == dw->workspaceID())
         return;
-    if (!sameCommit(sig, g_pending)) {
+    // Only a change of TARGET (tile / under-window) restarts the dwell
+    // clock. The quadrant side wobbles with the cursor's slope — and with
+    // the hitboxes drifting while post-commit springs settle — and
+    // restarting on every wobble kept the clock from ever expiring ("it
+    // gets stuck"). A side flip on the same window is deliberate (crossing
+    // the diagonal) and commits at once; the cooldown absorbs jitter from
+    // a cursor sitting right on the diagonal.
+    if (sig.active != g_pending.active || sig.tile != g_pending.tile || sig.under.lock() != g_pending.under.lock()) {
         g_pending      = sig;
         g_pendingSince = Time::steadyNow();
         return;
     }
+    g_pending.side = sig.side;
     if (Time::steadyNow() - g_pendingSince < DWELL || sameCommit(sig, g_commit))
+        return;
+    if (Time::steadyNow() - g_lastCommit < COMMIT_COOLDOWN)
         return;
     if (g_commit.active)
         regrab(dw);
@@ -1843,7 +1856,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.7"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.8"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
