@@ -746,6 +746,13 @@ static void drawOverview(PHLMONITOR m, float p, int zoomTile) {
 static void onLiveTimer(SP<CEventLoopTimer> self, void*) {
     if (!g_active)
         return; // disarmed on close; don't re-arm
+    // Never recapture mid-animation: snapshotting 18 workspaces stalls a
+    // frame, which reads as a hitch in the page-flip / zoom glide. Poll
+    // quickly until the motion settles, then catch up.
+    if (g_scrollProg < 1.0f || g_anim != g_animTarget) {
+        self->updateTimeout(std::chrono::milliseconds(50));
+        return;
+    }
     if (const auto m = g_captureMon.lock()) {
         captureWorkspaces(m);
         damageAll();
