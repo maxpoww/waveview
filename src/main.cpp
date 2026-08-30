@@ -184,7 +184,7 @@ static double          g_ghostW = 0.0, g_ghostH = 0.0;
 static double          g_ghostWantW = 0.0, g_ghostWantH = 0.0;
 static double          g_grabFracX = 0.5, g_grabFracY = 0.5;
 // Live-commit state (see the "life reaction" block before updateHoverAt).
-static constexpr auto DWELL = std::chrono::milliseconds(200);
+static constexpr auto DWELL = std::chrono::milliseconds(120);
 struct LiveCommit {
     bool         active = false; // false = no target under the cursor
     int          tile   = -1;
@@ -232,7 +232,7 @@ static void jumpTo(int wsId);
 static void jumpToWindow(PHLWINDOW w);
 static void updateHoverAt(PHLMONITOR m, const Vector2D& c);
 static void closeOverview();
-static void beginRealDrag(PHLWINDOW dw);
+static void beginRealDrag(PHLWINDOW dw, bool capture = true);
 static void endRealDrag(std::optional<Vector2D> at, PHLWINDOW splitTarget = nullptr);
 static void maybeCommit(PHLMONITOR m);
 
@@ -292,14 +292,10 @@ class CUVTexElement : public IPassElement {
         g_pHyprRenderer->m_renderData.primarySurfaceUVTopLeft     = uvTL;
         g_pHyprRenderer->m_renderData.primarySurfaceUVBottomRight = uvBR;
         data.allowCustomUV                                        = true;
-        // Trilinear only while morphing: these draws animate the capture
-        // through arbitrary downscales, where single-tap bilinear reduces
-        // text to crawling aliasing. The reset element restores bilinear so
-        // the settled minis keep their exact approved sharpness. The mip
-        // chain is generated at capture time — the filter must never see a
-        // texture without one (incomplete texture samples black).
-        if (data.tex)
-            data.tex->minFilter = GL_LINEAR_MIPMAP_LINEAR;
+        // NOTE: no filter games here. This element only cover-crops small
+        // aspect drifts now (seam-snapped minis); the big animated morphs
+        // that needed mipmaps are retired — live commits replaced them,
+        // and the per-capture glGenerateMipmap cost went with them.
         std::vector<UP<IPassElement>> out;
         out.emplace_back(makeUnique<CTexPassElement>(data));
         out.emplace_back(makeUnique<CUVResetElement>(data.tex));
@@ -432,16 +428,6 @@ static void captureWindows(PHLMONITOR m) {
 
         g_pHyprRenderer->m_renderData.blockScreenShader = true;
         g_pHyprRenderer->endRender();
-
-        // Build the mip chain the morph draws sample through (they switch
-        // this texture to GL_LINEAR_MIPMAP_LINEAR — an incomplete texture
-        // would sample black). Redone here on every recapture because the
-        // pixels just changed. EGL is current inside the capture flow.
-        if (const auto t = cw.fb->getTexture()) {
-            t->bind();
-            glGenerateMipmap(GL_TEXTURE_2D);
-            t->unbind();
-        }
 
         for (auto& pb : prevBoxes) // carry hit-box + preview glide forward across the rebuild
             if (pb.first.lock() == w) {
@@ -618,27 +604,6 @@ static void drawSchematic(PHLMONITOR m, const Rect tiles[N_TILES]) {
 static int  tileAt(PHLMONITOR m, const Vector2D& c);
 static bool tileEmpty(int tile);
 
-// Quadrant split, mirroring dwindle's precise_mouse_move exactly: the cursor's
-// slope from the target's center picks the seam — inside the flat side
-// triangles (|dy|/|dx| < h/w) the cut is side-by-side, in the steep top/bottom
-// triangles it stacks. `given` is the newcomer's half, `kept` the target's;
-// both are seam-true (gX/gY shaved per side).
-static void quadrantSplit(const CBox& b, const Vector2D& c, double gX, double gY, CBox& kept, CBox& given) {
-    const double dx = c.x - (b.x + b.w / 2.0);
-    const double dy = c.y - (b.y + b.h / 2.0);
-    if (std::abs(dy) * b.w < std::abs(dx) * b.h) {
-        const CBox lh{b.x, b.y, b.w / 2.0 - gX, b.h};
-        const CBox rh{b.x + b.w / 2.0 + gX, b.y, b.w / 2.0 - gX, b.h};
-        given = dx > 0.0 ? rh : lh;
-        kept  = dx > 0.0 ? lh : rh;
-    } else {
-        const CBox th{b.x, b.y, b.w, b.h / 2.0 - gY};
-        const CBox bh{b.x, b.y + b.h / 2.0 + gY, b.w, b.h / 2.0 - gY};
-        given = dy > 0.0 ? bh : th;
-        kept  = dy > 0.0 ? th : bh;
-    }
-}
-
 // Draw the overview onto the current monitor at zoom progress `p` (0 = zoomed
 // into `zoomTile`, 1 = full grid), pivoting the zoom on `zoomTile`. The look is
 // just the wallpaper with each window floating over it as an individually
@@ -733,6 +698,9 @@ static void drawOverview(PHLMONITOR m, float p, int zoomTile) {
     // (live commit) the window really lives in its target view, is part of
     // the capture like any sibling, and needs no ghost.
     const auto dragW  = (g_dragMoved && g_dragReal) ? g_dragWin.lock() : PHLWINDOW{};
+    // Committed: the window sits REALLY placed in its slot but is still in
+    // hand — the halo marks it so the gesture never reads as "dropped".
+    const auto heldW  = g_commit.active ? g_dragWin.lock() : PHLWINDOW{};
 
     // NO rest-shrink (per Max, round 3): windows draw at their true mapped
     // size — a maximized/smart-gaps window touches its tile edges exactly
@@ -966,8 +934,8 @@ static void drawOverview(PHLMONITOR m, float p, int zoomTile) {
         if (w && w == dragW)
             continue; // the dragged window is drawn last, under the cursor
 
-        if ((w && w == hoverW) || (ssize_t)i == swapIdx)
-            haloBorder(box, round); // ring: hover, or the live swap partner
+        if ((w && w == hoverW) || (ssize_t)i == swapIdx || (w && w == heldW))
+            haloBorder(box, round); // ring: hover, live swap partner, or held-in-place
         drawTex(tex, box, round);
     }
 
@@ -1073,7 +1041,7 @@ static void onMouseMove(Vector2D, Event::SCallbackInfo& info) {
 // the window out and re-tiles the siblings immediately (the live thumbnails
 // show it — no hole). The cursor warps to the window's desktop centre to
 // seed the drag, then returns; our motion-swallow mutes the side effects.
-static void beginRealDrag(PHLWINDOW dw) {
+static void beginRealDrag(PHLWINDOW dw, bool capture) {
     if (g_dragReal || !dw || dw->isFullscreen())
         return;
     const CBox     wb = dw->getWindowMainSurfaceBox();
@@ -1100,8 +1068,12 @@ static void beginRealDrag(PHLWINDOW dw) {
     g_layoutManager->setTargetGeom(CBox{-20000.0, -20000.0, wb.w, wb.h}, dw->layoutTarget());
     g_pCompositor->warpCursorTo(saved, true);
     g_dragReal = true;
-    if (const auto m = g_captureMon.lock())
-        captureWorkspaces(m); // show the re-tile right away
+    // A re-commit passes capture=false: it re-inserts immediately after and
+    // captures THEN — snapshotting the pulled-out intermediate here made
+    // every re-placement read as a double bounce ("it confirms twice").
+    if (capture)
+        if (const auto m = g_captureMon.lock())
+            captureWorkspaces(m); // show the re-tile right away
 }
 
 // A clean synthetic re-place: begin+end a whole drag around a KNOWN static
@@ -1151,6 +1123,14 @@ static void endRealDrag(std::optional<Vector2D> at, PHLWINDOW splitTarget) {
     g_pCompositor->warpCursorTo(dest, true);
     if (splitTarget)
         Desktop::focusState()->fullWindowFocus(splitTarget, Desktop::FOCUS_REASON_DESKTOP_STATE_CHANGE);
+    // Un-park BEFORE ending: the float sat at -20000 for the drag's
+    // duration, and now that captures run live through the settle, the
+    // landing spring would visibly fly it in from offscreen ("laggy").
+    // Re-seated at the drop point, the spring is short and reads as a drop.
+    if (const auto dw = g_dragWin.lock()) {
+        const CBox wb = dw->getWindowMainSurfaceBox();
+        g_layoutManager->setTargetGeom(CBox{dest.x - wb.w / 2.0, dest.y - wb.h / 2.0, wb.w, wb.h}, dw->layoutTarget());
+    }
     g_layoutManager->moveMouse(dest);
     // The check at the top is stale by now: the focus change and the drag
     // motion at the drop point both run through the controller and can drop
@@ -1170,7 +1150,10 @@ static void endRealDrag(std::optional<Vector2D> at, PHLWINDOW splitTarget) {
 // commits anew. Release on the committed target keeps it; anywhere else falls
 // back to the classic drop; outside every view — and on cancel/close — the
 // window returns to its ORIGINAL workspace and spot.
-// The discrete side of quadrantSplit's slope test (0 L, 1 R, 2 T, 3 B).
+// The discrete side of a would-be insert (0 L, 1 R, 2 T, 3 B), mirroring
+// dwindle's precise_mouse_move: the cursor's slope from the target's center
+// picks the seam — flat side triangles (|dy|/|dx| < h/w) cut side-by-side,
+// the steep top/bottom triangles stack.
 static int quadrantSide(const CBox& b, const Vector2D& c) {
     const double dx = c.x - (b.x + b.w / 2.0);
     const double dy = c.y - (b.y + b.h / 2.0);
@@ -1252,12 +1235,15 @@ static void commitAt(PHLMONITOR m, const Vector2D& c, PHLWINDOW dw, const LiveCo
 }
 
 // The hover left the committed spot: pull the window back out of its slot.
-// beginRealDrag floats it out, the siblings re-tile back, and it captures.
+// beginRealDrag floats it out and the siblings re-tile back. No synchronous
+// capture — a re-commit inserts (and captures) right behind this, and the
+// boosted timer covers the pulled-out case within 50ms; capturing here made
+// every re-placement a visible double bounce.
 static void regrab(PHLWINDOW dw) {
     if (!g_commit.active)
         return;
     g_commit = {};
-    beginRealDrag(dw);
+    beginRealDrag(dw, false);
     g_boostUntil = Time::steadyNow() + std::chrono::milliseconds(700);
     if (g_liveTimer)
         g_liveTimer->updateTimeout(std::chrono::milliseconds(50));
@@ -1277,6 +1263,11 @@ static void maybeCommit(PHLMONITOR m) {
     if (g_commit.active && winAt(g_dragCursor).lock() == dw)
         return;
     const auto sig = signatureAt(m, g_dragCursor, dw);
+    // Empty space in the view it already occupies isn't a new placement
+    // either — re-committing there just churned the layout (and a null
+    // split target falls to dwindle's stale-focus default slot).
+    if (g_commit.active && sig.active && !sig.under.lock() && sig.tile + 1 == dw->workspaceID())
+        return;
     if (!sameCommit(sig, g_pending)) {
         g_pending      = sig;
         g_pendingSince = Time::steadyNow();
@@ -1526,55 +1517,16 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
         } else {
             restoreOriginal(); // dropped outside every view: back to where it came from
         }
-        // DO NOT recapture until the landing spring rests (~480ms spring +
-        // settle tail; hyprland.lua windows speed 4.79) — an earlier
-        // snapshot catches windows mid-flight and blinks. Meanwhile show
-        // the COMPLETE landing shape immediately: the split target holds
-        // its kept half and the dragged window's stashed image is PLACED
-        // into the vacated half (or the whole view on an empty-space
-        // drop). The settled capture then merely confirms the picture.
+        // The landing is LIVE now (same treatment as a commit): capture
+        // immediately and keep capturing fast while the real windows
+        // spring into place — the un-park in endRealDrag keeps the spring
+        // short. The old stale-texture landing cosmetics are retired.
+        g_boostUntil = Time::steadyNow() + std::chrono::milliseconds(700);
+        captureWorkspaces(m);
         if (g_liveTimer)
-            g_liveTimer->updateTimeout(std::chrono::milliseconds(750));
-        if (drop >= 0) {
-            CBox landBox{tiles[drop].x, tiles[drop].y, tiles[drop].w, tiles[drop].h};
-            if (under) {
-                // Recompute the split fresh (a fast drop may never have
-                // registered a hover preview): kept half for the target,
-                // complement for the newcomer, sided by the drop point.
-                for (auto& cw : g_wins) {
-                    if (cw.win.lock() != under)
-                        continue;
-                    // Halves WITH the design seam between them (each side
-                    // gives half the gap) — raw halves touched, so the pair
-                    // read slightly bigger than the settled result and
-                    // visibly 'landed' when the recapture corrected it.
-                    const CBox&  b  = cw.screen;
-                    const double gX = DSN_WIN_GAP * tiles[drop].w / 2.0;
-                    const double gY = DSN_WIN_GAP * tiles[drop].h / 2.0;
-                    CBox         kept, given;
-                    quadrantSplit(b, c, gX, gY, kept, given);
-                    cw.previewBox  = kept;
-                    cw.previewCur  = kept; // held landing: no residual glide
-                    cw.previewT    = 1.f;
-                    cw.holdPreview = true;
-                    landBox        = given;
-                    break;
-                }
-            }
-            for (auto& cw : g_wins) {
-                if (cw.win.lock() == dw) {
-                    cw.previewBox  = landBox; // the newcomer lands NOW, visually
-                    cw.previewCur  = landBox;
-                    cw.previewT    = 1.f;
-                    cw.holdPreview = true;
-                } else if (cw.win.lock() != under) {
-                    cw.previewT = 0.f;
-                }
-            }
-        } else {
-            for (auto& cw : g_wins)
-                cw.previewT = 0.f; // cancelled: everything eases home
-        }
+            g_liveTimer->updateTimeout(std::chrono::milliseconds(50));
+        for (auto& cw : g_wins)
+            cw.previewT = 0.f;
     }
     damageAll();
 }
@@ -1891,7 +1843,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.6"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.7"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
