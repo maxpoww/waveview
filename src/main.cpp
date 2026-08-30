@@ -847,9 +847,13 @@ static void updateHoverAt(PHLMONITOR m, const Vector2D& c) {
     }
 }
 
-// Wheel while open: one notch flips to the next/previous page of 9
-// (cooldown so a fast wheel doesn't skip pages). Swallowed so the desktop
-// underneath never scrolls; the eased chase runs in onRender (dt-based).
+// Scroll while open flips between the two pages, clamped — never a loop.
+// A mouse wheel flips per notch; a 2-finger touchpad scroll streams tiny
+// deltas, so it accumulates to a travel threshold first. Swallowed either
+// way so the desktop underneath never scrolls; the eased glide runs in
+// onRender (dt-based).
+static double           g_fingerAcc    = 0.0;
+static constexpr double FINGER_FLIP_AT = 140.0; // accumulated px per page flip
 static void onMouseAxis(IPointer::SAxisEvent e, Event::SCallbackInfo& info) {
     if (!g_active || g_animTarget < 0.5f)
         return;
@@ -862,7 +866,19 @@ static void onMouseAxis(IPointer::SAxisEvent e, Event::SCallbackInfo& info) {
     const auto now = Time::steadyNow();
     if (std::chrono::duration<double>(now - g_pageFlipAt).count() < 0.3)
         return;
-    const int dir = e.delta > 0.0 ? 1 : e.delta < 0.0 ? -1 : 0;
+    int dir = 0;
+    if (e.source == WL_POINTER_AXIS_SOURCE_FINGER) {
+        // Direction change discards stale travel (momentum can't fight you).
+        if (e.delta * g_fingerAcc < 0.0)
+            g_fingerAcc = 0.0;
+        g_fingerAcc += e.delta;
+        if (std::abs(g_fingerAcc) < FINGER_FLIP_AT)
+            return;
+        dir         = g_fingerAcc > 0.0 ? 1 : -1;
+        g_fingerAcc = 0.0;
+    } else {
+        dir = e.delta > 0.0 ? 1 : e.delta < 0.0 ? -1 : 0;
+    }
     const int next = std::clamp(g_page + dir, 0, 1);
     if (next == g_page)
         return;
@@ -1097,9 +1113,10 @@ static void onSwipeBegin(IPointer::SSwipeBeginEvent e, Event::SCallbackInfo&) {
     g_swipeFired   = false;
 }
 
-// Accumulate the swipe; on a decisive 3-finger vertical move, toggle the overview
-// once (up opens, down closes) and latch g_swipeFired so the rest of the gesture
-// is inert. libinput reports fingers-up as negative dy.
+// Accumulate the swipe; on a decisive 3-finger vertical move (once per
+// gesture): swipe UP walks the same ladder as Super+R — open, then tour the
+// other inhabited page, then close; swipe DOWN is Escape (immediate close,
+// no touring). libinput reports fingers-up as negative dy.
 static void onSwipeUpdate(IPointer::SSwipeUpdateEvent e, Event::SCallbackInfo& info) {
     if (g_swipeFingers != 3 || g_swipeFired)
         return;
@@ -1107,10 +1124,10 @@ static void onSwipeUpdate(IPointer::SSwipeUpdateEvent e, Event::SCallbackInfo& i
     if (std::abs(g_swipeAcc.y) < SWIPE_TRIGGER || std::abs(g_swipeAcc.x) > std::abs(g_swipeAcc.y))
         return; // not yet decisive, or dominantly horizontal
 
-    const bool up     = g_swipeAcc.y < 0.0;
-    const bool opened = g_animTarget > 0.5f; // currently open/opening
-    if (up != opened)                        // up & closed -> open; down & open -> close
-        toggle();
+    if (g_swipeAcc.y < 0.0)
+        toggle(); // up: open → tour → close (the Super+R ladder)
+    else
+        closeOverview(); // down: Esc (no-op when already closed)
     g_swipeFired   = true;
     info.cancelled = true; // consume so no built-in gesture also reacts
 }
