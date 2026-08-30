@@ -131,8 +131,9 @@ struct CapWin {
     int                      tile;    // grid slot 0..8 (its workspace)
     bool                     active;  // currently focused window
     CBox                     screen;  // last-drawn box in draw space (for hit-testing)
-    float                    previewT   = 0.f; // swap-preview glide: 0 = home, 1 = in the dragged slot
-    CBox                     previewBox;       // the slot it glides toward (kept for the ease-back)
+    float                    previewT    = 0.f; // split-preview glide: 0 = home, 1 = at its kept half
+    CBox                     previewBox;        // the half it glides toward (kept for the ease-back)
+    bool                     holdPreview = false; // drop landed here: hold the preview until recapture
 };
 static std::vector<CapWin> g_wins;
 
@@ -753,7 +754,7 @@ static void drawOverview(PHLMONITOR m, float p, int zoomTile) {
         if (!ok[i])
             continue;
         auto&       cw     = g_wins[i];
-        const float target = (ssize_t)i == swapIdx ? 1.f : 0.f;
+        const float target = (cw.holdPreview || (ssize_t)i == swapIdx) ? 1.f : 0.f;
         if ((ssize_t)i == swapIdx) {
             // The half it keeps: split on the longer axis, away from the
             // cursor side — mirroring where dwindle puts the newcomer.
@@ -1069,8 +1070,9 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
         return;
     }
     if (dw) {
-        Rect tiles[N_TILES];
-        int  drop = -1;
+        Rect      tiles[N_TILES];
+        int       drop = -1;
+        PHLWINDOW under;
         if (computeTiles(m, tiles) == N_TILES)
             for (int i = 0; i < N_TILES; ++i)
                 if (CBox{tiles[i].x, tiles[i].y, tiles[i].w, tiles[i].h}.containsPoint(c)) {
@@ -1097,7 +1099,6 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
             // the dwindle insert splits whatever sits under it, exactly
             // like releasing the drag on the real desktop. Pass the window
             // under the drop as the split target (see endRealDrag).
-            PHLWINDOW under;
             for (auto it = g_wins.rbegin(); it != g_wins.rend(); ++it) {
                 if (it->screen.w <= 0.0 || !it->screen.containsPoint(c))
                     continue;
@@ -1121,8 +1122,17 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
         std::erase_if(g_wins, [&](const CapWin& cw) { return cw.win.lock() == dw; });
         if (g_liveTimer)
             g_liveTimer->updateTimeout(std::chrono::milliseconds(200));
-        for (auto& cw : g_wins)
-            cw.previewT = 0.f; // the real layout moved — no stale glide-back
+        // HOLD the split target's preview until the recapture: its preview
+        // half IS the post-drop truth — zeroing it snapped the sibling back
+        // to full size for 200ms and then re-split it (two reactions for
+        // one drop). Fresh captures reset the hold; the carried preview then
+        // decays onto the (nearly identical) real geometry.
+        for (auto& cw : g_wins) {
+            if (under && cw.win.lock() == under)
+                cw.holdPreview = true;
+            else
+                cw.previewT = 0.f;
+        }
     }
     damageAll();
 }
