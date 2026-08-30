@@ -214,6 +214,13 @@ static uint32_t        g_dirtyTiles   = 0;     // tiles touched since the last f
 // which is how dwindle got fed garbage (and windows came out floating).
 static bool            g_busy = false;
 static Time::steady_tp g_boostUntil{};  // fast recapture while a real re-tile springs
+// Float-leak watch (diagnosis, v0.21): every gesture end arms this; the live
+// timer then compares the window's float state against what the gesture
+// promised, for 3s — catching a leak that happens AFTER the synchronous
+// nets ran (the only place left: every static path is netted).
+static PHLWINDOWREF    g_watchWin;
+static bool            g_watchFloatExpect = false;
+static Time::steady_tp g_watchSince{};
 
 // Zoom animation: 0 = zoomed fully into g_zoomTile (that workspace fills the
 // screen), 1 = the whole 3x3 grid at its rest layout. Opening animates 0->1,
@@ -251,6 +258,7 @@ static void updateHoverAt(PHLMONITOR m, const Vector2D& c);
 static void closeOverview();
 static void beginRealDrag(PHLWINDOW dw, bool capture = true);
 static void endRealDrag(std::optional<Vector2D> at, PHLWINDOW splitTarget = nullptr);
+static void checkFloatWatch();
 static void maybeCommit(PHLMONITOR m);
 static void restoreFloatState(PHLWINDOW dw);
 
@@ -1091,8 +1099,12 @@ static void drawOverview(PHLMONITOR m, float p, int zoomTile) {
 // While the overview is open, re-capture thumbnails on a timer so they stay live.
 // Fires outside the render pass (so beginRender is safe) and re-arms itself.
 static void onLiveTimer(SP<CEventLoopTimer> self, void*) {
-    if (!g_active)
+    checkFloatWatch(); // float-leak watch outlives the overview (leaks show on the desktop)
+    if (!g_active) {
+        if (g_watchWin.lock())
+            self->updateTimeout(std::chrono::milliseconds(100)); // keep watching ≤3s past close
         return; // disarmed on close; don't re-arm
+    }
     // Never recapture mid-animation: snapshotting 18 workspaces stalls a
     // frame, which reads as a hitch in the page-flip / zoom glide. Poll
     // quickly until the motion settles, then catch up.
@@ -1205,10 +1217,13 @@ static void beginRealDrag(PHLWINDOW dw, bool capture) {
     // compositor never held — dragEnd() derefs null and crashes. The
     // begin may still have floated the window before rejecting: undo it.
     if (!g_layoutManager->dragController()->target()) {
+        trace("grab REJECT ws=%d float=%d", (int)dw->workspaceID(), (int)dw->m_isFloating);
         restoreFloatState(dw);
         g_pCompositor->warpCursorTo(saved, true);
         return;
     }
+    trace("grab ws=%d float=%d dragTiled=%d", (int)dw->workspaceID(), (int)dw->m_isFloating,
+          (int)g_layoutManager->dragController()->draggingTiled());
     g_layoutManager->moveMouse(home + Vector2D(3, 3)); // trip the drag threshold
     g_layoutManager->moveMouse(home);
     // Park the float far offscreen for the drag's duration: it floats at
@@ -1239,8 +1254,37 @@ static void beginRealDrag(PHLWINDOW dw, bool capture) {
 // Called after every end attempt: restores whatever the window was when
 // the gesture started, and no-ops when the end completed normally.
 static void restoreFloatState(PHLWINDOW dw) {
-    if (dw && dw->m_isMapped && !dw->isFullscreen() && dw->m_isFloating != g_origFloating)
+    if (dw && dw->m_isMapped && !dw->isFullscreen() && dw->m_isFloating != g_origFloating) {
+        trace("floatnet TOGGLE ws=%d float %d->%d", (int)dw->workspaceID(), (int)dw->m_isFloating,
+              (int)g_origFloating);
         g_layoutManager->changeFloatingMode(dw->layoutTarget());
+    }
+}
+
+// Arm the deferred float watch for the window a gesture just released.
+static void armFloatWatch(PHLWINDOW dw) {
+    if (!dw)
+        return;
+    g_watchWin         = dw;
+    g_watchFloatExpect = g_origFloating;
+    g_watchSince       = Time::steadyNow();
+}
+
+// One-shot leak report: fires if the watched window's float state diverges
+// from the gesture's promise any time within 3s of the release.
+static void checkFloatWatch() {
+    const auto w = g_watchWin.lock();
+    if (!w)
+        return;
+    const double ms = std::chrono::duration<double, std::milli>(Time::steadyNow() - g_watchSince).count();
+    if (w->m_isMapped && !w->isFullscreen() && w->m_isFloating != g_watchFloatExpect) {
+        trace("FLOAT-LEAK +%.0fms ws=%d float=%d expected=%d", ms, (int)w->workspaceID(), (int)w->m_isFloating,
+              (int)g_watchFloatExpect);
+        g_watchWin.reset(); // log once per gesture
+        return;
+    }
+    if (ms > 3000.0)
+        g_watchWin.reset(); // clean for 3s = no leak this gesture
 }
 
 // A clean synthetic re-place: begin+end a whole drag around a KNOWN static
@@ -1264,7 +1308,12 @@ static void placeAt(PHLWINDOW dw, const Vector2D& desk, PHLWINDOW under) {
         // mid-drag); the earlier check is stale by now. Re-check or crash.
         if (g_layoutManager->dragController()->target())
             g_layoutManager->endDragTarget();
-    }
+        else
+            trace("placeAt DEAD-TARGET(moved)");
+    } else
+        trace("placeAt REJECT");
+    trace("placeAt at=(%.0f,%.0f) ws=%d float=%d", desk.x, desk.y, (int)dw->workspaceID(),
+          (int)dw->m_isFloating);
     restoreFloatState(dw);
     g_pCompositor->warpCursorTo(saved, true);
 }
@@ -1285,6 +1334,7 @@ static void endRealDrag(std::optional<Vector2D> at, PHLWINDOW splitTarget) {
     // and takes Hyprland down. No live target → nothing to end — but the
     // grab already floated the window out, so undo that much.
     if (!g_layoutManager->dragController()->target()) {
+        trace("end DEAD-TARGET(top)");
         restoreFloatState(g_dragWin.lock());
         return;
     }
@@ -1309,6 +1359,11 @@ static void endRealDrag(std::optional<Vector2D> at, PHLWINDOW splitTarget) {
     // on 2026-08-30 — dragEnd() on a target freed during moveMouse).
     if (g_layoutManager->dragController()->target())
         g_layoutManager->endDragTarget();
+    else
+        trace("end DEAD-TARGET(moved)");
+    if (const auto dw2 = g_dragWin.lock())
+        trace("end at=(%.0f,%.0f) ws=%d float=%d", dest.x, dest.y, (int)dw2->workspaceID(),
+              (int)dw2->m_isFloating);
     restoreFloatState(g_dragWin.lock());
     g_pCompositor->warpCursorTo(saved, true);
 }
@@ -1538,6 +1593,7 @@ static void restoreOriginal() {
         }
     } else
         endRealDrag(g_origHome, nullptr);
+    armFloatWatch(dw); // cancels are gesture ends too
 }
 
 // Shared by motion and grid-scroll: recompute hover/drag targets at cursor `c`
@@ -1697,6 +1753,10 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
         // (the cursor sits on the live hole, or on the committed target):
         // reveal the window in place — nothing to end, move, or fake.
         if (g_commit.active && (winAt(c).lock() == dw || sameCommit(signatureAt(m, c, dw), g_commit))) {
+            // The one gesture end with NO net of its own (the commit's
+            // endRealDrag already netted) — watch it extra closely.
+            trace("release REVEAL ws=%d float=%d", (int)dw->workspaceID(), (int)dw->m_isFloating);
+            armFloatWatch(dw);
             g_dragWin.reset();
             g_commit  = {};
             g_pending = {};
@@ -1772,6 +1832,8 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
         g_commit  = {};
         g_origWS  = -1;
         restoreFloatState(dw); // last-resort net: no gesture may leak a float
+        trace("release settled ws=%d float=%d", (int)dw->workspaceID(), (int)dw->m_isFloating);
+        armFloatWatch(dw);
         g_boostUntil = Time::steadyNow() + BOOST_MS;
         warpFocusFx(); // the drop's focus churn must not glow through the settle captures
         captureWorkspaces(m, g_dirtyTiles ? g_dirtyTiles : ALL_TILES);
@@ -2095,10 +2157,27 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.20"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.22"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
+    // Unloading while the overview draws is how the 2026-08-30 crash happened:
+    // our CUVTexElement/CUVResetElement vtables live in this .so, and Hyprland
+    // clears the PREVIOUS frame's pass at the START of the next one
+    // (CRenderPass::clear() is beginRender's first call) — so a hot-unload
+    // mid-draw leaves queued elements whose virtual dtors point into unmapped
+    // memory. Hard-close first, then flush the pass while we're still mapped.
+    if (g_active) {
+        restoreOriginal(); // ends a live drag; float + workspace restored
+        notifyWaverunner(false);
+    }
+    g_active     = false;
+    g_animTarget = 0.0f;
+    g_dragWin.reset();
+    g_hoverWin.reset();
+    g_watchWin.reset();
+    g_commit  = {};
+    g_pending = {};
     g_renderListener.reset();
     g_keyListener.reset();
     g_moveListener.reset();
@@ -2123,4 +2202,8 @@ APICALL EXPORT void PLUGIN_EXIT() {
         if (cw.fb)
             cw.fb->release();
     g_wins.clear();
+    // Destroy any of OUR queued pass elements now, not next frame. Stock
+    // elements die a frame early with them: harmless, the pass rebuilds.
+    g_pHyprRenderer->m_renderPass.clear();
+    damageAll();
 }
