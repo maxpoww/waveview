@@ -1111,27 +1111,54 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
         } else {
             endRealDrag(std::nullopt); // dropped outside every view: go home
         }
-        // DO NOT recapture until the landing spring rests: windows animate on a
-        // ~480ms spring (hyprland.lua: windows speed 4.79) with a settle tail —
-        // any earlier snapshot catches them mid-flight and blinks. The held
-        // preview IS the landing shape, so stillness is correct meanwhile; the
-        // dragged window.s stale mini goes away so nothing overlaps.
-        for (auto& cw : g_wins)
-            if (cw.win.lock() == dw && cw.fb)
-                cw.fb->release();
-        std::erase_if(g_wins, [&](const CapWin& cw) { return cw.win.lock() == dw; });
+        // DO NOT recapture until the landing spring rests (~480ms spring +
+        // settle tail; hyprland.lua windows speed 4.79) — an earlier
+        // snapshot catches windows mid-flight and blinks. Meanwhile show
+        // the COMPLETE landing shape immediately: the split target holds
+        // its kept half and the dragged window's stashed image is PLACED
+        // into the vacated half (or the whole view on an empty-space
+        // drop). The settled capture then merely confirms the picture.
         if (g_liveTimer)
             g_liveTimer->updateTimeout(std::chrono::milliseconds(750));
-        // HOLD the split target's preview until the recapture: its preview
-        // half IS the post-drop truth — zeroing it snapped the sibling back
-        // to full size for 200ms and then re-split it (two reactions for
-        // one drop). Fresh captures reset the hold; the carried preview then
-        // decays onto the (nearly identical) real geometry.
-        for (auto& cw : g_wins) {
-            if (under && cw.win.lock() == under)
-                cw.holdPreview = true;
-            else
-                cw.previewT = 0.f;
+        if (drop >= 0) {
+            CBox landBox{tiles[drop].x, tiles[drop].y, tiles[drop].w, tiles[drop].h};
+            if (under) {
+                // Recompute the split fresh (a fast drop may never have
+                // registered a hover preview): kept half for the target,
+                // complement for the newcomer, sided by the drop point.
+                for (auto& cw : g_wins) {
+                    if (cw.win.lock() != under)
+                        continue;
+                    const CBox& b = cw.screen;
+                    CBox        kept, given;
+                    if (b.w >= b.h) {
+                        const bool left = c.x < b.x + b.w / 2.0;
+                        kept  = left ? CBox{b.x + b.w / 2.0, b.y, b.w / 2.0, b.h} : CBox{b.x, b.y, b.w / 2.0, b.h};
+                        given = left ? CBox{b.x, b.y, b.w / 2.0, b.h} : CBox{b.x + b.w / 2.0, b.y, b.w / 2.0, b.h};
+                    } else {
+                        const bool top = c.y < b.y + b.h / 2.0;
+                        kept  = top ? CBox{b.x, b.y + b.h / 2.0, b.w, b.h / 2.0} : CBox{b.x, b.y, b.w, b.h / 2.0};
+                        given = top ? CBox{b.x, b.y, b.w, b.h / 2.0} : CBox{b.x, b.y + b.h / 2.0, b.w, b.h / 2.0};
+                    }
+                    cw.previewBox  = kept;
+                    cw.previewT    = 1.f;
+                    cw.holdPreview = true;
+                    landBox        = given;
+                    break;
+                }
+            }
+            for (auto& cw : g_wins) {
+                if (cw.win.lock() == dw) {
+                    cw.previewBox  = landBox; // the newcomer lands NOW, visually
+                    cw.previewT    = 1.f;
+                    cw.holdPreview = true;
+                } else if (cw.win.lock() != under) {
+                    cw.previewT = 0.f;
+                }
+            }
+        } else {
+            for (auto& cw : g_wins)
+                cw.previewT = 0.f; // cancelled: everything eases home
         }
     }
     damageAll();
