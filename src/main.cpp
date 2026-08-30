@@ -172,6 +172,12 @@ static float           g_frameDt      = 0.016f;
 // or back at home on cancel/close.
 static bool            g_dragReal       = false;
 static Vector2D        g_dragHomeCenter = {};
+// The cursor ghost SHAPESHIFTS to preview its destination: eased dims chase
+// the slot it would take (complement half / full empty view / own size),
+// anchored by the grab point as a fraction of the box.
+static double          g_ghostW = 0.0, g_ghostH = 0.0;
+static double          g_ghostWantW = 0.0, g_ghostWantH = 0.0;
+static double          g_grabFracX = 0.5, g_grabFracY = 0.5;
 
 // Zoom animation: 0 = zoomed fully into g_zoomTile (that workspace fills the
 // screen), 1 = the whole 3x3 grid at its rest layout. Opening animates 0->1,
@@ -507,6 +513,9 @@ static void drawSchematic(PHLMONITOR m, const Rect tiles[N_TILES]) {
     }
 }
 
+static int  tileAt(PHLMONITOR m, const Vector2D& c);
+static bool tileEmpty(int tile);
+
 // Draw the overview onto the current monitor at zoom progress `p` (0 = zoomed
 // into `zoomTile`, 1 = full grid), pivoting the zoom on `zoomTile`. The look is
 // just the wallpaper with each window floating over it as an individually
@@ -766,10 +775,14 @@ static void drawOverview(PHLMONITOR m, float p, int zoomTile) {
                 const bool left = g_dragCursor.x < b.x + b.w / 2.0;
                 cw.previewBox   = left ? CBox{b.x + b.w / 2.0 + gX, b.y, b.w / 2.0 - gX, b.h}
                                        : CBox{b.x, b.y, b.w / 2.0 - gX, b.h};
+                g_ghostWantW    = b.w / 2.0 - gX; // the ghost previews ITS half
+                g_ghostWantH    = b.h;
             } else {
                 const bool top = g_dragCursor.y < b.y + b.h / 2.0;
                 cw.previewBox  = top ? CBox{b.x, b.y + b.h / 2.0 + gY, b.w, b.h / 2.0 - gY}
                                      : CBox{b.x, b.y, b.w, b.h / 2.0 - gY};
+                g_ghostWantW   = b.w;
+                g_ghostWantH   = b.h / 2.0 - gY;
             }
         }
         cw.previewT += (target - cw.previewT) * std::min(1.0f, g_frameDt * 14.f);
@@ -783,6 +796,26 @@ static void drawOverview(PHLMONITOR m, float p, int zoomTile) {
             boxes[i]       = CBox{mix(h.x, cw.previewBox.x, e), mix(h.y, cw.previewBox.y, e),
                                   mix(h.w, cw.previewBox.w, e), mix(h.h, cw.previewBox.h, e)};
         }
+    }
+    // Ghost shape chase: over an empty view it wants the full tile; over
+    // nothing, its own size (over a window the swap branch above set the
+    // half). Eased like everything else.
+    if (dragIdx >= 0) {
+        if (swapIdx < 0) {
+            const int te = tileAt(m, g_dragCursor);
+            if (te >= 0 && tileEmpty(te)) {
+                g_ghostWantW = tiles[te].w;
+                g_ghostWantH = tiles[te].h;
+            } else {
+                g_ghostWantW = boxes[dragIdx].w;
+                g_ghostWantH = boxes[dragIdx].h;
+            }
+        }
+        const double k = std::min(1.0, (double)g_frameDt * 14.0);
+        g_ghostW += (g_ghostWantW - g_ghostW) * k;
+        g_ghostH += (g_ghostWantH - g_ghostH) * k;
+        if (std::abs(g_ghostW - g_ghostWantW) > 0.5 || std::abs(g_ghostH - g_ghostWantH) > 0.5)
+            previewMoving = true;
     }
     if (previewMoving) {
         g_pHyprRenderer->damageMonitor(m);
@@ -815,7 +848,10 @@ static void drawOverview(PHLMONITOR m, float p, int zoomTile) {
             const auto tex = cw.fb ? cw.fb->getTexture() : nullptr;
             if (!tex)
                 break;
-            CBox b{g_dragCursor.x - g_dragGrab.x, g_dragCursor.y - g_dragGrab.y, cw.screen.w, cw.screen.h};
+            // Shapeshifting ghost: eased dims previewing the destination
+            // slot, anchored by the grab point as a fraction of the box.
+            CBox b{g_dragCursor.x - g_grabFracX * g_ghostW, g_dragCursor.y - g_grabFracY * g_ghostH, g_ghostW,
+                   g_ghostH};
             const int round = (int)std::lround(std::min(b.w, b.h) * 0.06);
             haloBorder(b, round);
             drawTex(tex, b, round);
@@ -1062,7 +1098,11 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
             // grab offset from the window's drawn top-left, so it tracks naturally
             for (auto& cw : g_wins)
                 if (cw.win.lock() == w) {
-                    g_dragGrab = Vector2D(c.x - cw.screen.x, c.y - cw.screen.y);
+                    g_dragGrab  = Vector2D(c.x - cw.screen.x, c.y - cw.screen.y);
+                    g_grabFracX = cw.screen.w > 0.0 ? std::clamp(g_dragGrab.x / cw.screen.w, 0.0, 1.0) : 0.5;
+                    g_grabFracY = cw.screen.h > 0.0 ? std::clamp(g_dragGrab.y / cw.screen.h, 0.0, 1.0) : 0.5;
+                    g_ghostW = g_ghostWantW = cw.screen.w;
+                    g_ghostH = g_ghostWantH = cw.screen.h;
                     break;
                 }
             damageAll();
