@@ -208,7 +208,7 @@ static void jumpToWindow(PHLWINDOW w);
 static void updateHoverAt(PHLMONITOR m, const Vector2D& c);
 static void closeOverview();
 static void beginRealDrag(PHLWINDOW dw);
-static void endRealDrag(std::optional<Vector2D> at);
+static void endRealDrag(std::optional<Vector2D> at, PHLWINDOW splitTarget = nullptr);
 
 static void damageAll() {
     for (auto& m : g_pCompositor->m_monitors) {
@@ -930,13 +930,20 @@ static void beginRealDrag(PHLWINDOW dw) {
 
 // End the running real drag at `at` (desktop coords) — the dwindle insert
 // splits whatever is under that point — or back at home when cancelled.
-static void endRealDrag(std::optional<Vector2D> at) {
+// `splitTarget`: dwindle's use_active_for_splits keys the insert off the
+// FOCUSED window; on the desktop focus-follows-mouse focuses the drop
+// target during the drag, but the overview swallows motion, leaving focus
+// stale (the insert then fell to a default slot — "it goes back home").
+// Focusing the target first restores the invariant the machinery expects.
+static void endRealDrag(std::optional<Vector2D> at, PHLWINDOW splitTarget) {
     if (!g_dragReal)
         return;
     g_dragReal           = false;
     const Vector2D dest  = at.value_or(g_dragHomeCenter);
     const Vector2D saved = g_pInputManager->getMouseCoordsInternal();
     g_pCompositor->warpCursorTo(dest, true);
+    if (splitTarget)
+        Desktop::focusState()->fullWindowFocus(splitTarget, Desktop::FOCUS_REASON_DESKTOP_STATE_CHANGE);
     g_layoutManager->moveMouse(dest);
     g_layoutManager->endDragTarget();
     g_pCompositor->warpCursorTo(saved, true);
@@ -1097,8 +1104,18 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
             }
             // Finish the drag begun at grab: end it at the drop point —
             // the dwindle insert splits whatever sits under it, exactly
-            // like releasing the drag on the real desktop.
-            endRealDrag(desk);
+            // like releasing the drag on the real desktop. Pass the window
+            // under the drop as the split target (see endRealDrag).
+            PHLWINDOW under;
+            for (auto it = g_wins.rbegin(); it != g_wins.rend(); ++it) {
+                if (it->screen.w <= 0.0 || !it->screen.containsPoint(c))
+                    continue;
+                if (auto w2 = it->win.lock(); w2 && w2 != dw) {
+                    under = w2;
+                    break;
+                }
+            }
+            endRealDrag(desk, under);
         } else {
             endRealDrag(std::nullopt); // dropped outside every view: go home
         }
