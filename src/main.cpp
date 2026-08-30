@@ -132,6 +132,8 @@ struct CapWin {
     int                      tile;    // grid slot 0..8 (its workspace)
     bool                     active;  // currently focused window
     CBox                     screen;  // last-drawn box in draw space (for hit-testing)
+    float                    previewT   = 0.f; // swap-preview glide: 0 = home, 1 = in the dragged slot
+    CBox                     previewBox;       // the slot it glides toward (kept for the ease-back)
 };
 static std::vector<CapWin> g_wins;
 
@@ -163,6 +165,8 @@ static constexpr float SCROLL_SECONDS = 0.42f; // page-flip duration
 // True once the user has seen the other page this open (wheel or Super+R
 // tour) — the next toggle press then closes (see toggle()).
 static bool            g_tourDone     = false;
+// Wall-clock dt of the current frame (set in onRender), for the preview glide.
+static float           g_frameDt      = 0.016f;
 
 // Zoom animation: 0 = zoomed fully into g_zoomTile (that workspace fills the
 // screen), 1 = the whole 3x3 grid at its rest layout. Opening animates 0->1,
@@ -252,10 +256,15 @@ static void captureWindows(PHLMONITOR m) {
     // working across the rebuild — otherwise the fresh entries carry a zeroed
     // box until the next drawOverview, and a pointer move in that gap drops the
     // hover (the border blinks ~every REFRESH_MS).
-    std::vector<std::pair<PHLWINDOWREF, CBox>> prevBoxes;
+    struct Carry {
+        CBox  screen;
+        float previewT;
+        CBox  previewBox;
+    };
+    std::vector<std::pair<PHLWINDOWREF, Carry>> prevBoxes;
     prevBoxes.reserve(g_wins.size());
     for (auto& cw : g_wins) {
-        prevBoxes.emplace_back(cw.win, cw.screen);
+        prevBoxes.emplace_back(cw.win, Carry{cw.screen, cw.previewT, cw.previewBox});
         if (cw.fb) // free last cycle's textures before rebuilding
             cw.fb->release();
     }
@@ -309,9 +318,11 @@ static void captureWindows(PHLMONITOR m) {
         g_pHyprRenderer->m_renderData.blockScreenShader = true;
         g_pHyprRenderer->endRender();
 
-        for (auto& pb : prevBoxes) // carry the hit-box forward if we saw this window last cycle
+        for (auto& pb : prevBoxes) // carry hit-box + preview glide forward across the rebuild
             if (pb.first.lock() == w) {
-                cw.screen = pb.second;
+                cw.screen     = pb.second.screen;
+                cw.previewT   = pb.second.previewT;
+                cw.previewBox = pb.second.previewBox;
                 break;
             }
 
@@ -734,18 +745,42 @@ static void drawOverview(PHLMONITOR m, float p, int zoomTile) {
     }
     // Live reorder preview (the others react, like grabbing a window on the
     // real desktop): while the drag hovers a sibling in the SAME view, that
-    // sibling shows in the dragged window's slot — the swap made visible
-    // before the drop commits it.
+    // sibling GLIDES into the dragged window's slot (eased, dt-based) and
+    // glides home when the drag moves off — the swap made visible before
+    // the drop commits it.
     if (dragIdx >= 0) {
         for (size_t i = g_wins.size(); i-- > 0;) {
             if (!ok[i] || (ssize_t)i == dragIdx || g_wins[i].tile != g_wins[dragIdx].tile)
                 continue;
             if (boxes[i].w > 0.0 && boxes[i].containsPoint(g_dragCursor)) {
-                swapIdx        = (ssize_t)i;
-                boxes[swapIdx] = boxes[dragIdx];
+                swapIdx = (ssize_t)i;
                 break;
             }
         }
+    }
+    bool previewMoving = false;
+    for (size_t i = 0; i < g_wins.size(); ++i) {
+        if (!ok[i])
+            continue;
+        auto&       cw     = g_wins[i];
+        const float target = (ssize_t)i == swapIdx ? 1.f : 0.f;
+        if ((ssize_t)i == swapIdx && dragIdx >= 0)
+            cw.previewBox = boxes[dragIdx]; // remember where it's headed
+        cw.previewT += (target - cw.previewT) * std::min(1.0f, g_frameDt * 14.f);
+        if (std::abs(cw.previewT - target) < 0.01f)
+            cw.previewT = target;
+        else
+            previewMoving = true;
+        if (cw.previewT > 0.001f && cw.previewBox.w > 0.0) {
+            const double e = easeInOutCubic(cw.previewT);
+            const CBox&  h = boxes[i];
+            boxes[i]       = CBox{mix(h.x, cw.previewBox.x, e), mix(h.y, cw.previewBox.y, e),
+                                  mix(h.w, cw.previewBox.w, e), mix(h.h, cw.previewBox.h, e)};
+        }
+    }
+    if (previewMoving) {
+        g_pHyprRenderer->damageMonitor(m);
+        g_pCompositor->scheduleFrameForMonitor(m);
     }
     for (size_t i = 0; i < g_wins.size(); ++i) {
         auto& cw = g_wins[i];
@@ -1009,6 +1044,8 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
                 g_layoutManager->switchTargets(dw->layoutTarget(), target->layoutTarget(), true);
         }
         captureWorkspaces(m); // reflect the move immediately
+        for (auto& cw : g_wins)
+            cw.previewT = 0.f; // the real layout moved — no stale glide-back
     }
     damageAll();
 }
@@ -1026,6 +1063,7 @@ static void onRender(eRenderStage stage) {
     g_animLastT    = now;
     if (dt <= 0.f || dt > 0.1f)
         dt = 0.016f;
+    g_frameDt        = dt;
     const float step = dt / ANIM_SECONDS;
     if (g_anim < g_animTarget)
         g_anim = std::min(g_animTarget, g_anim + step);
