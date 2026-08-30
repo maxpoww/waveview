@@ -1111,17 +1111,17 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
         } else {
             endRealDrag(std::nullopt); // dropped outside every view: go home
         }
-        // DON'T recapture immediately: the landing re-tile is animating and
-        // an instant snapshot shows every window mid-flight — a blink
-        // across the tiles. Let it settle, then the live timer catches up;
-        // meanwhile drop the dragged window's stale mini so nothing
-        // overlaps the re-tiled siblings.
+        // DO NOT recapture until the landing spring rests: windows animate on a
+        // ~480ms spring (hyprland.lua: windows speed 4.79) with a settle tail —
+        // any earlier snapshot catches them mid-flight and blinks. The held
+        // preview IS the landing shape, so stillness is correct meanwhile; the
+        // dragged window.s stale mini goes away so nothing overlaps.
         for (auto& cw : g_wins)
             if (cw.win.lock() == dw && cw.fb)
                 cw.fb->release();
         std::erase_if(g_wins, [&](const CapWin& cw) { return cw.win.lock() == dw; });
         if (g_liveTimer)
-            g_liveTimer->updateTimeout(std::chrono::milliseconds(200));
+            g_liveTimer->updateTimeout(std::chrono::milliseconds(750));
         // HOLD the split target's preview until the recapture: its preview
         // half IS the post-drop truth — zeroing it snapped the sibling back
         // to full size for 200ms and then re-split it (two reactions for
