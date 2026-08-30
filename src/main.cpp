@@ -56,7 +56,7 @@ struct Rect {
 };
 extern "C" {
 const char* waveview_hello();
-int         waveview_workspace_tiles(double mw, double mh, Rect* out);
+int         waveview_workspace_tiles(double mw, double mh, double top, Rect* out);
 int         waveview_tile_for_workspace(int64_t ws_id);
 void        waveview_map_window(double tx, double ty, double tw, double th, double mon_x, double mon_y, double mon_w,
                                 double mon_h, double wx, double wy, double ww, double wh, Rect* out);
@@ -286,14 +286,13 @@ static double topInset(PHLMONITOR m) {
     return std::round(m->m_reservedArea.top() * m->m_scale);
 }
 
-// 3x3 tiles inset below the reserved strip — the ONE tile source shared by
-// draw, capture, hit-testing, and the schematic, so they can't disagree.
+// 3x3 tiles below the reserved strip plus Max's 3-logical-px window top-gap
+// (the same breathing room his windows keep to the bar) — the ONE tile source
+// shared by draw, capture, hit-testing, and the schematic, so they can't
+// disagree. The brain top-anchors the grid there and keeps every gap uniform.
 static int computeTiles(PHLMONITOR m, Rect* out) {
-    const double inset = topInset(m);
-    const int    n     = waveview_workspace_tiles(m->m_transformedSize.x, m->m_transformedSize.y - inset, out);
-    for (int i = 0; i < n && i < 9; ++i)
-        out[i].y += inset;
-    return n;
+    const double top = topInset(m) + std::round(3.0 * m->m_scale);
+    return waveview_workspace_tiles(m->m_transformedSize.x, m->m_transformedSize.y, top, out);
 }
 
 static void captureWorkspaces(PHLMONITOR m) {
@@ -475,25 +474,29 @@ static void drawOverview(PHLMONITOR m, float p, int zoomTile) {
     // a press is still a potential click, so the window stays put in its tile.
     const auto dragW  = g_dragMoved ? g_dragWin.lock() : PHLWINDOW{};
 
-    // While dragging, outline the tile the cursor is over — the drop target.
-    if (dragW) {
-        for (int i = 0; i < 9; ++i) {
-            const CBox t = dispRect(CBox{tiles[i].x, tiles[i].y, tiles[i].w, tiles[i].h});
-            if (t.containsPoint(g_dragCursor))
-                drawBorder(t, CHyprColor(0.40, 0.70, 1.0, 0.55), std::max(2.0, t.h * 0.008));
-        }
-    }
-
-    // Hovered empty workspace: outline it as a click-to-jump target.
-    if (!dragW && g_hoverTile >= 0) {
-        const CBox t = dispRect(CBox{tiles[g_hoverTile].x, tiles[g_hoverTile].y, tiles[g_hoverTile].w, tiles[g_hoverTile].h});
-        drawBorder(t, kHoverCol, std::max(2.0, t.h * 0.01));
-    }
-
     // Windows shrink toward their centers and round as the grid zooms out — so at
     // p=0 (zoomed fully into the active workspace) they're pixel-exact and the
     // close animation lands seamlessly on the real desktop.
     const double shrink = mix(1.0, 0.975, p);
+    // Tile outlines (drop target, empty-hover) get the SAME shrink as the
+    // windows, so an empty workspace never reads bigger than a full one.
+    auto shrunkTile = [&](int i) -> CBox {
+        const Rect&  r  = tiles[i];
+        const double cx = r.x + r.w / 2.0, cy = r.y + r.h / 2.0;
+        return dispRect(CBox{cx - r.w * shrink / 2.0, cy - r.h * shrink / 2.0, r.w * shrink, r.h * shrink});
+    };
+
+    // While dragging, outline the tile the cursor is over — the drop target.
+    if (dragW) {
+        for (int i = 0; i < 9; ++i) {
+            if (dispRect(CBox{tiles[i].x, tiles[i].y, tiles[i].w, tiles[i].h}).containsPoint(g_dragCursor))
+                drawBorder(shrunkTile(i), CHyprColor(0.40, 0.70, 1.0, 0.55), std::max(2.0, tiles[i].h * 0.008));
+        }
+    }
+
+    // Hovered empty workspace: outline it as a click-to-jump target.
+    if (!dragW && g_hoverTile >= 0)
+        drawBorder(shrunkTile(g_hoverTile), kHoverCol, std::max(2.0, tiles[g_hoverTile].h * 0.01));
     for (auto& cw : g_wins) {
         const auto tex = cw.fb ? cw.fb->getTexture() : nullptr;
         if (!tex)

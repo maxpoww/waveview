@@ -22,33 +22,42 @@ pub extern "C" fn waveview_hello() -> *const c_char {
     b"brain online\0".as_ptr() as *const c_char
 }
 
-/// Compute the 9 workspace tile rects for a monitor of `mw` x `mh` pixels.
-/// Each tile preserves the monitor aspect ratio; the 3x3 grid is centered and
-/// separated by `gap` (the big inter-workspace gaps), with an outer margin.
+/// Compute the 9 workspace tile rects for a monitor of `mw` x `mh` pixels,
+/// with the usable area starting at `top` (below the OPTIONS bar plus its
+/// breathing gap — the shim passes reserved strip + 3 logical px).
+///
+/// Consistency rules (the visual complaints this layout answers):
+/// - Tiles mirror the FULL monitor aspect (`mh/mw`), not the reduced area's,
+///   so every tile is a faithful miniature and the close-zoom lands exactly.
+/// - ONE `gap` everywhere: between tiles and as the left/right/bottom outer
+///   margins, so no edge reads different from an inner seam. (When height
+///   binds, leftover width splits into the two side margins — symmetric.)
+/// - The grid is TOP-ANCHORED at `top`: the 3 px promise to the bar is kept
+///   exactly, and any vertical slack falls to the bottom.
+///
 /// Writes 9 `Rect`s to `out`; returns the count.
 ///
 /// # Safety
 /// `out` must point to space for at least 9 `Rect`s.
 #[no_mangle]
-pub unsafe extern "C" fn waveview_workspace_tiles(mw: f64, mh: f64, out: *mut Rect) -> c_int {
-    if mw <= 0.0 || mh <= 0.0 || out.is_null() {
+pub unsafe extern "C" fn waveview_workspace_tiles(mw: f64, mh: f64, top: f64, out: *mut Rect) -> c_int {
+    if mw <= 0.0 || mh <= 0.0 || !(0.0..mh).contains(&top) || out.is_null() {
         return 0;
     }
-    let outer = mh * 0.006; // outer margin (tight — fill the screen)
-    let gap = mh * 0.006; // gap between workspaces (the "imaginary lines")
-    let aspect = mh / mw;
+    let gap = mh * 0.006; // the one gap (inter-tile AND outer margins)
+    let avail_h = mh - top;
+    let aspect = mh / mw; // full-monitor aspect — tiles are true miniatures
 
     // Cell width limited by both available width and height, so the 3x3 grid of
-    // aspect-correct tiles always fits inside the monitor.
-    let cw_by_w = (mw - 2.0 * outer - 2.0 * gap) / 3.0;
-    let cw_by_h = ((mh - 2.0 * outer - 2.0 * gap) / 3.0) / aspect;
+    // aspect-correct tiles always fits: 2 side margins + 2 inner gaps across,
+    // 2 inner gaps + 1 bottom margin down (the top is `top` itself).
+    let cw_by_w = (mw - 4.0 * gap) / 3.0;
+    let cw_by_h = ((avail_h - 3.0 * gap) / 3.0) / aspect;
     let cell_w = cw_by_w.min(cw_by_h).max(1.0);
     let cell_h = cell_w * aspect;
 
     let grid_w = 3.0 * cell_w + 2.0 * gap;
-    let grid_h = 3.0 * cell_h + 2.0 * gap;
     let left = (mw - grid_w) / 2.0;
-    let top = (mh - grid_h) / 2.0;
 
     let tiles = std::slice::from_raw_parts_mut(out, 9);
     for row in 0..3 {
@@ -184,13 +193,20 @@ mod tests {
     #[test]
     fn nine_aspect_correct_tiles_fit_inside_monitor() {
         let mut tiles = [Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 }; 9];
-        let n = unsafe { waveview_workspace_tiles(1920.0, 1080.0, tiles.as_mut_ptr()) };
+        let n = unsafe { waveview_workspace_tiles(1920.0, 1080.0, 48.0, tiles.as_mut_ptr()) };
         assert_eq!(n, 9);
         let aspect = 1080.0 / 1920.0;
         for t in &tiles {
-            assert!(t.x >= 0.0 && t.y >= 0.0);
+            assert!(t.x >= 0.0 && t.y >= 48.0 - 1e-6);
             assert!(t.x + t.w <= 1920.0 + 1e-6 && t.y + t.h <= 1080.0 + 1e-6);
-            assert!((t.h / t.w - aspect).abs() < 1e-6); // each tile mirrors monitor aspect
+            assert!((t.h / t.w - aspect).abs() < 1e-6); // full-monitor aspect, not reduced
         }
+        // Top-anchored exactly at `top` (the 3 px promise to the bar).
+        assert!((tiles[0].y - 48.0).abs() < 1e-9);
+        // One uniform gap: inner seams equal each other and the side margins
+        // whenever width binds.
+        let inner_x = tiles[1].x - (tiles[0].x + tiles[0].w);
+        let inner_y = tiles[3].y - (tiles[0].y + tiles[0].h);
+        assert!((inner_x - inner_y).abs() < 1e-6);
     }
 }
