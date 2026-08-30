@@ -30,41 +30,43 @@ pub extern "C" fn waveview_hello() -> *const c_char {
 /// scrolling (the shim owns the scroll offset; tiles here are unscrolled).
 pub const N_TILES: usize = 18;
 
-/// FULL-BLEED scrollable layout (per Max): 3 columns x 6 rows. The first
-/// three rows fill the usable area edge to edge with ONE `gap` everywhere —
-/// between tiles and as the left/right/bottom margins; the top margin is
-/// `top` itself (bar + 3 px). Rows 4-6 continue below the fold at the same
-/// rhythm; the shim scrolls them into view.
+/// Mockup-blessed layout (Max's design, ~/overview-mockup settings
+/// 2026-08-30): 3 columns x 6 rows, the visible 3 rows filling the usable
+/// area with `outer` side/bottom margins and `gap` between tiles; the top
+/// margin is `top` itself (bar + top-gap). Rows 4-6 continue below the
+/// fold at the same rhythm; the shim scrolls them in page flips.
 ///
-/// Tiles give up exact monitor aspect (cell width fills the width, cell
-/// height makes three rows fill the height — ~2-3% flatter on a barred
-/// monitor). Window minis stay correctly placed (the mapper scales x and y
-/// independently) and the close-zoom uses separate x/y scales, so the give
-/// is invisible in motion.
+/// All distances arrive in draw-space px (the shim scales the logical
+/// design values: gap 12, outer 35, top-gap 12).
 ///
 /// Writes [`N_TILES`] `Rect`s to `out`; returns the count.
 ///
 /// # Safety
 /// `out` must point to space for at least [`N_TILES`] `Rect`s.
 #[no_mangle]
-pub unsafe extern "C" fn waveview_workspace_tiles(mw: f64, mh: f64, top: f64, out: *mut Rect) -> c_int {
-    if mw <= 0.0 || mh <= 0.0 || !(0.0..mh).contains(&top) || out.is_null() {
+pub unsafe extern "C" fn waveview_workspace_tiles(
+    mw: f64,
+    mh: f64,
+    top: f64,
+    gap: f64,
+    outer: f64,
+    out: *mut Rect,
+) -> c_int {
+    if mw <= 0.0 || mh <= 0.0 || !(0.0..mh).contains(&top) || gap < 0.0 || outer < 0.0 || out.is_null() {
         return 0;
     }
-    let gap = mh * 0.006; // the one gap (inter-tile AND outer margins)
     let avail_h = mh - top;
 
-    // Fill both axes exactly with the VISIBLE 3 rows: 2 side margins +
-    // 2 inner gaps across, 2 inner gaps + 1 bottom margin down (the top
-    // margin is `top` itself). Rows 4-6 continue the same rhythm below.
-    let cell_w = ((mw - 4.0 * gap) / 3.0).max(1.0);
-    let cell_h = ((avail_h - 3.0 * gap) / 3.0).max(1.0);
+    // Visible 3 rows: 2 side margins + 2 inner gaps across; 2 inner gaps +
+    // 1 bottom `outer` margin down (the top margin is `top` itself).
+    let cell_w = ((mw - 2.0 * outer - 2.0 * gap) / 3.0).max(1.0);
+    let cell_h = ((avail_h - outer - 2.0 * gap) / 3.0).max(1.0);
 
     let tiles = std::slice::from_raw_parts_mut(out, N_TILES);
     for row in 0..6 {
         for col in 0..3 {
             tiles[row * 3 + col] = Rect {
-                x: gap + col as f64 * (cell_w + gap),
+                x: outer + col as f64 * (cell_w + gap),
                 y: top + row as f64 * (cell_h + gap),
                 w: cell_w,
                 h: cell_h,
@@ -193,28 +195,25 @@ mod tests {
     }
 
     #[test]
-    fn full_bleed_grid_fills_and_gaps_are_uniform() {
+    fn mockup_grid_margins_and_gaps() {
         let mut tiles = [Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 }; N_TILES];
-        let (mw, mh, top) = (1920.0, 1080.0, 48.0);
-        let n = unsafe { waveview_workspace_tiles(mw, mh, top, tiles.as_mut_ptr()) };
+        let (mw, mh, top, gap, outer) = (1920.0, 1080.0, 48.0, 12.0, 35.0);
+        let n = unsafe { waveview_workspace_tiles(mw, mh, top, gap, outer, tiles.as_mut_ptr()) };
         assert_eq!(n, N_TILES as c_int);
-        let gap = mh * 0.006;
-        // Top-anchored exactly at `top` (the 3 px promise to the bar).
+        // Top-anchored exactly at `top` (bar + top-gap).
         assert!((tiles[0].y - top).abs() < 1e-9);
-        // Side and bottom margins equal the inter-tile gap — full bleed for
-        // the visible 3 rows (row 3 ends one gap above the bottom edge).
-        assert!((tiles[0].x - gap).abs() < 1e-9);
-        assert!((mw - (tiles[2].x + tiles[2].w) - gap).abs() < 1e-6);
-        assert!((mh - (tiles[8].y + tiles[8].h) - gap).abs() < 1e-6);
-        // Inner seams both equal the same gap, and rows 4-6 continue the
-        // exact rhythm below the fold.
+        // Sides and bottom carry the `outer` margin; seams carry `gap`.
+        assert!((tiles[0].x - outer).abs() < 1e-9);
+        assert!((mw - (tiles[2].x + tiles[2].w) - outer).abs() < 1e-6);
+        assert!((mh - (tiles[8].y + tiles[8].h) - outer).abs() < 1e-6);
         let inner_x = tiles[1].x - (tiles[0].x + tiles[0].w);
         let inner_y = tiles[3].y - (tiles[0].y + tiles[0].h);
         assert!((inner_x - gap).abs() < 1e-6 && (inner_y - gap).abs() < 1e-6);
+        // Rows 4-6 continue the exact rhythm below the fold.
         let row_step = tiles[3].y - tiles[0].y;
         for r in 1..6 {
             assert!((tiles[r * 3].y - tiles[0].y - r as f64 * row_step).abs() < 1e-6);
         }
-        assert!(tiles[17].y + tiles[17].h > mh); // below the fold, scroll reveals
+        assert!(tiles[17].y + tiles[17].h > mh); // below the fold, page 2 reveals
     }
 }

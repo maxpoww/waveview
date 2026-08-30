@@ -56,7 +56,7 @@ struct Rect {
 };
 extern "C" {
 const char* waveview_hello();
-int         waveview_workspace_tiles(double mw, double mh, double top, Rect* out);
+int         waveview_workspace_tiles(double mw, double mh, double top, double gap, double outer, Rect* out);
 int         waveview_tile_for_workspace(int64_t ws_id);
 void        waveview_map_window(double tx, double ty, double tw, double th, double mon_x, double mon_y, double mon_w,
                                 double mon_h, double wx, double wy, double ww, double wh, Rect* out);
@@ -65,6 +65,18 @@ void        waveview_map_window(double tx, double ty, double tw, double th, doub
 // 3x6 workspace grid (18 workspaces); rows 4-6 live below the fold and
 // scroll into view. Must match the brain's N_TILES.
 static constexpr int N_TILES = 18;
+
+// The mockup-blessed design (Max, ~/overview-mockup settings 2026-08-30),
+// all in LOGICAL px (scaled to draw space at use): bare wallpaper (no tile
+// cards / dim / numbers), breathing margins, soft corners, and in-tile
+// window gaps ~3x their literal miniature (solo windows stay full-bleed —
+// smart gaps).
+static constexpr double DSN_GAP        = 12.0; // between tiles
+static constexpr double DSN_OUTER      = 35.0; // side + bottom margins
+static constexpr double DSN_TOP_GAP    = 12.0; // below the bar
+static constexpr double DSN_TILE_ROUND = 28.0; // hover/drop frame corners
+static constexpr double DSN_WIN_ROUND  = 20.0; // window mini corners
+static constexpr double DSN_WIN_GAP    = 0.017; // in-tile gap, fraction of tile
 
 inline HANDLE              PHANDLE = nullptr;
 static bool                g_active = false;
@@ -300,14 +312,14 @@ static double topInset(PHLMONITOR m) {
     return std::round(m->m_reservedArea.top() * m->m_scale);
 }
 
-// 3x6 tiles below the reserved strip plus Max's 3-logical-px window top-gap
-// (the same breathing room his windows keep to the bar), shifted up by the
-// current grid scroll — the ONE tile source shared by draw, capture,
-// hit-testing, and the schematic, so they can't disagree. The brain
-// top-anchors the grid there and keeps every gap uniform.
+// 3x6 tiles below the reserved strip plus the design's top-gap, shifted up
+// by the current grid scroll — the ONE tile source shared by draw, capture,
+// hit-testing, and the schematic, so they can't disagree.
 static int computeTiles(PHLMONITOR m, Rect* out) {
-    const double top = topInset(m) + std::round(3.0 * m->m_scale);
-    const int    n   = waveview_workspace_tiles(m->m_transformedSize.x, m->m_transformedSize.y, top, out);
+    const double s   = m->m_scale;
+    const double top = topInset(m) + std::round(DSN_TOP_GAP * s);
+    const int    n   = waveview_workspace_tiles(m->m_transformedSize.x, m->m_transformedSize.y, top,
+                                                DSN_GAP * s, DSN_OUTER * s, out);
     for (int i = 0; i < n && i < N_TILES; ++i)
         out[i].y -= g_scroll;
     return n;
@@ -491,7 +503,7 @@ static void drawOverview(PHLMONITOR m, float p, int zoomTile) {
         bd.box           = b;
         bd.grad1         = Config::CGradientValueData(c);
         bd.borderSize    = std::max(1, (int)std::lround(bw));
-        bd.round         = (int)std::lround(std::min(b.w, b.h) * 0.04);
+        bd.round         = (int)std::lround(DSN_TILE_ROUND * m->m_scale);
         bd.roundingPower = 2.0f;
         bd.a             = 1.0f; // alpha carried by the gradient color; don't double-dim
         g_pHyprRenderer->m_renderPass.add(makeUnique<CBorderPassElement>(bd));
@@ -531,6 +543,14 @@ static void drawOverview(PHLMONITOR m, float p, int zoomTile) {
     // Hovered empty workspace: outline it as a click-to-jump target.
     if (!dragW && g_hoverTile >= 0)
         drawBorder(tileBox(g_hoverTile), kHoverCol, std::max(2.0, tiles[g_hoverTile].h * 0.01));
+    // Per-tile window counts: the design's gap exaggeration applies only to
+    // multi-window workspaces (solo/maximized stays full-bleed, smart-gaps
+    // style — the mockup's workspace 1).
+    int tileWins[N_TILES] = {};
+    for (auto& cw : g_wins)
+        if (cw.tile >= 0 && cw.tile < N_TILES)
+            tileWins[cw.tile]++;
+
     for (auto& cw : g_wins) {
         const auto tex = cw.fb ? cw.fb->getTexture() : nullptr;
         if (!tex)
@@ -545,11 +565,22 @@ static void drawOverview(PHLMONITOR m, float p, int zoomTile) {
             continue;
         }
 
-        // True mapped size — no shrink (gaps are the desktop's own, miniaturized).
-        const CBox box = dispRect(CBox{mini.x, mini.y, mini.w, mini.h});
-        cw.screen      = box; // remembered for pointer hit-testing
-        const int round  = (int)std::lround(std::min(box.w, box.h) * 0.06 * p);
-        const auto w     = cw.win.lock();
+        // Design gap exaggeration (DSN_WIN_GAP): the literal miniature of the
+        // desktop gaps is ~3x too subtle to read; multi-window tiles inset
+        // each window by half the design gap per side. Scales with p so the
+        // close-zoom still lands pixel-exact on the real desktop.
+        if (tileWins[cw.tile] >= 2) {
+            const double dx = DSN_WIN_GAP * 0.5 * tiles[cw.tile].w * p;
+            const double dy = DSN_WIN_GAP * 0.5 * tiles[cw.tile].h * p;
+            mini.x += dx;
+            mini.y += dy;
+            mini.w = std::max(1.0, mini.w - 2.0 * dx);
+            mini.h = std::max(1.0, mini.h - 2.0 * dy);
+        }
+        const CBox box  = dispRect(CBox{mini.x, mini.y, mini.w, mini.h});
+        cw.screen       = box; // remembered for pointer hit-testing
+        const int round = (int)std::lround(DSN_WIN_ROUND * m->m_scale * p);
+        const auto w    = cw.win.lock();
 
         if (w && w == dragW)
             continue; // the dragged window is drawn last, under the cursor
