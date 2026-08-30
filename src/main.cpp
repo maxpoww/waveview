@@ -1264,6 +1264,27 @@ static Vector2D deskAt(PHLMONITOR m, const Rect& t, const Vector2D& c) {
     return {ux + (c.x - t.x) * uw / t.w, uy + (c.y - t.y) * uh / t.h};
 }
 
+// Translate the INTENT — "split `under` on `side`, as seen in the tiles" —
+// into a desktop point that makes dwindle's precise_mouse_move pick exactly
+// that side against the window's REAL layout geometry. The displayed boxes
+// are the committed preview (squeezed halves); mapping the raw cursor onto
+// the pulled-out real layout picked the wrong axis ("the axis reordering is
+// not working well"). Quarter-points sit safely inside the flat/steep
+// triangles for any box aspect, so the choice is deterministic. Goal-based,
+// like the mapping: the layout tree moves instantly, pixels lag.
+static Vector2D dropPointFor(PHLWINDOW under, int side) {
+    const CBox     wb = under->getWindowMainSurfaceBox();
+    const Vector2D dp = under->m_realPosition->goal() - under->m_realPosition->value();
+    const Vector2D ds = under->m_realSize->goal() - under->m_realSize->value();
+    const CBox     b{wb.x + dp.x, wb.y + dp.y, wb.w + ds.x, wb.h + ds.y};
+    switch (side) {
+        case 0: return {b.x + b.w * 0.25, b.y + b.h * 0.50}; // left of it
+        case 1: return {b.x + b.w * 0.75, b.y + b.h * 0.50}; // right of it
+        case 2: return {b.x + b.w * 0.50, b.y + b.h * 0.25}; // above it
+        default: return {b.x + b.w * 0.50, b.y + b.h * 0.75}; // below it
+    }
+}
+
 // What a commit at cursor `c` would be: the tile, the window under the
 // cursor (if any), and the quadrant side of the would-be insert.
 static LiveCommit signatureAt(PHLMONITOR m, const Vector2D& c, PHLWINDOW dw) {
@@ -1307,8 +1328,8 @@ static void commitAt(PHLMONITOR m, const Vector2D& c, PHLWINDOW dw, const LiveCo
     Rect tiles[N_TILES];
     if (computeTiles(m, tiles) != N_TILES)
         return;
-    const Vector2D desk  = deskAt(m, tiles[sig.tile], c);
     const auto     under = sig.under.lock();
+    const Vector2D desk  = under ? dropPointFor(under, sig.side) : deskAt(m, tiles[sig.tile], c);
     if (dw->workspaceID() == sig.tile + 1)
         endRealDrag(desk, under);
     else {
@@ -1602,13 +1623,17 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
             double ux2, uy2, uw3, uh3;
             usableArea(m, ux2, uy2, uw3, uh3);
             const Rect&    t = tiles[drop];
-            const Vector2D desk{ux2 + (c.x - t.x) * uw3 / t.w, uy2 + (c.y - t.y) * uh3 / t.h};
+            Vector2D desk{ux2 + (c.x - t.x) * uw3 / t.w, uy2 + (c.y - t.y) * uh3 / t.h};
             (void)tiles2;
             for (auto it = g_wins.rbegin(); it != g_wins.rend(); ++it) {
                 if (it->screen.w <= 0.0 || !it->screen.containsPoint(c))
                     continue;
                 if (auto w2 = it->win.lock(); w2 && w2 != dw) {
                     under = w2;
+                    // Same intent translation as a commit: the side is what
+                    // the user aimed at on the DISPLAYED box; the drop point
+                    // forces that side against the real layout.
+                    desk  = dropPointFor(w2, quadrantSide(it->screen, c));
                     break;
                 }
             }
@@ -1965,7 +1990,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.15"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.16"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
