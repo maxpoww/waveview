@@ -1404,10 +1404,15 @@ static void toggle() {
 }
 
 // A trackpad swipe begins: remember the finger count and reset the accumulator.
-static void onSwipeBegin(IPointer::SSwipeBeginEvent e, Event::SCallbackInfo&) {
+// While the overview is open the whole gesture stream is consumed so the
+// compositor's workspace-swipe never engages underneath (a sideways 3/4-finger
+// swipe would drag the real workspaces behind the overview).
+static void onSwipeBegin(IPointer::SSwipeBeginEvent e, Event::SCallbackInfo& info) {
     g_swipeFingers = e.fingers;
     g_swipeAcc     = Vector2D(0.0, 0.0);
     g_swipeFired   = false;
+    if (g_active)
+        info.cancelled = true;
 }
 
 // Accumulate the swipe; on a decisive 3-finger vertical move (once per
@@ -1415,6 +1420,8 @@ static void onSwipeBegin(IPointer::SSwipeBeginEvent e, Event::SCallbackInfo&) {
 // other inhabited page, then close; swipe DOWN is Escape (immediate close,
 // no touring). libinput reports fingers-up as negative dy.
 static void onSwipeUpdate(IPointer::SSwipeUpdateEvent e, Event::SCallbackInfo& info) {
+    if (g_active)
+        info.cancelled = true; // overview owns the trackpad while open
     if (g_swipeFingers != 3 || g_swipeFired)
         return;
     g_swipeAcc += e.delta;
@@ -1429,7 +1436,9 @@ static void onSwipeUpdate(IPointer::SSwipeUpdateEvent e, Event::SCallbackInfo& i
     info.cancelled = true; // consume so no built-in gesture also reacts
 }
 
-static void onSwipeEnd(IPointer::SSwipeEndEvent, Event::SCallbackInfo&) {
+static void onSwipeEnd(IPointer::SSwipeEndEvent, Event::SCallbackInfo& info) {
+    if (g_active)
+        info.cancelled = true;
     g_swipeFingers = 0;
     g_swipeFired   = false;
 }
