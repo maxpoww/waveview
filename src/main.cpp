@@ -134,14 +134,10 @@ struct CapWin {
     int                      tile;    // grid slot 0..8 (its workspace)
     bool                     active;  // currently focused window
     CBox                     screen;  // last-drawn box in draw space (for hit-testing)
-    float                    previewT    = 0.f; // split-preview glide: 0 = home, 1 = at its kept half
-    CBox                     previewBox;        // the half it glides toward (kept for the ease-back)
-    CBox                     previewCur;        // eased chase of previewBox — crossing a split diagonal glides, never snaps
-    CBox                     drawCur;           // eased chase of the mapped slot — re-tiles glide at frame rate
-    bool                     holdPreview = false; // drop landed here: hold the preview until recapture
+    CBox                     drawCur; // eased chase of the mapped slot — re-tiles glide at frame rate
 };
-// One shared ease rate for every drag-preview chase (sibling halves, ghost
-// dims) — slowed from the original 14/s snap to sit closer to the desktop's
+// One shared ease rate for every drag chase (slot glides, ghost dims) —
+// slowed from the original 14/s snap to sit closer to the desktop's
 // window spring, so reactions read as motion, not as teleports.
 static constexpr float PREVIEW_RATE = 9.f;
 static std::vector<CapWin> g_wins;
@@ -151,10 +147,8 @@ static std::vector<CapWin> g_wins;
 static PHLWINDOWREF g_hoverWin;              // window under the cursor (gets a border)
 static PHLWINDOWREF g_dragWin;              // window pressed on; becomes a drag once the cursor moves past CLICK_SLOP
 static Vector2D     g_dragCursor;            // current cursor in draw space (while dragging)
-static Vector2D     g_dragGrab;              // cursor→box-topleft offset captured at grab
 static Vector2D     g_pressPos;              // cursor at button-press (draw space) — to tell a click from a drag
 static bool         g_dragMoved = false;     // cursor left the CLICK_SLOP radius since press → treat as a drag, not a click
-static int          g_hoverTile = -1;        // empty workspace tile under the cursor (gets a border), or -1
 static int          g_pressTile = -1;        // empty tile a press landed on (release within slop → jump), or -1
 // A press that releases within this radius (draw-space px) is a click (jump to
 // the window), not a drag (move it to another workspace).
@@ -225,6 +219,19 @@ struct SBusyScope {
     ~SBusyScope() { g_busy = prev; }
 };
 static Time::steady_tp g_boostUntil{};  // fast recapture while a real re-tile springs
+
+// Mark the workspace's tile for the next partial capture; no-op off-grid.
+static void markDirty(int64_t wsId) {
+    if (const int t = waveview_tile_for_workspace(wsId); t >= 0)
+        g_dirtyTiles |= (1u << t);
+}
+// Capture at ~20fps for the next BOOST_MS — a real re-tile is springing
+// and the tiles should show the actual animation.
+static void boostCaptures() {
+    g_boostUntil = Time::steadyNow() + BOOST_MS;
+    if (g_liveTimer)
+        g_liveTimer->updateTimeout(std::chrono::milliseconds(50));
+}
 // Float-leak watch (diagnosis, v0.21): every gesture end arms this; the live
 // timer then compares the window's float state against what the gesture
 // promised, for 3s — catching a leak that happens AFTER the synchronous
@@ -412,9 +419,6 @@ static void captureWindows(PHLMONITOR m, uint32_t mask = ALL_TILES) {
     // hover (the border blinks ~every REFRESH_MS).
     struct Carry {
         CBox                     screen;
-        float                    previewT;
-        CBox                     previewBox;
-        CBox                     previewCur;
         CBox                     drawCur;
         SP<Render::IFramebuffer> fb; // reused next cycle — see below
     };
@@ -429,8 +433,7 @@ static void captureWindows(PHLMONITOR m, uint32_t mask = ALL_TILES) {
         // framebuffer per window on EVERY capture (up to 20/s each during
         // the boost) churned the driver into a progressive mid-drag
         // slowdown ("after a few movements all gets slowed down").
-        prevBoxes.emplace_back(cw.win, Carry{cw.screen, cw.previewT, cw.previewBox, cw.previewCur, cw.drawCur,
-                                             isDragged ? nullptr : cw.fb});
+        prevBoxes.emplace_back(cw.win, Carry{cw.screen, cw.drawCur, isDragged ? nullptr : cw.fb});
         if (isDragged)
             stashDragged = cw; // keep its fb alive
     }
@@ -536,13 +539,10 @@ static void captureWindows(PHLMONITOR m, uint32_t mask = ALL_TILES) {
             g_pHyprRenderer->endRender();
         }
 
-        for (auto& pb : prevBoxes) // carry hit-box + preview glide forward across the rebuild
+        for (auto& pb : prevBoxes) // carry hit-box + slot glide forward across the rebuild
             if (pb.first.lock() == w) {
-                cw.screen     = pb.second.screen;
-                cw.previewT   = pb.second.previewT;
-                cw.previewBox = pb.second.previewBox;
-                cw.previewCur = pb.second.previewCur;
-                cw.drawCur    = pb.second.drawCur;
+                cw.screen  = pb.second.screen;
+                cw.drawCur = pb.second.drawCur;
                 break;
             }
 
@@ -573,13 +573,14 @@ static double topInset(PHLMONITOR m) {
 // mapping against the full monitor bakes the bar strip into every tile as
 // a dead band no window can ever occupy (the "out gaps" that survived four
 // rounds of seam logic — a maximized window must BE the full tile).
-static void usableArea(PHLMONITOR m, double& x, double& y, double& w, double& h) {
+struct SUsable {
+    double x, y, w, h;
+};
+static SUsable usableArea(PHLMONITOR m) {
     const double l = m->m_reservedArea.left(), r = m->m_reservedArea.right();
     const double t = m->m_reservedArea.top(), b = m->m_reservedArea.bottom();
-    x = m->m_position.x + l;
-    y = m->m_position.y + t;
-    w = std::max(1.0, m->m_size.x - l - r);
-    h = std::max(1.0, m->m_size.y - t - b);
+    return {m->m_position.x + l, m->m_position.y + t, std::max(1.0, m->m_size.x - l - r),
+            std::max(1.0, m->m_size.y - t - b)};
 }
 
 // 3x6 tiles below the reserved strip plus the design's top-gap, shifted up
@@ -648,8 +649,30 @@ static void captureWorkspaces(PHLMONITOR m, uint32_t mask = ALL_TILES) {
     if (startedOn)
         startedOn->m_visible = false; // hide the real active ws; otherwise its on-screen windows bleed into every tile
 
+    // Occupancy: an empty workspace's snapshot is never sampled (the
+    // backdrop is g_bgFB; minis crop from their OWN tile's snapshot), so
+    // rendering it is pure waste — and each FB is monitor-res ABGR
+    // (~25MB at 3200x2000). Empty tiles are skipped AND their FBs freed;
+    // an occupied tile with no valid FB is captured even off-mask (a
+    // window can land on a previously-empty view mid-boost — without the
+    // force it would vanish from the grid until the next full pass).
+    uint32_t occupied = 0;
+    for (auto& w : g_pCompositor->m_windows) {
+        if (!w || !w->m_isMapped || w->isHidden() || w->monitorID() != m->m_id)
+            continue;
+        if (const int t = waveview_tile_for_workspace(w->workspaceID()); t >= 0)
+            occupied |= (1u << t);
+    }
+
     for (int i = 0; i < N_TILES; ++i) {
         auto& fb = g_fbs[i];
+        if (!(occupied & (1u << i))) {
+            if (fb) {
+                fb->release();
+                fb.reset();
+            }
+            continue;
+        }
         if (!(mask & (1u << i)) && fb && fb->m_size == monbox.size())
             continue; // not dirty: last snapshot stands
         if (!fb)
@@ -708,6 +731,28 @@ static void captureWorkspaces(PHLMONITOR m, uint32_t mask = ALL_TILES) {
           std::chrono::duration<double, std::milli>(Time::steadyNow() - capT0).count());
 }
 
+// Release every capture buffer: the workspace snapshots, the backdrop, and
+// the per-window crops — roughly half a GB of VRAM at 3200x2000. Runs at
+// full-close (the overview holds GPU memory only while it's on screen; the
+// reopen recaptures everything anyway) and at unload. Safe mid-frame: the
+// render pass was cleared at this frame's beginRender, so no queued element
+// still references these textures.
+static void freeCaptures() {
+    for (auto& fb : g_fbs) {
+        if (fb)
+            fb->release();
+        fb.reset();
+    }
+    if (g_bgFB) {
+        g_bgFB->release();
+        g_bgFB.reset();
+    }
+    for (auto& cw : g_wins)
+        if (cw.fb)
+            cw.fb->release();
+    g_wins.clear();
+}
+
 // Schematic fallback: dark tiles + each live window mapped into its workspace
 // tile (focused window highlighted). Used on monitors we haven't captured
 // thumbnails for. Tiles are pixel-space; window boxes are logical — the brain
@@ -723,11 +768,10 @@ static void drawSchematic(PHLMONITOR m, const Rect tiles[N_TILES]) {
         if (ti < 0)
             continue;
 
-        const CBox wb = w->getWindowMainSurfaceBox();
-        Rect       mini;
-        double     ux, uy, uw, uh;
-        usableArea(m, ux, uy, uw, uh);
-        waveview_map_window(tiles[ti].x, tiles[ti].y, tiles[ti].w, tiles[ti].h, ux, uy, uw, uh, wb.x, wb.y, wb.w,
+        const CBox    wb = w->getWindowMainSurfaceBox();
+        Rect          mini;
+        const SUsable u = usableArea(m);
+        waveview_map_window(tiles[ti].x, tiles[ti].y, tiles[ti].w, tiles[ti].h, u.x, u.y, u.w, u.h, wb.x, wb.y, wb.w,
                             wb.h, &mini);
         if (mini.w <= 0.0 || mini.h <= 0.0)
             continue;
@@ -858,12 +902,11 @@ static void drawOverview(PHLMONITOR m, float p, int zoomTile) {
     };
     std::vector<MiniBox> real(g_wins.size()), tgt(g_wins.size());
     std::vector<bool>    ok(g_wins.size(), false);
-    double               ux, uy, uw2, uh2;
-    usableArea(m, ux, uy, uw2, uh2);
+    const SUsable        u = usableArea(m);
     for (size_t i = 0; i < g_wins.size(); ++i) {
         auto& cw = g_wins[i];
         Rect  mini;
-        waveview_map_window(tiles[cw.tile].x, tiles[cw.tile].y, tiles[cw.tile].w, tiles[cw.tile].h, ux, uy, uw2, uh2,
+        waveview_map_window(tiles[cw.tile].x, tiles[cw.tile].y, tiles[cw.tile].w, tiles[cw.tile].h, u.x, u.y, u.w, u.h,
                             cw.logical.x, cw.logical.y, cw.logical.w, cw.logical.h, &mini);
         if (mini.w <= 0.0 || mini.h <= 0.0) {
             cw.screen = CBox{};
@@ -1009,36 +1052,6 @@ static void drawOverview(PHLMONITOR m, float p, int zoomTile) {
         }
     }
     bool previewMoving = false;
-    for (size_t i = 0; i < g_wins.size(); ++i) {
-        if (!ok[i])
-            continue;
-        auto&       cw     = g_wins[i];
-        // Synthetic split-preview morphs are RETIRED: the reaction to a
-        // hover is a LIVE COMMIT (the real windows re-tile and the capture
-        // shows it). holdPreview survives for the classic-drop fallback
-        // (release before the dwell fired).
-        const float target = cw.holdPreview ? 1.f : 0.f;
-        cw.previewT += (target - cw.previewT) * std::min(1.0f, g_frameDt * PREVIEW_RATE);
-        if (std::abs(cw.previewT - target) < 0.01f)
-            cw.previewT = target;
-        else
-            previewMoving = true;
-        if (cw.previewT > 0.001f && cw.previewCur.w > 0.0) {
-            const double kc = std::min(1.0, (double)g_frameDt * PREVIEW_RATE);
-            cw.previewCur   = CBox{cw.previewCur.x + (cw.previewBox.x - cw.previewCur.x) * kc,
-                                   cw.previewCur.y + (cw.previewBox.y - cw.previewCur.y) * kc,
-                                   cw.previewCur.w + (cw.previewBox.w - cw.previewCur.w) * kc,
-                                   cw.previewCur.h + (cw.previewBox.h - cw.previewCur.h) * kc};
-            if (std::abs(cw.previewCur.x - cw.previewBox.x) + std::abs(cw.previewCur.y - cw.previewBox.y) +
-                    std::abs(cw.previewCur.w - cw.previewBox.w) + std::abs(cw.previewCur.h - cw.previewBox.h) >
-                1.0)
-                previewMoving = true;
-            const double e = easeInOutCubic(cw.previewT);
-            const CBox&  h = boxes[i];
-            boxes[i]       = CBox{mix(h.x, cw.previewCur.x, e), mix(h.y, cw.previewCur.y, e),
-                                  mix(h.w, cw.previewCur.w, e), mix(h.h, cw.previewCur.h, e)};
-        }
-    }
     // The ghost keeps the window's own shape — destination previews are
     // REAL commits now, so it never morphs (and never hits the aspect-
     // mismatch draw path that rendered so badly).
@@ -1082,6 +1095,7 @@ static void drawOverview(PHLMONITOR m, float p, int zoomTile) {
         g_pHyprRenderer->damageMonitor(m);
         g_pCompositor->scheduleFrameForMonitor(m);
     }
+    const int round = (int)std::lround(DSN_WIN_ROUND * m->m_scale * p); // same corners everywhere, incl. the ghost
     for (size_t i = 0; i < g_wins.size(); ++i) {
         auto& cw = g_wins[i];
         if (!ok[i])
@@ -1089,9 +1103,8 @@ static void drawOverview(PHLMONITOR m, float p, int zoomTile) {
         const auto tex = cw.fb ? cw.fb->getTexture() : nullptr;
         if (!tex)
             continue;
-        const CBox& box   = boxes[i];
-        const int   round = (int)std::lround(DSN_WIN_ROUND * m->m_scale * p);
-        const auto  w     = cw.win.lock();
+        const CBox& box = boxes[i];
+        const auto  w   = cw.win.lock();
 
         if (w && w == dragW)
             continue; // the dragged window is drawn last, under the cursor
@@ -1117,7 +1130,6 @@ static void drawOverview(PHLMONITOR m, float p, int zoomTile) {
             // treatment as the sibling halves gliding beneath it.
             CBox b{g_dragCursor.x - g_grabFracX * g_ghostW, g_dragCursor.y - g_grabFracY * g_ghostH, g_ghostW,
                    g_ghostH};
-            const int round = (int)std::lround(DSN_WIN_ROUND * m->m_scale * p); // same corners as the settled minis
             haloBorder(b, round);
             drawTex(tex, b, round);
             break;
@@ -1191,17 +1203,13 @@ static bool tileEmpty(int tile) {
     return true;
 }
 
-// Cursor motion while open: update the hovered window, or the drag position —
-// then SWALLOW the event. Cancelling is safe in this fork: PointerManager::move
-// runs before the hook fires (verified in InputManager.cpp::onMouseMoved), so
-// the sprite keeps moving; what cancelling stops is focus-follows-mouse and
-// surface motion reaching the desktop underneath — which used to leak (windows
-// A window is only resizable if its layout target sits in a space:
-// LayoutManager::resizeTarget dereferences target->space() unchecked, and a
-// spaceless target (group-membership transitions leave them behind) is a
-// null CSpace — the 2026-08-30 18:46 SIGSEGV. The core's own DragController
-// refuses these too ("no workspace"); we must match it on our direct path.
-static bool resizableWin(const PHLWINDOW& w) {
+// Whether the window's layout target sits in a space. The fork's
+// LayoutManager::resizeTarget AND setTargetGeom dereference target->space()
+// unchecked, and a spaceless target (group-membership transitions leave
+// them behind) is a null CSpace — the 2026-08-30 18:46 SIGSEGV. The core's
+// own DragController refuses these ("no workspace"); every direct layout
+// call of ours must match it.
+static bool inLayoutSpace(const PHLWINDOW& w) {
     const auto t = w ? w->layoutTarget() : nullptr;
     return t && t->space();
 }
@@ -1217,16 +1225,18 @@ static void endRealResize() {
     if (!w)
         return;
     trace("resize end ws=%d", (int)w->workspaceID());
-    if (const int t = waveview_tile_for_workspace(w->workspaceID()); t >= 0)
-        g_dirtyTiles |= (1u << t);
-    g_boostUntil = Time::steadyNow() + BOOST_MS;
+    markDirty(w->workspaceID());
+    boostCaptures();
     if (const auto m = g_captureMon.lock())
         captureWorkspaces(m, g_dirtyTiles);
-    if (g_liveTimer)
-        g_liveTimer->updateTimeout(std::chrono::milliseconds(50));
     damageAll();
 }
 
+// Cursor motion while open: update the hovered window, or the drag/resize —
+// then SWALLOW the event. Cancelling is safe in this fork: PointerManager::move
+// runs before the hook fires (verified in InputManager.cpp::onMouseMoved), so
+// the sprite keeps moving; what cancelling stops is focus-follows-mouse and
+// surface motion reaching the desktop underneath — which used to leak (windows
 // refocused, the dock revealed, topbar pills lit while the overview was open).
 // The first uncancelled motion after close re-focuses under the cursor.
 static void onMouseMove(Vector2D, Event::SCallbackInfo& info) {
@@ -1240,8 +1250,8 @@ static void onMouseMove(Vector2D, Event::SCallbackInfo& info) {
         return; // the machinery's own cursor warps must not feed back into it
     if (g_resizing) {
         const auto rw = g_resizeWin.lock();
-        if (!rw || rw->isFullscreen() || !resizableWin(rw)) {
-            if (rw && !resizableWin(rw))
+        if (!rw || rw->isFullscreen() || !inLayoutSpace(rw)) {
+            if (rw && !inLayoutSpace(rw))
                 trace("resize DROP mid-gesture: ws=%d target lost its space", (int)rw->workspaceID());
             endRealResize(); // window died / went fullscreen / left the layout mid-gesture
             return;
@@ -1251,8 +1261,7 @@ static void onMouseMove(Vector2D, Event::SCallbackInfo& info) {
         g_resizeLast     = c;
         if (d.x != 0.0 || d.y != 0.0) {
             g_layoutManager->resizeTarget(d, rw->layoutTarget(), g_resizeCorner);
-            if (const int t = waveview_tile_for_workspace(rw->workspaceID()); t >= 0)
-                g_dirtyTiles |= (1u << t);
+            markDirty(rw->workspaceID());
             g_boostUntil = Time::steadyNow() + BOOST_MS; // captures track the live resize
             damageAll();
         }
@@ -1313,12 +1322,12 @@ static void beginRealDrag(PHLWINDOW dw, bool capture) {
     // window's image gets printed on the reacting one"). The end-drag
     // recomputes position from the begin anchor, so parking is invisible
     // to the drop math; our cursor ghost is the only visual.
-    g_layoutManager->setTargetGeom(CBox{-20000.0, -20000.0, wb.w, wb.h}, dw->layoutTarget());
+    if (inLayoutSpace(dw)) // setTargetGeom derefs target->space() unchecked
+        g_layoutManager->setTargetGeom(CBox{-20000.0, -20000.0, wb.w, wb.h}, dw->layoutTarget());
     g_pCompositor->warpCursorTo(saved, true);
     g_dragReal = true;
     warpFocusFx(); // grab/regrab focus churn must not glow through captures
-    if (const int dt = waveview_tile_for_workspace(dw->workspaceID()); dt >= 0)
-        g_dirtyTiles |= (1u << dt); // the pull-out re-tiled this view
+    markDirty(dw->workspaceID()); // the pull-out re-tiled this view
     // A re-commit passes capture=false: it re-inserts immediately after and
     // captures THEN — snapshotting the pulled-out intermediate made every
     // re-placement read as a double bounce. (NO geometry warping here: a
@@ -1431,7 +1440,7 @@ static void endRealDrag(std::optional<Vector2D> at, PHLWINDOW splitTarget) {
     // duration, and now that captures run live through the settle, the
     // landing spring would visibly fly it in from offscreen ("laggy").
     // Re-seated at the drop point, the spring is short and reads as a drop.
-    if (const auto dw = g_dragWin.lock()) {
+    if (const auto dw = g_dragWin.lock(); dw && inLayoutSpace(dw)) { // setTargetGeom derefs target->space() unchecked
         const CBox wb = dw->getWindowMainSurfaceBox();
         g_layoutManager->setTargetGeom(CBox{dest.x - wb.w / 2.0, dest.y - wb.h / 2.0, wb.w, wb.h}, dw->layoutTarget());
     }
@@ -1475,9 +1484,8 @@ static int quadrantSide(const CBox& b, const Vector2D& c) {
 // Draw-space point c mapped to desktop logical coords within tile t
 // (inverse of the tile mapping; same math as the drop handler).
 static Vector2D deskAt(PHLMONITOR m, const Rect& t, const Vector2D& c) {
-    double ux, uy, uw, uh;
-    usableArea(m, ux, uy, uw, uh);
-    return {ux + (c.x - t.x) * uw / t.w, uy + (c.y - t.y) * uh / t.h};
+    const SUsable u = usableArea(m);
+    return {u.x + (c.x - t.x) * u.w / t.w, u.y + (c.y - t.y) * u.h / t.h};
 }
 
 // Translate the INTENT — "split `under` on `side`, as seen in the tiles" —
@@ -1532,42 +1540,41 @@ static bool sameCommit(const LiveCommit& a, const LiveCommit& b) {
     return a.active == b.active && a.tile == b.tile && a.under.lock() == b.under.lock() && a.side == b.side;
 }
 
-// Really place the held window at `c` — the same machinery as the drop —
-// then capture fast so the tiles show the actual re-tile springing with
-// clients re-rendering at their true new sizes. The landed window itself is
-// HIDDEN from the tile draws for the whole gesture (a live HOLE marks the
-// spot) and the ghost stays on the cursor: the workspaces react to the
-// intention, the hand never loses the window.
-static void commitAt(PHLMONITOR m, const Vector2D& c, PHLWINDOW dw, const LiveCommit& sig) {
-    if (!g_dragReal || !sig.active)
-        return;
+// Land `dw` at draw-space `c` per signature `sig` — the ONE placement
+// machinery, shared by the live commit and the classic release-drop (they
+// used to be clones and drifted). Same view: end the grab-drag right at the
+// mapped point (the dwindle insert splits `under` exactly like the
+// desktop). Cross-view: NEVER move a workspace while the drag is alive
+// (they fight over the space — empty-view drops silently failed); close
+// the drag, move, then a clean synthetic re-place (an empty view needs no
+// re-place: sole window = full view). Returns false if nothing was placed.
+static bool landAt(PHLMONITOR m, const Vector2D& c, PHLWINDOW dw, const LiveCommit& sig) {
+    if (!sig.active)
+        return false;
     const SBusyScope busy;
-    Rect tiles[N_TILES];
+    Rect             tiles[N_TILES];
     if (computeTiles(m, tiles) != N_TILES)
-        return;
+        return false;
     // Stale-signature net: if the aim point no longer sits in the signature's
     // tile, the mapping would extrapolate to nonsense coordinates — abort and
-    // let the next tick re-read the world.
+    // let the caller re-read the world.
     if (!CBox{tiles[sig.tile].x, tiles[sig.tile].y, tiles[sig.tile].w, tiles[sig.tile].h}.containsPoint(c))
-        return;
+        return false;
     const auto     under = sig.under.lock();
     const Vector2D desk  = under ? dropPointFor(under, sig.side) : deskAt(m, tiles[sig.tile], c);
-    trace("commit tile=%d side=%d under=%p ws=%d desk=(%.0f,%.0f)", sig.tile, sig.side, (void*)under.get(),
+    trace("land tile=%d side=%d under=%p ws=%d desk=(%.0f,%.0f)", sig.tile, sig.side, (void*)under.get(),
           (int)dw->workspaceID(), desk.x, desk.y);
-    if (const int ot = waveview_tile_for_workspace(dw->workspaceID()); ot >= 0)
-        g_dirtyTiles |= (1u << ot);
+    markDirty(dw->workspaceID());
     g_dirtyTiles |= (1u << sig.tile);
     if (dw->workspaceID() == sig.tile + 1)
         endRealDrag(desk, under);
     else {
-        // Same rule as the drop: never move a workspace while the drag is
-        // alive — close the drag, move, then a clean synthetic re-place.
         endRealDrag(std::nullopt);
         auto ws = g_pCompositor->getWorkspaceByID(sig.tile + 1);
         if (!ws)
             ws = g_pCompositor->createNewWorkspace(sig.tile + 1, m->m_id);
         if (!ws)
-            return;
+            return false;
         g_pCompositor->moveWindowToWorkspaceSafe(dw, ws);
         // The arrival fade would blink through the live captures (the
         // window shows half-transparent for several snapshots — "traces").
@@ -1576,13 +1583,26 @@ static void commitAt(PHLMONITOR m, const Vector2D& c, PHLWINDOW dw, const LiveCo
         if (under)
             placeAt(dw, desk, under);
     }
+    return true;
+}
+
+// Really place the held window at `c` — the same machinery as the drop —
+// then capture fast so the tiles show the actual re-tile springing with
+// clients re-rendering at their true new sizes. The landed window itself is
+// HIDDEN from the tile draws for the whole gesture (a live HOLE marks the
+// spot) and the ghost stays on the cursor: the workspaces react to the
+// intention, the hand never loses the window.
+static void commitAt(PHLMONITOR m, const Vector2D& c, PHLWINDOW dw, const LiveCommit& sig) {
+    if (!g_dragReal)
+        return;
+    const SBusyScope busy;
+    if (!landAt(m, c, dw, sig))
+        return;
     g_commit     = sig;
     g_lastCommit = Time::steadyNow();
-    g_boostUntil = Time::steadyNow() + BOOST_MS;
+    boostCaptures();
     warpFocusFx();
     captureWorkspaces(m, g_dirtyTiles);
-    if (g_liveTimer)
-        g_liveTimer->updateTimeout(std::chrono::milliseconds(50));
     damageAll();
 }
 
@@ -1597,9 +1617,7 @@ static void regrab(PHLWINDOW dw) {
     trace("regrab ws=%d", (int)dw->workspaceID());
     g_commit = {};
     beginRealDrag(dw, false);
-    g_boostUntil = Time::steadyNow() + BOOST_MS;
-    if (g_liveTimer)
-        g_liveTimer->updateTimeout(std::chrono::milliseconds(50));
+    boostCaptures();
     damageAll();
 }
 
@@ -1654,10 +1672,8 @@ static void restoreOriginal() {
     const auto       dw = g_dragWin.lock();
     if (dw) {
         trace("restore ws=%d -> %d", (int)dw->workspaceID(), g_origWS);
-        if (const int ct = waveview_tile_for_workspace(dw->workspaceID()); ct >= 0)
-            g_dirtyTiles |= (1u << ct);
-        if (const int ot = waveview_tile_for_workspace(g_origWS); ot >= 0)
-            g_dirtyTiles |= (1u << ot);
+        markDirty(dw->workspaceID());
+        markDirty(g_origWS);
     }
     if (dw && g_commit.active)
         regrab(dw); // one mechanism: a held drag we end at the original spot
@@ -1760,24 +1776,19 @@ static void updateHoverAt(PHLMONITOR m, const Vector2D& c) {
         return;
     }
 
-    // Hover: a window under the cursor, else an empty workspace tile (jump target).
+    // Hover: the window under the cursor gets a border. (Empty tiles are
+    // still clickable jump targets — the cursor is the affordance, nothing
+    // to draw or track for them.)
     PHLWINDOWREF hov = winAt(c);
-    int          tile = -1;
-    if (!hov.lock()) {
-        const int t = tileAt(m, c);
-        if (t >= 0 && tileEmpty(t))
-            tile = t;
-    }
-    if (hov.lock() != g_hoverWin.lock() || tile != g_hoverTile) {
-        g_hoverWin  = hov;
-        g_hoverTile = tile;
+    if (hov.lock() != g_hoverWin.lock()) {
+        g_hoverWin = hov;
         damageAll();
     }
 
     // Border zones: near a thumbnail's edge the pointer flips to a resize
     // shape and the next press resizes instead of moving.
     const char* shape = nullptr;
-    if (const auto hw = hov.lock(); hw && !hw->isFullscreen() && resizableWin(hw))
+    if (const auto hw = hov.lock(); hw && !hw->isFullscreen() && inLayoutSpace(hw))
         for (auto it = g_wins.rbegin(); it != g_wins.rend(); ++it)
             if (it->win.lock() == hw && it->screen.w > 0.0) {
                 shape = edgeZoneAt(it->screen, c, g_edgeCorner, g_edgeMask);
@@ -1854,25 +1865,20 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
             return; // already mid-resize (stray second press)
         // Border press: the pointer sits on a resize zone — this gesture
         // resizes. The interior grab below moves.
-        if (const auto ew = g_edgeWin.lock(); ew && !ew->isFullscreen() && resizableWin(ew) && !g_dragWin.lock()) {
+        if (const auto ew = g_edgeWin.lock(); ew && !ew->isFullscreen() && inLayoutSpace(ew) && !g_dragWin.lock()) {
             Rect      tiles[N_TILES];
             const int t = waveview_tile_for_workspace(ew->workspaceID());
             if (t >= 0 && computeTiles(m, tiles) == N_TILES && tiles[t].w > 0.0 && tiles[t].h > 0.0) {
-                double ux, uy, uw, uh;
-                usableArea(m, ux, uy, uw, uh);
-                (void)ux;
-                (void)uy;
+                const SUsable u = usableArea(m);
                 g_resizing     = true;
                 g_resizeWin    = ew;
                 g_resizeLast   = c;
                 g_resizeCorner = g_edgeCorner;
                 g_resizeMask   = g_edgeMask;
-                g_resizeScale  = {uw / tiles[t].w, uh / tiles[t].h};
+                g_resizeScale  = {u.w / tiles[t].w, u.h / tiles[t].h};
                 g_watchWin.reset(); // dwindle ratio pushes are not float leaks
                 trace("resize grab ws=%d corner=%d mask=(%.0f,%.0f) class=%s", (int)ew->workspaceID(), (int)g_resizeCorner, g_resizeMask.x, g_resizeMask.y, ew->fetchClass().c_str());
-                g_boostUntil = Time::steadyNow() + BOOST_MS;
-                if (g_liveTimer)
-                    g_liveTimer->updateTimeout(std::chrono::milliseconds(50));
+                boostCaptures();
                 return;
             }
         }
@@ -1887,9 +1893,9 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
             // grab offset from the window's drawn top-left, so it tracks naturally
             for (auto& cw : g_wins)
                 if (cw.win.lock() == w) {
-                    g_dragGrab  = Vector2D(c.x - cw.screen.x, c.y - cw.screen.y);
-                    g_grabFracX = cw.screen.w > 0.0 ? std::clamp(g_dragGrab.x / cw.screen.w, 0.0, 1.0) : 0.5;
-                    g_grabFracY = cw.screen.h > 0.0 ? std::clamp(g_dragGrab.y / cw.screen.h, 0.0, 1.0) : 0.5;
+                    const Vector2D grab{c.x - cw.screen.x, c.y - cw.screen.y};
+                    g_grabFracX = cw.screen.w > 0.0 ? std::clamp(grab.x / cw.screen.w, 0.0, 1.0) : 0.5;
+                    g_grabFracY = cw.screen.h > 0.0 ? std::clamp(grab.y / cw.screen.h, 0.0, 1.0) : 0.5;
                     g_ghostW = g_ghostWantW = cw.screen.w;
                     g_ghostH = g_ghostWantH = cw.screen.h;
                     break;
@@ -1955,64 +1961,10 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
         if (g_commit.active)
             regrab(dw); // released elsewhere before the dwell: pull out, classic drop below
         g_pending = {};
-        Rect      tiles[N_TILES];
-        int       drop = -1;
-        PHLWINDOW under;
-        if (computeTiles(m, tiles) == N_TILES)
-            for (int i = 0; i < N_TILES; ++i)
-                if (CBox{tiles[i].x, tiles[i].y, tiles[i].w, tiles[i].h}.containsPoint(c)) {
-                    drop = i;
-                    break;
-                }
-        if (drop >= 0) {
-            trace("drop tile=%d ws=%d", drop, (int)dw->workspaceID());
-            if (const int ot = waveview_tile_for_workspace(dw->workspaceID()); ot >= 0)
-                g_dirtyTiles |= (1u << ot);
-            g_dirtyTiles |= (1u << drop);
-            // The drop point, mapped back into desktop logical coords
-            // within the target view (inverse of the tile mapping).
-            Rect   tiles2[N_TILES];
-            double ux2, uy2, uw3, uh3;
-            usableArea(m, ux2, uy2, uw3, uh3);
-            const Rect&    t = tiles[drop];
-            Vector2D desk{ux2 + (c.x - t.x) * uw3 / t.w, uy2 + (c.y - t.y) * uh3 / t.h};
-            (void)tiles2;
-            for (auto it = g_wins.rbegin(); it != g_wins.rend(); ++it) {
-                if (it->screen.w <= 0.0 || !it->screen.containsPoint(c))
-                    continue;
-                if (auto w2 = it->win.lock(); w2 && w2 != dw) {
-                    under = w2;
-                    // Same intent translation as a commit: the side is what
-                    // the user aimed at on the DISPLAYED box; the drop point
-                    // forces that side against the real layout.
-                    desk  = dropPointFor(w2, quadrantSide(it->screen, c));
-                    break;
-                }
-            }
-            if (dw->workspaceID() == drop + 1) {
-                // Same view: end the grab-drag right at the drop point —
-                // the dwindle insert splits `under` exactly like the desktop.
-                endRealDrag(desk, under);
-            } else {
-                // Cross-view: NEVER move a workspace while the drag is
-                // alive (they fight over the space — empty-view drops
-                // silently failed). Close the drag at home, move, then a
-                // clean synthetic re-place lands it at the drop point;
-                // an empty view needs no re-place (sole window = full view).
-                endRealDrag(std::nullopt);
-                auto ws = g_pCompositor->getWorkspaceByID(drop + 1);
-                if (!ws)
-                    ws = g_pCompositor->createNewWorkspace(drop + 1, m->m_id);
-                if (ws) {
-                    g_pCompositor->moveWindowToWorkspaceSafe(dw, ws);
-                    dw->m_alpha.warp(); // no arrival-fade blink in the captures
-                    if (under)
-                        placeAt(dw, desk, under);
-                }
-            }
-        } else {
+        // The classic drop is a fresh signature landed via the SAME machinery
+        // as a live commit (they used to be hand-rolled clones of each other).
+        if (!landAt(m, c, dw, signatureAt(m, c, dw)))
             restoreOriginal(); // dropped outside every view: back to where it came from
-        }
         // The gesture is over: the final landing is LIVE — capture now and
         // keep capturing fast while the real windows spring into place
         // (the un-park in endRealDrag keeps the spring short).
@@ -2022,13 +1974,9 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
         restoreFloatState(dw); // last-resort net: no gesture may leak a float
         trace("release settled ws=%d float=%d", (int)dw->workspaceID(), (int)dw->m_isFloating);
         armFloatWatch(dw);
-        g_boostUntil = Time::steadyNow() + BOOST_MS;
+        boostCaptures();
         warpFocusFx(); // the drop's focus churn must not glow through the settle captures
         captureWorkspaces(m, g_dirtyTiles ? g_dirtyTiles : ALL_TILES);
-        if (g_liveTimer)
-            g_liveTimer->updateTimeout(std::chrono::milliseconds(50));
-        for (auto& cw : g_wins)
-            cw.previewT = 0.f;
     }
     damageAll();
 }
@@ -2076,10 +2024,10 @@ static void onRender(eRenderStage stage) {
         g_resizing = false;
         g_resizeWin.reset();
         resetEdgeCursor();
-        g_hoverTile = -1;
         g_pressTile = -1;
         if (g_liveTimer)
             g_liveTimer->updateTimeout(std::nullopt);
+        freeCaptures(); // closed = zero VRAM held; reopen recaptures
         damageAll();
         return;
     }
@@ -2165,14 +2113,13 @@ static void toggle() {
         }
     }
     if (!opening) {
-        restoreOriginal(); // never leave a real drag dangling; a commit is undone
-        g_dragWin.reset();
-        g_dragMoved = false;
+        closeOverview(); // one close path: drag/resize/cursor cleanup included
+        return;
     }
-    g_animTarget = opening ? 1.0f : 0.0f;
-    notifyWaverunner(opening);
+    g_animTarget = 1.0f;
+    notifyWaverunner(true);
     g_animLastT  = Time::steadyNow();
-    if (opening) {
+    {
         g_active         = true;
         const auto m     = g_pCompositor->getMonitorFromCursor();
         const int  at    = waveview_tile_for_workspace(m ? m->activeWorkspaceID() : -1);
@@ -2350,7 +2297,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.27"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.28"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
@@ -2385,19 +2332,7 @@ APICALL EXPORT void PLUGIN_EXIT() {
         g_pEventLoopManager->removeTimer(g_liveTimer);
         g_liveTimer.reset();
     }
-    for (auto& fb : g_fbs) {
-        if (fb)
-            fb->release();
-        fb.reset();
-    }
-    if (g_bgFB) {
-        g_bgFB->release();
-        g_bgFB.reset();
-    }
-    for (auto& cw : g_wins)
-        if (cw.fb)
-            cw.fb->release();
-    g_wins.clear();
+    freeCaptures();
     // Destroy any of OUR queued pass elements now, not next frame. Stock
     // elements die a frame early with them: harmless, the pass rebuilds.
     g_pHyprRenderer->m_renderPass.clear();
