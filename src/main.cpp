@@ -270,8 +270,15 @@ static void captureWindows(PHLMONITOR m) {
     };
     std::vector<std::pair<PHLWINDOWREF, Carry>> prevBoxes;
     prevBoxes.reserve(g_wins.size());
+    // Mid-drag, the dragged window is parked offscreen — recropping it
+    // would blank the cursor ghost. Stash its whole capture and reuse it.
+    std::optional<CapWin> stashDragged;
     for (auto& cw : g_wins) {
         prevBoxes.emplace_back(cw.win, Carry{cw.screen, cw.previewT, cw.previewBox});
+        if (g_dragReal && cw.win.lock() && cw.win.lock() == g_dragWin.lock()) {
+            stashDragged = cw; // keep its fb alive
+            continue;
+        }
         if (cw.fb) // free last cycle's textures before rebuilding
             cw.fb->release();
     }
@@ -281,6 +288,10 @@ static void captureWindows(PHLMONITOR m) {
     for (auto& w : g_pCompositor->m_windows) {
         if (!w || !w->m_isMapped || w->isHidden() || w->monitorID() != m->m_id)
             continue;
+        if (stashDragged && w == g_dragWin.lock()) {
+            g_wins.push_back(*stashDragged); // parked offscreen — reuse its capture
+            continue;
+        }
         const int tile = waveview_tile_for_workspace(w->workspaceID());
         if (tile < 0 || !g_fbs[tile])
             continue;
