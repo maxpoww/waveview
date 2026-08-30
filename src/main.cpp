@@ -1673,12 +1673,25 @@ static void restoreOriginal() {
 // and the cursor-spec shape name. The zone hugs the INSIDE of the rect —
 // outside it is the seam, or a sibling. Capped so tiny thumbnails keep a
 // grabbable interior for the move gesture.
-static constexpr double EDGE_ZONE = 8.0; // drawn px
+static constexpr double EDGE_ZONE   = 8.0;  // drawn px, thin band per edge
+static constexpr double CORNER_ZONE = 22.0; // corners reach much further along
+                                            // both edges — an 8x8 corner was
+                                            // unhittable at thumbnail scale
 static const char*      edgeZoneAt(const CBox& r, const Vector2D& c, Layout::eRectCorner& corner, Vector2D& mask) {
+    const double dl = c.x - r.x, dr = r.x + r.w - c.x;
+    const double dt = c.y - r.y, db = r.y + r.h - c.y;
+    const double cx = std::min(CORNER_ZONE, r.w / 3.0), cy = std::min(CORNER_ZONE, r.h / 3.0);
+    corner          = Layout::CORNER_NONE;
+    // Corners first: near two edges at once (generously) is a diagonal.
+    if ((dl < cx || dr < cx) && (dt < cy || db < cy)) {
+        mask   = {1.0, 1.0};
+        corner = dt < cy ? (dl < cx ? Layout::CORNER_TOPLEFT : Layout::CORNER_TOPRIGHT) //
+                         : (dl < cx ? Layout::CORNER_BOTTOMLEFT : Layout::CORNER_BOTTOMRIGHT);
+        return (corner == Layout::CORNER_TOPLEFT || corner == Layout::CORNER_BOTTOMRIGHT) ? "nwse-resize" : "nesw-resize";
+    }
     const double zx = std::min(EDGE_ZONE, r.w / 4.0), zy = std::min(EDGE_ZONE, r.h / 4.0);
-    const bool   L = c.x - r.x < zx, R = r.x + r.w - c.x < zx;
-    const bool   T = c.y - r.y < zy, B = r.y + r.h - c.y < zy;
-    corner         = Layout::CORNER_NONE;
+    const bool   L = dl < zx, R = dr < zx;
+    const bool   T = dt < zy, B = db < zy;
     if (!L && !R && !T && !B)
         return nullptr;
     mask = {L || R ? 1.0 : 0.0, T || B ? 1.0 : 0.0};
@@ -1688,11 +1701,7 @@ static const char*      edgeZoneAt(const CBox& r, const Vector2D& c, Layout::eRe
         corner = R ? Layout::CORNER_BOTTOMRIGHT : Layout::CORNER_BOTTOMLEFT;
     else
         corner = L ? Layout::CORNER_BOTTOMLEFT : Layout::CORNER_BOTTOMRIGHT;
-    if (mask.x == 0.0)
-        return "ns-resize";
-    if (mask.y == 0.0)
-        return "ew-resize";
-    return (corner == Layout::CORNER_TOPLEFT || corner == Layout::CORNER_BOTTOMRIGHT) ? "nwse-resize" : "nesw-resize";
+    return mask.x == 0.0 ? "ns-resize" : "ew-resize";
 }
 
 // Leave the zone: drop hover state and give the pointer back its default.
@@ -2328,7 +2337,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.25"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.26"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
