@@ -594,37 +594,105 @@ static void drawOverview(PHLMONITOR m, float p, int zoomTile) {
         tgt[i].x1   = (t.x + t.w - tgt[i].x1 < thrX) ? t.x + t.w : tgt[i].x1;
         tgt[i].y1   = (t.y + t.h - tgt[i].y1 < thrY) ? t.y + t.h : tgt[i].y1;
     }
-    for (size_t i = 0; i < g_wins.size(); ++i) {
-        if (!ok[i])
-            continue;
-        for (size_t j = i + 1; j < g_wins.size(); ++j) {
-            if (!ok[j] || g_wins[i].tile != g_wins[j].tile)
+    // Pass B: SEAM LINES. Pairwise mutation was order-dependent (an edge
+    // facing two neighbours got re-centred twice, so identical twins
+    // diverged — measured 12.7px on Max's ws5). Instead: per tile, per
+    // axis, cluster all non-bound edges that fall near a common line; the
+    // line sits at the cluster mean and EVERY closing edge becomes
+    // line - g/2, every opening edge line + g/2. Deterministic, and
+    // columns/rows align by construction.
+    {
+        struct EdgeRef {
+            double coord;
+            size_t win;
+            bool   closing; // true = x1/y1 (left/top side of the seam)
+        };
+        auto solveAxis = [&](int tile, bool xAxis) {
+            const Rect&          t   = tiles[tile];
+            const double         eps = std::max(t.w, t.h) * 0.03;
+            const double         g   = DSN_WIN_GAP * (xAxis ? t.w : t.h);
+            const double         lo  = xAxis ? t.x : t.y;
+            const double         hi  = xAxis ? t.x + t.w : t.y + t.h;
+            std::vector<EdgeRef> edges;
+            for (size_t i = 0; i < g_wins.size(); ++i) {
+                if (!ok[i] || g_wins[i].tile != tile)
+                    continue;
+                const double e0 = xAxis ? tgt[i].x0 : tgt[i].y0;
+                const double e1 = xAxis ? tgt[i].x1 : tgt[i].y1;
+                if (e0 > lo + 0.5) // bound-snapped edges are final
+                    edges.push_back({e0, i, false});
+                if (e1 < hi - 0.5)
+                    edges.push_back({e1, i, true});
+            }
+            std::sort(edges.begin(), edges.end(), [](const EdgeRef& a, const EdgeRef& b) { return a.coord < b.coord; });
+            // Seam lines: cluster means where BOTH sides have windows.
+            std::vector<double> lines;
+            for (size_t s = 0; s < edges.size();) {
+                size_t e   = s + 1;
+                double sum = edges[s].coord;
+                bool   opn = !edges[s].closing, cls = edges[s].closing;
+                while (e < edges.size() && edges[e].coord - edges[s].coord < eps) {
+                    sum += edges[e].coord;
+                    opn |= !edges[e].closing;
+                    cls |= edges[e].closing;
+                    ++e;
+                }
+                if (opn && cls)
+                    lines.push_back(sum / (double)(e - s));
+                s = e;
+            }
+            if (lines.empty())
+                return;
+            // Piecewise redistribution: content between lines compresses by
+            // one uniform factor and EXACTLY g is inserted at every line —
+            // uniform seams, aligned columns, flush bounds; sizes stay
+            // proportional to their between-lines share.
+            const size_t        k     = lines.size();
+            const double        span  = hi - lo;
+            const double        scale = std::max(0.0, span - (double)k * g) / span;
+            std::vector<double> is(k + 2), ns(k + 2); // interval starts: old, new
+            is[0] = lo;
+            ns[0] = lo;
+            for (size_t j = 1; j <= k; ++j) {
+                is[j] = lines[j - 1];
+                ns[j] = ns[j - 1] + (is[j] - is[j - 1]) * scale + g;
+            }
+            is[k + 1] = hi;
+            ns[k + 1] = hi + g; // sentinel; unused beyond interval math
+            auto remap = [&](double v, bool closing) -> double {
+                if (v <= lo + 0.5)
+                    return lo;
+                if (v >= hi - 0.5)
+                    return hi;
+                for (size_t j = 0; j < k; ++j)
+                    if (std::abs(v - lines[j]) < eps / 2.0)
+                        return closing ? ns[j + 1] - g : ns[j + 1]; // line: -g/2 side handled by ns offset
+                // inside an interval: linear map within it
+                size_t j = 0;
+                while (j < k && v > lines[j])
+                    ++j;
+                const double a0 = is[j], n0 = ns[j];
+                return n0 + (v - a0) * scale;
+            };
+            for (size_t i = 0; i < g_wins.size(); ++i) {
+                if (!ok[i] || g_wins[i].tile != tile)
+                    continue;
+                if (xAxis) {
+                    tgt[i].x0 = remap(tgt[i].x0, false);
+                    tgt[i].x1 = remap(tgt[i].x1, true);
+                } else {
+                    tgt[i].y0 = remap(tgt[i].y0, false);
+                    tgt[i].y1 = remap(tgt[i].y1, true);
+                }
+            }
+        };
+        bool tileSeen[N_TILES] = {};
+        for (size_t i = 0; i < g_wins.size(); ++i) {
+            if (!ok[i] || tileSeen[g_wins[i].tile])
                 continue;
-            const Rect&  t   = tiles[g_wins[i].tile];
-            const double eps = std::max(t.w, t.h) * 0.03;
-            const double gX  = DSN_WIN_GAP * t.w, gY = DSN_WIN_GAP * t.h;
-            auto&        a   = tgt[i];
-            auto&        b   = tgt[j];
-            const bool   ovY = std::min(a.y1, b.y1) - std::max(a.y0, b.y0) > 1.0;
-            const bool   ovX = std::min(a.x1, b.x1) - std::max(a.x0, b.x0) > 1.0;
-            if (ovY && std::abs(b.x0 - a.x1) < eps) { // a left of b
-                const double mid = (a.x1 + b.x0) / 2.0;
-                a.x1 = mid - gX / 2.0;
-                b.x0 = mid + gX / 2.0;
-            } else if (ovY && std::abs(a.x0 - b.x1) < eps) { // b left of a
-                const double mid = (b.x1 + a.x0) / 2.0;
-                b.x1 = mid - gX / 2.0;
-                a.x0 = mid + gX / 2.0;
-            }
-            if (ovX && std::abs(b.y0 - a.y1) < eps) { // a above b
-                const double mid = (a.y1 + b.y0) / 2.0;
-                a.y1 = mid - gY / 2.0;
-                b.y0 = mid + gY / 2.0;
-            } else if (ovX && std::abs(a.y0 - b.y1) < eps) { // b above a
-                const double mid = (b.y1 + a.y0) / 2.0;
-                b.y1 = mid - gY / 2.0;
-                a.y0 = mid + gY / 2.0;
-            }
+            tileSeen[g_wins[i].tile] = true;
+            solveAxis(g_wins[i].tile, true);
+            solveAxis(g_wins[i].tile, false);
         }
     }
     for (size_t i = 0; i < g_wins.size(); ++i) {
