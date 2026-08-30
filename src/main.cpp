@@ -134,6 +134,7 @@ struct CapWin {
     float                    previewT    = 0.f; // split-preview glide: 0 = home, 1 = at its kept half
     CBox                     previewBox;        // the half it glides toward (kept for the ease-back)
     CBox                     previewCur;        // eased chase of previewBox — crossing a split diagonal glides, never snaps
+    CBox                     drawCur;           // eased chase of the mapped slot — re-tiles glide at frame rate
     bool                     holdPreview = false; // drop landed here: hold the preview until recapture
 };
 // One shared ease rate for every drag-preview chase (sibling halves, ghost
@@ -366,6 +367,7 @@ static void captureWindows(PHLMONITOR m) {
         float previewT;
         CBox  previewBox;
         CBox  previewCur;
+        CBox  drawCur;
     };
     std::vector<std::pair<PHLWINDOWREF, Carry>> prevBoxes;
     prevBoxes.reserve(g_wins.size());
@@ -373,7 +375,7 @@ static void captureWindows(PHLMONITOR m) {
     // would blank the cursor ghost. Stash its whole capture and reuse it.
     std::optional<CapWin> stashDragged;
     for (auto& cw : g_wins) {
-        prevBoxes.emplace_back(cw.win, Carry{cw.screen, cw.previewT, cw.previewBox, cw.previewCur});
+        prevBoxes.emplace_back(cw.win, Carry{cw.screen, cw.previewT, cw.previewBox, cw.previewCur, cw.drawCur});
         if (g_dragReal && cw.win.lock() && cw.win.lock() == g_dragWin.lock()) {
             stashDragged = cw; // keep its fb alive
             continue;
@@ -398,9 +400,17 @@ static void captureWindows(PHLMONITOR m) {
         if (!srcTex)
             continue;
 
-        const CBox wb = w->getWindowMainSurfaceBox(); // logical coords
+        const CBox wb = w->getWindowMainSurfaceBox(); // logical coords, CURRENT (pixels live here)
         if (wb.w <= 1.0 || wb.h <= 1.0)
             continue;
+        // The tile mapping uses the spring GOAL, not the mid-flight value:
+        // sampling in-flight geometry at capture cadence made minis flip
+        // across snap/seam thresholds between snapshots ("jumps"). Goals
+        // move exactly once per commit; the draw-side glide animates the
+        // transition at full frame rate. (Delta on top of the surface box,
+        // so surface-vs-frame offsets stay whatever they were.)
+        const Vector2D gdp = w->m_realPosition->goal() - w->m_realPosition->value();
+        const Vector2D gds = w->m_realSize->goal() - w->m_realSize->value();
 
         // The window's rect as normalized UV within the full-workspace snapshot.
         const double u0 = std::clamp((wb.x - m->m_position.x) / m->m_size.x, 0.0, 1.0);
@@ -412,7 +422,7 @@ static void captureWindows(PHLMONITOR m) {
 
         CapWin cw;
         cw.win     = w;
-        cw.logical = Rect{wb.x, wb.y, wb.w, wb.h};
+        cw.logical = Rect{wb.x + gdp.x, wb.y + gdp.y, wb.w + gds.x, wb.h + gds.y};
         cw.tile    = tile;
         cw.active  = g_pCompositor->isWindowActive(w);
 
@@ -441,6 +451,7 @@ static void captureWindows(PHLMONITOR m) {
                 cw.previewT   = pb.second.previewT;
                 cw.previewBox = pb.second.previewBox;
                 cw.previewCur = pb.second.previewCur;
+                cw.drawCur    = pb.second.drawCur;
                 break;
             }
 
@@ -920,6 +931,33 @@ static void drawOverview(PHLMONITOR m, float p, int zoomTile) {
         if (std::abs(g_ghostW - g_ghostWantW) > 0.5 || std::abs(g_ghostH - g_ghostWantH) > 0.5)
             previewMoving = true;
     }
+    // The DRAW-SIDE GLIDE: mapped slots come from spring goals and move
+    // exactly once per commit; each drawn box chases its slot at full frame
+    // rate. The capture cadence now only refreshes CONTENT — motion no
+    // longer samples at 20fps next to a 165Hz ghost. Zoom and page flips
+    // own the motion themselves: while they run, the chase snaps.
+    {
+        const bool settled = p >= 0.999f && g_scrollProg >= 1.0f;
+        for (size_t i = 0; i < g_wins.size(); ++i) {
+            auto& cw = g_wins[i];
+            if (!ok[i])
+                continue;
+            if (!settled || cw.drawCur.w <= 0.0) {
+                cw.drawCur = boxes[i];
+                continue;
+            }
+            const double kc = std::min(1.0, (double)g_frameDt * PREVIEW_RATE);
+            cw.drawCur       = CBox{cw.drawCur.x + (boxes[i].x - cw.drawCur.x) * kc,
+                                    cw.drawCur.y + (boxes[i].y - cw.drawCur.y) * kc,
+                                    cw.drawCur.w + (boxes[i].w - cw.drawCur.w) * kc,
+                                    cw.drawCur.h + (boxes[i].h - cw.drawCur.h) * kc};
+            if (std::abs(cw.drawCur.x - boxes[i].x) + std::abs(cw.drawCur.y - boxes[i].y) +
+                    std::abs(cw.drawCur.w - boxes[i].w) + std::abs(cw.drawCur.h - boxes[i].h) >
+                1.0)
+                previewMoving = true;
+            boxes[i] = cw.drawCur;
+        }
+    }
     if (previewMoving) {
         g_pHyprRenderer->damageMonitor(m);
         g_pCompositor->scheduleFrameForMonitor(m);
@@ -1233,6 +1271,10 @@ static void commitAt(PHLMONITOR m, const Vector2D& c, PHLWINDOW dw, const LiveCo
         if (!ws)
             return;
         g_pCompositor->moveWindowToWorkspaceSafe(dw, ws);
+        // The arrival fade would blink through the live captures (the
+        // window shows half-transparent for several snapshots — "traces").
+        // Alpha warps clean: no client redraw depends on it.
+        dw->m_alpha.warp();
         if (under)
             placeAt(dw, desk, under);
     }
@@ -1319,6 +1361,7 @@ static void restoreOriginal() {
         endRealDrag(std::nullopt);
         if (const auto ws = g_pCompositor->getWorkspaceByID(g_origWS)) {
             g_pCompositor->moveWindowToWorkspaceSafe(dw, ws);
+            dw->m_alpha.warp(); // no arrival-fade blink in the captures
             placeAt(dw, g_origHome, nullptr);
         }
     } else
@@ -1533,6 +1576,7 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
                     ws = g_pCompositor->createNewWorkspace(drop + 1, m->m_id);
                 if (ws) {
                     g_pCompositor->moveWindowToWorkspaceSafe(dw, ws);
+                    dw->m_alpha.warp(); // no arrival-fade blink in the captures
                     if (under)
                         placeAt(dw, desk, under);
                 }
@@ -1868,7 +1912,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.11"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.12"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
