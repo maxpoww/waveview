@@ -922,6 +922,13 @@ static void beginRealDrag(PHLWINDOW dw) {
     g_layoutManager->beginDragTarget(dw->layoutTarget(), MBIND_MOVE);
     g_layoutManager->moveMouse(home + Vector2D(3, 3)); // trip the drag threshold
     g_layoutManager->moveMouse(home);
+    // Park the float far offscreen for the drag's duration: it floats at
+    // its old spot on the REAL workspace, so the live captures were baking
+    // its pixels into the re-tiled siblings' textures ("the grabbed
+    // window's image gets printed on the reacting one"). The end-drag
+    // recomputes position from the begin anchor, so parking is invisible
+    // to the drop math; our cursor ghost is the only visual.
+    g_layoutManager->setTargetGeom(CBox{-20000.0, -20000.0, wb.w, wb.h}, dw->layoutTarget());
     g_pCompositor->warpCursorTo(saved, true);
     g_dragReal = true;
     if (const auto m = g_captureMon.lock())
