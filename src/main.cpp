@@ -312,6 +312,20 @@ static double topInset(PHLMONITOR m) {
     return std::round(m->m_reservedArea.top() * m->m_scale);
 }
 
+// The monitor's USABLE logical area — position/size minus every reserved
+// strip. Windows are mapped into tiles against THIS, not the full monitor:
+// mapping against the full monitor bakes the bar strip into every tile as
+// a dead band no window can ever occupy (the "out gaps" that survived four
+// rounds of seam logic — a maximized window must BE the full tile).
+static void usableArea(PHLMONITOR m, double& x, double& y, double& w, double& h) {
+    const double l = m->m_reservedArea.left(), r = m->m_reservedArea.right();
+    const double t = m->m_reservedArea.top(), b = m->m_reservedArea.bottom();
+    x = m->m_position.x + l;
+    y = m->m_position.y + t;
+    w = std::max(1.0, m->m_size.x - l - r);
+    h = std::max(1.0, m->m_size.y - t - b);
+}
+
 // 3x6 tiles below the reserved strip plus the design's top-gap, shifted up
 // by the current grid scroll — the ONE tile source shared by draw, capture,
 // hit-testing, and the schematic, so they can't disagree.
@@ -429,8 +443,10 @@ static void drawSchematic(PHLMONITOR m, const Rect tiles[N_TILES]) {
 
         const CBox wb = w->getWindowMainSurfaceBox();
         Rect       mini;
-        waveview_map_window(tiles[ti].x, tiles[ti].y, tiles[ti].w, tiles[ti].h, m->m_position.x, m->m_position.y,
-                            m->m_size.x, m->m_size.y, wb.x, wb.y, wb.w, wb.h, &mini);
+        double     ux, uy, uw, uh;
+        usableArea(m, ux, uy, uw, uh);
+        waveview_map_window(tiles[ti].x, tiles[ti].y, tiles[ti].w, tiles[ti].h, ux, uy, uw, uh, wb.x, wb.y, wb.w,
+                            wb.h, &mini);
         if (mini.w <= 0.0 || mini.h <= 0.0)
             continue;
 
@@ -548,10 +564,11 @@ static void drawOverview(PHLMONITOR m, float p, int zoomTile) {
         if (!tex)
             continue;
 
-        Rect mini;
-        waveview_map_window(tiles[cw.tile].x, tiles[cw.tile].y, tiles[cw.tile].w, tiles[cw.tile].h, m->m_position.x,
-                            m->m_position.y, m->m_size.x, m->m_size.y, cw.logical.x, cw.logical.y, cw.logical.w,
-                            cw.logical.h, &mini);
+        Rect   mini;
+        double ux, uy, uw, uh;
+        usableArea(m, ux, uy, uw, uh);
+        waveview_map_window(tiles[cw.tile].x, tiles[cw.tile].y, tiles[cw.tile].w, tiles[cw.tile].h, ux, uy, uw, uh,
+                            cw.logical.x, cw.logical.y, cw.logical.w, cw.logical.h, &mini);
         if (mini.w <= 0.0 || mini.h <= 0.0) {
             cw.screen = CBox{};
             continue;
