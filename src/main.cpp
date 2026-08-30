@@ -718,6 +718,35 @@ static void drawOverview(PHLMONITOR m, float p, int zoomTile) {
             solveAxis(g_wins[i].tile, false);
         }
     }
+    // Resolve every window's drawn box first (hit-testing uses the REAL
+    // slots), then apply the live swap preview before drawing.
+    std::vector<CBox> boxes(g_wins.size());
+    ssize_t           dragIdx = -1, swapIdx = -1;
+    for (size_t i = 0; i < g_wins.size(); ++i) {
+        if (!ok[i])
+            continue;
+        const double x0 = mix(real[i].x0, tgt[i].x0, p), y0 = mix(real[i].y0, tgt[i].y0, p);
+        const double x1 = mix(real[i].x1, tgt[i].x1, p), y1 = mix(real[i].y1, tgt[i].y1, p);
+        boxes[i]        = dispRect(CBox{x0, y0, std::max(1.0, x1 - x0), std::max(1.0, y1 - y0)});
+        g_wins[i].screen = boxes[i]; // hit-testing tracks the real slot
+        if (dragW && g_wins[i].win.lock() == dragW)
+            dragIdx = (ssize_t)i;
+    }
+    // Live reorder preview (the others react, like grabbing a window on the
+    // real desktop): while the drag hovers a sibling in the SAME view, that
+    // sibling shows in the dragged window's slot — the swap made visible
+    // before the drop commits it.
+    if (dragIdx >= 0) {
+        for (size_t i = g_wins.size(); i-- > 0;) {
+            if (!ok[i] || (ssize_t)i == dragIdx || g_wins[i].tile != g_wins[dragIdx].tile)
+                continue;
+            if (boxes[i].w > 0.0 && boxes[i].containsPoint(g_dragCursor)) {
+                swapIdx        = (ssize_t)i;
+                boxes[swapIdx] = boxes[dragIdx];
+                break;
+            }
+        }
+    }
     for (size_t i = 0; i < g_wins.size(); ++i) {
         auto& cw = g_wins[i];
         if (!ok[i])
@@ -725,18 +754,15 @@ static void drawOverview(PHLMONITOR m, float p, int zoomTile) {
         const auto tex = cw.fb ? cw.fb->getTexture() : nullptr;
         if (!tex)
             continue;
-        const double x0 = mix(real[i].x0, tgt[i].x0, p), y0 = mix(real[i].y0, tgt[i].y0, p);
-        const double x1 = mix(real[i].x1, tgt[i].x1, p), y1 = mix(real[i].y1, tgt[i].y1, p);
-        const CBox box  = dispRect(CBox{x0, y0, std::max(1.0, x1 - x0), std::max(1.0, y1 - y0)});
-        cw.screen       = box; // remembered for pointer hit-testing
-        const int round = (int)std::lround(DSN_WIN_ROUND * m->m_scale * p);
-        const auto w    = cw.win.lock();
+        const CBox& box   = boxes[i];
+        const int   round = (int)std::lround(DSN_WIN_ROUND * m->m_scale * p);
+        const auto  w     = cw.win.lock();
 
         if (w && w == dragW)
             continue; // the dragged window is drawn last, under the cursor
 
-        if (w && w == hoverW)
-            haloBorder(box, round); // rounded ring behind the window
+        if ((w && w == hoverW) || (ssize_t)i == swapIdx)
+            haloBorder(box, round); // ring: hover, or the live swap partner
         drawTex(tex, box, round);
     }
 
