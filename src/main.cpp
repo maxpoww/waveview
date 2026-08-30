@@ -516,6 +516,27 @@ static void drawSchematic(PHLMONITOR m, const Rect tiles[N_TILES]) {
 static int  tileAt(PHLMONITOR m, const Vector2D& c);
 static bool tileEmpty(int tile);
 
+// Quadrant split, mirroring dwindle's precise_mouse_move exactly: the cursor's
+// slope from the target's center picks the seam — inside the flat side
+// triangles (|dy|/|dx| < h/w) the cut is side-by-side, in the steep top/bottom
+// triangles it stacks. `given` is the newcomer's half, `kept` the target's;
+// both are seam-true (gX/gY shaved per side).
+static void quadrantSplit(const CBox& b, const Vector2D& c, double gX, double gY, CBox& kept, CBox& given) {
+    const double dx = c.x - (b.x + b.w / 2.0);
+    const double dy = c.y - (b.y + b.h / 2.0);
+    if (std::abs(dy) * b.w < std::abs(dx) * b.h) {
+        const CBox lh{b.x, b.y, b.w / 2.0 - gX, b.h};
+        const CBox rh{b.x + b.w / 2.0 + gX, b.y, b.w / 2.0 - gX, b.h};
+        given = dx > 0.0 ? rh : lh;
+        kept  = dx > 0.0 ? lh : rh;
+    } else {
+        const CBox th{b.x, b.y, b.w, b.h / 2.0 - gY};
+        const CBox bh{b.x, b.y + b.h / 2.0 + gY, b.w, b.h / 2.0 - gY};
+        given = dy > 0.0 ? bh : th;
+        kept  = dy > 0.0 ? th : bh;
+    }
+}
+
 // Draw the overview onto the current monitor at zoom progress `p` (0 = zoomed
 // into `zoomTile`, 1 = full grid), pivoting the zoom on `zoomTile`. The look is
 // just the wallpaper with each window floating over it as an individually
@@ -766,24 +787,16 @@ static void drawOverview(PHLMONITOR m, float p, int zoomTile) {
         const float target = (cw.holdPreview || (ssize_t)i == swapIdx) ? 1.f : 0.f;
         if ((ssize_t)i == swapIdx) {
             // The half it keeps (seam included — matches the settled
-            // geometry exactly): split on the longer axis, away from the
-            // cursor side — mirroring where dwindle puts the newcomer.
+            // geometry exactly): quadrant-sided, mirroring where dwindle's
+            // precise_mouse_move puts the newcomer.
             const CBox&  b  = boxes[i];
             const double gX = DSN_WIN_GAP * tiles[cw.tile].w / 2.0;
             const double gY = DSN_WIN_GAP * tiles[cw.tile].h / 2.0;
-            if (b.w >= b.h) {
-                const bool left = g_dragCursor.x < b.x + b.w / 2.0;
-                cw.previewBox   = left ? CBox{b.x + b.w / 2.0 + gX, b.y, b.w / 2.0 - gX, b.h}
-                                       : CBox{b.x, b.y, b.w / 2.0 - gX, b.h};
-                g_ghostWantW    = b.w / 2.0 - gX; // the ghost previews ITS half
-                g_ghostWantH    = b.h;
-            } else {
-                const bool top = g_dragCursor.y < b.y + b.h / 2.0;
-                cw.previewBox  = top ? CBox{b.x, b.y + b.h / 2.0 + gY, b.w, b.h / 2.0 - gY}
-                                     : CBox{b.x, b.y, b.w, b.h / 2.0 - gY};
-                g_ghostWantW   = b.w;
-                g_ghostWantH   = b.h / 2.0 - gY;
-            }
+            CBox         kept, given;
+            quadrantSplit(b, g_dragCursor, gX, gY, kept, given);
+            cw.previewBox = kept;
+            g_ghostWantW  = given.w; // the ghost previews ITS half
+            g_ghostWantH  = given.h;
         }
         cw.previewT += (target - cw.previewT) * std::min(1.0f, g_frameDt * 14.f);
         if (std::abs(cw.previewT - target) < 0.01f)
@@ -1206,19 +1219,7 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
                     const double gX = DSN_WIN_GAP * tiles[drop].w / 2.0;
                     const double gY = DSN_WIN_GAP * tiles[drop].h / 2.0;
                     CBox         kept, given;
-                    if (b.w >= b.h) {
-                        const bool left = c.x < b.x + b.w / 2.0;
-                        const CBox lh{b.x, b.y, b.w / 2.0 - gX, b.h};
-                        const CBox rh{b.x + b.w / 2.0 + gX, b.y, b.w / 2.0 - gX, b.h};
-                        kept  = left ? rh : lh;
-                        given = left ? lh : rh;
-                    } else {
-                        const bool top = c.y < b.y + b.h / 2.0;
-                        const CBox th{b.x, b.y, b.w, b.h / 2.0 - gY};
-                        const CBox bh{b.x, b.y + b.h / 2.0 + gY, b.w, b.h / 2.0 - gY};
-                        kept  = top ? bh : th;
-                        given = top ? th : bh;
-                    }
+                    quadrantSplit(b, c, gX, gY, kept, given);
                     cw.previewBox  = kept;
                     cw.previewT    = 1.f;
                     cw.holdPreview = true;
