@@ -237,6 +237,64 @@ static void renderRect(const CBox& box, const CHyprColor& color, int round = 0) 
     g_pHyprRenderer->m_renderPass.add(makeUnique<CRectPassElement>(data));
 }
 
+// Stock CTexPassElement can only stretch its whole texture into `box` — the
+// stretch is what made morphing windows look mangled. Its one source-crop
+// path (allowCustomUV) reads UVs from the renderer's GLOBAL render data at
+// draw time, so these two EK_CUSTOM elements bracket it: the first plants
+// the UVs and emits the tex element, the trailing one restores the (-1,-1)
+// sentinel so nothing drawn later inherits the crop.
+class CUVResetElement : public IPassElement {
+  public:
+    virtual std::vector<UP<IPassElement>> draw() {
+        g_pHyprRenderer->m_renderData.primarySurfaceUVTopLeft     = Vector2D(-1, -1);
+        g_pHyprRenderer->m_renderData.primarySurfaceUVBottomRight = Vector2D(-1, -1);
+        return {};
+    }
+    virtual bool needsLiveBlur() {
+        return false;
+    }
+    virtual bool needsPrecomputeBlur() {
+        return false;
+    }
+    virtual const char* passName() {
+        return "waveviewUVReset";
+    }
+    virtual ePassElementType type() {
+        return EK_CUSTOM;
+    }
+};
+
+class CUVTexElement : public IPassElement {
+  public:
+    CTexPassElement::SRenderData data;
+    Vector2D                     uvTL, uvBR;
+    CUVTexElement(CTexPassElement::SRenderData&& d, const Vector2D& tl, const Vector2D& br) : data(std::move(d)), uvTL(tl), uvBR(br) {}
+    virtual std::vector<UP<IPassElement>> draw() {
+        g_pHyprRenderer->m_renderData.primarySurfaceUVTopLeft     = uvTL;
+        g_pHyprRenderer->m_renderData.primarySurfaceUVBottomRight = uvBR;
+        data.allowCustomUV                                        = true;
+        std::vector<UP<IPassElement>> out;
+        out.emplace_back(makeUnique<CTexPassElement>(data));
+        out.emplace_back(makeUnique<CUVResetElement>());
+        return out;
+    }
+    virtual bool needsLiveBlur() {
+        return false;
+    }
+    virtual bool needsPrecomputeBlur() {
+        return false;
+    }
+    virtual std::optional<CBox> boundingBox() {
+        return data.box.copy().scale(1.F / g_pHyprRenderer->m_renderData.pMonitor->m_scale).round();
+    }
+    virtual const char* passName() {
+        return "waveviewUVTex";
+    }
+    virtual ePassElementType type() {
+        return EK_CUSTOM;
+    }
+};
+
 // Capture just the wallpaper into g_bgFB: the built-in background plus any
 // background-layer surfaces (hyprpaper etc.), nothing else. This is the single
 // backdrop the whole overview floats over. Must run inside the capture flow
@@ -598,6 +656,27 @@ static void drawOverview(PHLMONITOR m, float p, int zoomTile) {
         td.round         = round;
         td.roundingPower = 2.0f;
         td.clipBox       = stripClip;
+        // COVER, never stretch: when the box's aspect drifts from the
+        // capture's (a sibling gliding to its split half, the ghost morphing
+        // toward its destination), crop the source centrally in UV space —
+        // the window's pixels keep their aspect and the box edges cut into
+        // them, reading like a real resize instead of rubber-banding.
+        const double ta = tex->m_size.y > 0.0 ? tex->m_size.x / tex->m_size.y : 1.0;
+        const double ba = b.h > 0.0 ? b.w / b.h : ta;
+        if (std::abs(ba - ta) > 0.01 * ta) {
+            Vector2D tl{0.0, 0.0}, br{1.0, 1.0};
+            if (ba > ta) { // box relatively wider: crop top/bottom
+                const double f = ta / ba;
+                tl.y           = (1.0 - f) / 2.0;
+                br.y           = 1.0 - tl.y;
+            } else { // box relatively taller: crop left/right
+                const double f = ba / ta;
+                tl.x           = (1.0 - f) / 2.0;
+                br.x           = 1.0 - tl.x;
+            }
+            g_pHyprRenderer->m_renderPass.add(makeUnique<CUVTexElement>(std::move(td), tl, br));
+            return;
+        }
         g_pHyprRenderer->m_renderPass.add(makeUnique<CTexPassElement>(td));
     };
     // A rounded border, drawn as a filled rounded rect *behind* the window:
@@ -885,9 +964,9 @@ static void drawOverview(PHLMONITOR m, float p, int zoomTile) {
             // Shapeshifting ghost: eased dims previewing the destination
             // slot, anchored by the grab point as a fraction of the box.
             // The WINDOW ITSELF morphs (per Max — the frosted-plate stand-in
-            // read as an abstract colored shape): its content fills the whole
-            // eased box, the same treatment as the sibling halves gliding
-            // beneath it.
+            // read as an abstract colored shape). drawTex's cover-crop keeps
+            // its pixels undistorted while the box changes shape — same
+            // treatment as the sibling halves gliding beneath it.
             CBox b{g_dragCursor.x - g_grabFracX * g_ghostW, g_dragCursor.y - g_grabFracY * g_ghostH, g_ghostW,
                    g_ghostH};
             const int round = (int)std::lround(DSN_WIN_ROUND * m->m_scale * p); // same corners as the settled minis
@@ -1612,7 +1691,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.3"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.4"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
