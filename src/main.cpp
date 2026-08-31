@@ -575,6 +575,22 @@ static double topInset(PHLMONITOR m) {
     return std::round(m->m_reservedArea.top() * m->m_scale);
 }
 
+// Is the pointer over the OPTIONS bar's reserved strip? The overview keeps
+// the bar alive up there (tiles are laid out below it), so its pills must
+// stay hoverable and clickable — the X is the overview's exit. We swallow
+// every pointer event while open, so without this the bar would be visible
+// but dead (Max, 2026-08-31: "the whole options click does not work on
+// overview"). Logical coords: the cursor and the reserve both are.
+static bool inTopbarStrip(PHLMONITOR m) {
+    if (!m)
+        return false;
+    const double inset = m->m_reservedArea.top();
+    if (inset <= 0.0)
+        return false;
+    const auto c = g_pInputManager->getMouseCoordsInternal();
+    return c.x >= m->m_position.x && c.x < m->m_position.x + m->m_size.x && c.y >= m->m_position.y && c.y < m->m_position.y + inset;
+}
+
 // The monitor's USABLE logical area — position/size minus every reserved
 // strip. Windows are mapped into tiles against THIS, not the full monitor:
 // mapping against the full monitor bakes the bar strip into every tile as
@@ -1254,6 +1270,16 @@ static void onMouseMove(Vector2D, Event::SCallbackInfo& info) {
     const auto m = g_captureMon.lock();
     if (!m)
         return;
+    // Hand the OPTIONS strip back to the bar (mid-gesture events stay ours,
+    // so a drag or resize that wanders under the bar isn't interrupted).
+    if (!g_busy && !g_resizing && !g_dragWin.lock() && inTopbarStrip(m)) {
+        if (g_hoverWin.lock()) {
+            g_hoverWin.reset();
+            sendOverviewHover(nullptr); // left the grid: pill drops the title
+            damageAll();
+        }
+        return; // NOT cancelled — the bar's pills get hover + clicks
+    }
     info.cancelled   = true;
     if (g_busy)
         return; // the machinery's own cursor warps must not feed back into it
@@ -1831,6 +1857,8 @@ static void onMouseAxis(IPointer::SAxisEvent e, Event::SCallbackInfo& info) {
     const auto m = g_captureMon.lock();
     if (!m)
         return;
+    if (inTopbarStrip(m))
+        return; // scrolls over the bar are the bar's (its boxes scroll)
     info.cancelled = true;
     if (e.axis != WL_POINTER_AXIS_VERTICAL_SCROLL)
         return;
@@ -1880,6 +1908,11 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
     const auto m = g_captureMon.lock();
     if (!m)
         return;
+    // A press on the OPTIONS strip belongs to the bar (its X closes us); a
+    // release mid-gesture stays ours so a drag that ended up under the bar
+    // still lands.
+    if (!g_resizing && !g_dragWin.lock() && inTopbarStrip(m))
+        return; // NOT cancelled — the bar handles the click
     info.cancelled = true;
 
     const Vector2D c = cursorDrawSpace(m);
@@ -2444,7 +2477,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.31"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.32"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
