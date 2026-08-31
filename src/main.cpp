@@ -104,6 +104,9 @@ static SP<CEventLoopTimer> g_liveTimer; // re-arms every REFRESH_MS while open t
 static SP<CEventLoopTimer> g_dragCheckTimer; // one-shot after a button event: the compositor's drag state settles around our listener
 static void                checkResizeDrag(); // defined with the waverunner channel below
 static void                noteInteraction(bool pointer); // ditto — feeds the daemon's focus-cycle frecency
+static void                sendOverviewHover(PHLWINDOW w); // topbar pill follows the overview's pointer
+static void                sendOverviewSize(PHLWINDOW w, bool force); // live size while resizing a thumbnail
+static void                resetOverviewPill(); // forget what the pill was told (overview opened/closed)
 
 // evdev keycodes as delivered by the input event (xkb code = evdev + 8). Digit
 // row is contiguous: KEY_1..KEY_9 = 2..10, so workspace N is keycode N + 1.
@@ -1224,6 +1227,7 @@ static void endRealResize() {
     if (!g_resizing)
         return;
     g_resizing   = false;
+    sendOverviewSize(nullptr, true); // clear the topbar's live readout
     const auto w = g_resizeWin.lock();
     g_resizeWin.reset();
     if (!w)
@@ -1268,6 +1272,7 @@ static void onMouseMove(Vector2D, Event::SCallbackInfo& info) {
             g_layoutManager->resizeTarget(d, rw->layoutTarget(), g_resizeCorner);
             markDirty(rw->workspaceID());
             g_boostUntil = Time::steadyNow() + BOOST_MS; // captures track the live resize
+            sendOverviewSize(rw, false); // live numbers on the topbar pill
             damageAll();
         }
         return;
@@ -1787,6 +1792,7 @@ static void updateHoverAt(PHLMONITOR m, const Vector2D& c) {
     PHLWINDOWREF hov = winAt(c);
     if (hov.lock() != g_hoverWin.lock()) {
         g_hoverWin = hov;
+        sendOverviewHover(hov.lock()); // the topbar pill follows the pointer
         damageAll();
     }
 
@@ -2060,8 +2066,11 @@ static void onRender(eRenderStage stage) {
 
 // Fire-and-forget a control verb to waverunner (the dock/topbar daemon)
 // over its socket on a detached thread; a dead daemon = nothing to tell.
-static void sendWaverunner(const char* msg) {
-    std::thread([msg] {
+// Takes the message BY VALUE and moves it into the thread: callers build
+// verbs with payloads (titles, sizes) in temporaries, and a captured
+// `const char*` into one of those would dangle before the write.
+static void sendWaverunner(std::string msg) {
+    std::thread([msg = std::move(msg)] {
         const char* rt = getenv("XDG_RUNTIME_DIR");
         if (!rt)
             return;
@@ -2072,14 +2081,17 @@ static void sendWaverunner(const char* msg) {
         addr.sun_family = AF_UNIX;
         snprintf(addr.sun_path, sizeof(addr.sun_path), "%s/waverunner.sock", rt);
         if (connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0)
-            (void)!write(fd, msg, strlen(msg));
+            (void)!write(fd, msg.data(), msg.size());
         close(fd);
     }).detach();
 }
 
 // Tell waverunner the overview state, so it conceals its surfaces while we
-// own the screen.
+// own the screen. Every open/close path funnels through here, so this is
+// also where the topbar-pill overrides are forgotten (the daemon drops them
+// on overview-off; we drop our "already sent" memory to match).
 static void notifyWaverunner(bool on) {
+    resetOverviewPill();
     sendWaverunner(on ? "overview-on\n" : "overview-off\n");
 }
 
@@ -2103,6 +2115,58 @@ static void checkResizeDrag() {
 
 static void onDragCheckTimer(SP<CEventLoopTimer> self, void*) {
     checkResizeDrag();
+}
+
+// --- Overview → topbar (waverunner draws the bar over the overview) --------
+// The current-task pill follows the POINTER while we own the screen: it
+// shows the hovered thumbnail's title, plus the live size while a thumbnail
+// is being resized. Both are fire-and-forget verbs; the resize stream is
+// throttled because it rides pointer motion (one socket write per motion
+// event would be one detached thread per event).
+static std::string                                 g_sentHoverTitle;
+static bool                                        g_sentHoverValid = false;
+static std::string                                 g_sentSize;
+static std::chrono::steady_clock::time_point       g_sizeSentAt{};
+static constexpr std::chrono::milliseconds         SIZE_SEND_EVERY{50};
+
+static void sendOverviewHover(PHLWINDOW w) {
+    const std::string title = w ? w->m_title : std::string{};
+    if (g_sentHoverValid && title == g_sentHoverTitle)
+        return;
+    g_sentHoverTitle = title;
+    g_sentHoverValid = true;
+    // Titles can hold anything except our line terminator; strip newlines.
+    std::string line = "overview-hover " + title;
+    for (auto& c : line)
+        if (c == '\n' || c == '\r')
+            c = ' ';
+    line += '\n';
+    sendWaverunner(std::move(line));
+}
+
+// `w == nullptr` ends the readout.
+static void sendOverviewSize(PHLWINDOW w, bool force) {
+    std::string size;
+    if (w) {
+        const auto s = w->m_realSize->goal();
+        size = std::format("{}x{}", (int)s.x, (int)s.y);
+    }
+    if (size == g_sentSize)
+        return;
+    const auto now = std::chrono::steady_clock::now();
+    if (!force && !size.empty() && now - g_sizeSentAt < SIZE_SEND_EVERY)
+        return; // throttle the motion-driven stream
+    g_sentSize   = size;
+    g_sizeSentAt = now;
+    sendWaverunner(size.empty() ? std::string("overview-resize\n") : "overview-resize " + size + "\n");
+}
+
+// Opening/closing forgets what the pill was last told, so the next hover
+// always re-sends (the daemon drops both overrides when the overview ends).
+static void resetOverviewPill() {
+    g_sentHoverValid = false;
+    g_sentHoverTitle.clear();
+    g_sentSize.clear();
 }
 
 // --- Interaction watch (feeds waverunner's focus-cycle frecency) ------------
@@ -2380,7 +2444,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.30"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.31"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
