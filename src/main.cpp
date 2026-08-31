@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdarg>
 #include <cstring>
+#include <format>
 #include <functional>
 #include <memory>
 #include <sstream>
@@ -102,6 +103,7 @@ static CHyprSignalListener g_axisListener; // wheel while open scrolls the 3x6 g
 static SP<CEventLoopTimer> g_liveTimer; // re-arms every REFRESH_MS while open to keep thumbnails live
 static SP<CEventLoopTimer> g_dragCheckTimer; // one-shot after a button event: the compositor's drag state settles around our listener
 static void                checkResizeDrag(); // defined with the waverunner channel below
+static void                noteInteraction(bool pointer); // ditto — feeds the daemon's focus-cycle frecency
 
 // evdev keycodes as delivered by the input event (xkb code = evdev + 8). Digit
 // row is contiguous: KEY_1..KEY_9 = 2..10, so workspace N is keycode N + 1.
@@ -1815,6 +1817,9 @@ static void updateHoverAt(PHLMONITOR m, const Vector2D& c) {
 static double           g_fingerAcc    = 0.0;
 static constexpr double FINGER_FLIP_AT = 140.0; // accumulated px per page flip
 static void onMouseAxis(IPointer::SAxisEvent e, Event::SCallbackInfo& info) {
+    // Scrolling inside the focused window is use (desktop-side only).
+    if (!g_active)
+        noteInteraction(true);
     if (!g_active || g_animTarget < 0.5f)
         return;
     const auto m = g_captureMon.lock();
@@ -1861,6 +1866,9 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
     checkResizeDrag();
     if (g_dragCheckTimer)
         g_dragCheckTimer->updateTimeout(std::chrono::milliseconds(30));
+    // Clicking INTO the focused window is use (desktop-side only).
+    if (!g_active && e.state == WL_POINTER_BUTTON_STATE_PRESSED)
+        noteInteraction(true);
     if (!g_active || g_animTarget < 0.5f || e.button != BTN_LEFT)
         return;
     const auto m = g_captureMon.lock();
@@ -2097,6 +2105,40 @@ static void onDragCheckTimer(SP<CEventLoopTimer> self, void*) {
     checkResizeDrag();
 }
 
+// --- Interaction watch (feeds waverunner's focus-cycle frecency) ------------
+// One "interacted" per window-visit: the FIRST key/click/scroll the user aims
+// at the focused window tells the daemon "this window is being used" — it
+// commits an in-flight focus walk and earns the window its usage point.
+// Super-chords never count (they're binds — the Super+Tab that drives the
+// cycle must not commit it), and clicks/scrolls only count with the cursor
+// inside the focused window's box (a click on the topbar pill is the cycle
+// itself, not window use). Keyboard counts wherever the pointer rests —
+// typing with the mouse parked on the pill is still working in the window.
+static std::string g_interactEpisode; // focused window the last notify was for
+static bool        g_interactSent = false;
+
+static void noteInteraction(bool pointer) {
+    const auto w = Desktop::focusState()->window();
+    if (!w)
+        return;
+    if (pointer) {
+        const auto c = g_pInputManager->getMouseCoordsInternal();
+        const auto p = w->m_realPosition->value();
+        const auto s = w->m_realSize->value();
+        if (c.x < p.x || c.y < p.y || c.x > p.x + s.x || c.y > p.y + s.y)
+            return; // aimed at a layer or another window, not this one
+    }
+    auto addr = std::format("0x{:x}", reinterpret_cast<uintptr_t>(w.get()));
+    if (addr != g_interactEpisode) {
+        g_interactEpisode = addr;
+        g_interactSent    = false;
+    }
+    if (g_interactSent)
+        return;
+    g_interactSent = true;
+    sendWaverunner("interacted\n");
+}
+
 // Whether any window lives on `page` (0 = workspaces 1-9, 1 = 10-18),
 // judged from the open capture set.
 static bool pageHasWindows(int page) {
@@ -2266,6 +2308,11 @@ static void onKey(IKeyboard::SKeyEvent e, Event::SCallbackInfo& info) {
         g_superHeld = e.state == WL_KEYBOARD_KEY_STATE_PRESSED;
         return;
     }
+    // Typing into the focused window is USE (desktop-side only; keys while
+    // the overview is open are ours). Super-chords are binds, not use — the
+    // Super+Tab that drives the focus cycle must never commit it.
+    if (!g_active && !g_superHeld && e.state == WL_KEYBOARD_KEY_STATE_PRESSED)
+        noteInteraction(false);
     if (!g_active || g_animTarget < 0.5f) // only intercept while open (not mid-close)
         return;
     // Super held: digits are OURS — page-relative jump, swallowed so the
@@ -2333,7 +2380,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.29"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.30"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
