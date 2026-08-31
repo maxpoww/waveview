@@ -100,6 +100,8 @@ static CHyprSignalListener g_swipeUpdateListener;
 static CHyprSignalListener g_swipeEndListener;
 static CHyprSignalListener g_axisListener; // wheel while open scrolls the 3x6 grid (see onMouseAxis)
 static SP<CEventLoopTimer> g_liveTimer; // re-arms every REFRESH_MS while open to keep thumbnails live
+static SP<CEventLoopTimer> g_dragCheckTimer; // one-shot after a button event: the compositor's drag state settles around our listener
+static void                checkResizeDrag(); // defined with the waverunner channel below
 
 // evdev keycodes as delivered by the input event (xkb code = evdev + 8). Digit
 // row is contiguous: KEY_1..KEY_9 = 2..10, so workspace N is keycode N + 1.
@@ -1240,6 +1242,7 @@ static void endRealResize() {
 // refocused, the dock revealed, topbar pills lit while the overview was open).
 // The first uncancelled motion after close re-focuses under the cursor.
 static void onMouseMove(Vector2D, Event::SCallbackInfo& info) {
+    checkResizeDrag(); // resize-drag watch runs desktop-side too (cheap)
     if (!g_active || g_animTarget < 0.5f)
         return;
     const auto m = g_captureMon.lock();
@@ -1852,6 +1855,12 @@ static void onMouseAxis(IPointer::SAxisEvent e, Event::SCallbackInfo& info) {
 // tile under the cursor, moving it to that workspace. All left-clicks are swallowed
 // so nothing leaks through to the desktop underneath.
 static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) {
+    // Resize-drag watch: the press that starts a border resize is processed
+    // by the compositor around our listener — check now AND shortly after,
+    // so a click-and-hold shows the size before any movement.
+    checkResizeDrag();
+    if (g_dragCheckTimer)
+        g_dragCheckTimer->updateTimeout(std::chrono::milliseconds(30));
     if (!g_active || g_animTarget < 0.5f || e.button != BTN_LEFT)
         return;
     const auto m = g_captureMon.lock();
@@ -2041,11 +2050,10 @@ static void onRender(eRenderStage stage) {
     }
 }
 
-// Tell waverunner (the dock/topbar daemon) the overview state, so it
-// conceals its surfaces while we own the screen. Fire-and-forget over its
-// control socket on a detached thread; a dead daemon = nothing to conceal.
-static void notifyWaverunner(bool on) {
-    std::thread([on] {
+// Fire-and-forget a control verb to waverunner (the dock/topbar daemon)
+// over its socket on a detached thread; a dead daemon = nothing to tell.
+static void sendWaverunner(const char* msg) {
+    std::thread([msg] {
         const char* rt = getenv("XDG_RUNTIME_DIR");
         if (!rt)
             return;
@@ -2055,12 +2063,38 @@ static void notifyWaverunner(bool on) {
         sockaddr_un addr{};
         addr.sun_family = AF_UNIX;
         snprintf(addr.sun_path, sizeof(addr.sun_path), "%s/waverunner.sock", rt);
-        if (connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0) {
-            const char* msg = on ? "overview-on\n" : "overview-off\n";
+        if (connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0)
             (void)!write(fd, msg, strlen(msg));
-        }
         close(fd);
     }).detach();
+}
+
+// Tell waverunner the overview state, so it conceals its surfaces while we
+// own the screen.
+static void notifyWaverunner(bool on) {
+    sendWaverunner(on ? "overview-on\n" : "overview-off\n");
+}
+
+// Tell waverunner when a window RESIZE drag begins/ends (a border click, or
+// Super+RMB), so the topbar can show the live size from the CLICK onward.
+// The compositor emits no drag events, but the drag controller's state is
+// public — this is a cheap read + bool compare, called from mouse events.
+// The overview's own grid drags run MBIND_MOVE (and its live resize calls
+// resizeTarget directly, no drag state), so neither false-triggers.
+static bool g_resizeDragSent = false;
+static void checkResizeDrag() {
+    const auto& dc   = g_layoutManager->dragController();
+    const auto  mode = dc->mode();
+    const bool on   = dc->target() &&
+        (mode == MBIND_RESIZE || mode == MBIND_RESIZE_BLOCK_RATIO || mode == MBIND_RESIZE_FORCE_RATIO);
+    if (on == g_resizeDragSent)
+        return;
+    g_resizeDragSent = on;
+    sendWaverunner(on ? "resize-drag-on\n" : "resize-drag-off\n");
+}
+
+static void onDragCheckTimer(SP<CEventLoopTimer> self, void*) {
+    checkResizeDrag();
 }
 
 // Whether any window lives on `page` (0 = workspaces 1-9, 1 = 10-18),
@@ -2293,11 +2327,13 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     g_swipeEndListener    = Event::bus()->m_events.gesture.swipe.end.listen(onSwipeEnd);
     g_liveTimer      = makeShared<CEventLoopTimer>(std::nullopt, onLiveTimer, nullptr);
     g_pEventLoopManager->addTimer(g_liveTimer);
+    g_dragCheckTimer = makeShared<CEventLoopTimer>(std::nullopt, onDragCheckTimer, nullptr);
+    g_pEventLoopManager->addTimer(g_dragCheckTimer);
     HyprlandAPI::addNotification(handle, std::string("[waveview] loaded -- ") + waveview_hello(),
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.28"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.29"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
@@ -2331,6 +2367,14 @@ APICALL EXPORT void PLUGIN_EXIT() {
     if (g_liveTimer) {
         g_pEventLoopManager->removeTimer(g_liveTimer);
         g_liveTimer.reset();
+    }
+    if (g_resizeDragSent) {
+        g_resizeDragSent = false;
+        sendWaverunner("resize-drag-off\n");
+    }
+    if (g_dragCheckTimer) {
+        g_pEventLoopManager->removeTimer(g_dragCheckTimer);
+        g_dragCheckTimer.reset();
     }
     freeCaptures();
     // Destroy any of OUR queued pass elements now, not next frame. Stock
