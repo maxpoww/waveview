@@ -102,6 +102,13 @@ static CHyprSignalListener g_swipeEndListener;
 static CHyprSignalListener g_axisListener; // wheel while open scrolls the 3x6 grid (see onMouseAxis)
 static SP<CEventLoopTimer> g_liveTimer; // re-arms every REFRESH_MS while open to keep thumbnails live
 static SP<CEventLoopTimer> g_dragCheckTimer; // one-shot after a button event: the compositor's drag state settles around our listener
+static SP<CEventLoopTimer> g_handTimer;      // one-shot: the open hand shown at press closes shortly after
+// A press shows the hand OPEN for a beat, then closes it, so the grab reads
+// as a hand taking hold rather than a shape swap. Deliberately longer than
+// the 10ms asked for: a frame is ~16ms at 60Hz, so a 10ms open hand would be
+// replaced before it was ever scanned out. This is about the shortest that
+// actually renders as a beat.
+static constexpr int HAND_CLOSE_MS = 90;
 static void                checkResizeDrag(); // defined with the waverunner channel below
 static void                noteInteraction(bool pointer); // ditto — feeds the daemon's focus-cycle frecency
 static void                sendOverviewHover(PHLWINDOW w); // topbar pill follows the overview's pointer
@@ -1783,7 +1790,12 @@ static void resetEdgeCursor() {
 // overview cursor changes go through here so exactly one place owns the
 // override and the "did it change" check — the desktop must never be left
 // wearing one of ours (see the resets on close/exit).
-static void setOverviewCursor(const char* shape) {
+//
+// `force` re-applies even when we believe the shape is already set. Needed
+// during a real drag: the compositor's own drag machinery sets the cursor
+// too, so our cached name goes stale and the shape silently reverts to the
+// arrow while the cache still says "grabbing" (Max, 2026-09-01).
+static void setOverviewCursor(const char* shape, bool force = false) {
     if (!shape) {
         if (!g_edgeShape.empty()) {
             g_pCursorManager->setCursorFromName("left_ptr");
@@ -1791,10 +1803,24 @@ static void setOverviewCursor(const char* shape) {
         }
         return;
     }
-    if (g_edgeShape != shape) {
+    if (force || g_edgeShape != shape) {
         g_pCursorManager->setCursorFromName(shape);
         g_edgeShape = shape;
     }
+}
+
+// While dragging, re-assert the closed hand on a throttle rather than on
+// every motion event (a fast mouse delivers hundreds a second, and each
+// re-assert re-renders the cursor).
+static std::chrono::steady_clock::time_point g_handReassert{};
+static void                                  holdGrabbingCursor() {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - g_handReassert < std::chrono::milliseconds(60)) {
+        setOverviewCursor("grabbing");
+        return;
+    }
+    g_handReassert = now;
+    setOverviewCursor("grabbing", /*force=*/true);
 }
 
 // Shared by motion and grid-scroll: recompute hover/drag targets at cursor `c`
@@ -1859,17 +1885,15 @@ static void updateHoverAt(PHLMONITOR m, const Vector2D& c) {
 
     // Everywhere else the cursor states what the gesture under it WOULD do,
     // in the order the gestures themselves resolve:
-    //   dragging now      → closed hand
-    //   over a thumbnail  → open hand (press-and-move carries it)
-    //   over an empty tile→ finger (a click jumps to that workspace)
-    //   over the void     → plain arrow
+    //   dragging now       → closed hand (re-asserted; see holdGrabbingCursor)
+    //   over a thumbnail   → finger: a click jumps to that window
+    //   over an empty tile → finger: a click jumps to that workspace
+    //   over the void      → plain arrow
     // (A live resize never reaches here — onMouseMove handles and returns —
     // so its edge shape is left standing rather than overwritten.)
     if (g_dragMoved && (g_dragWin.lock() || g_pressTile >= 0))
-        setOverviewCursor("grabbing");
-    else if (hov.lock())
-        setOverviewCursor("grab");
-    else if (tileAt(m, c) >= 0)
+        holdGrabbingCursor();
+    else if (hov.lock() || tileAt(m, c) >= 0)
         setOverviewCursor("pointer");
     else
         setOverviewCursor(nullptr);
@@ -1990,10 +2014,11 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
                     g_ghostH = g_ghostWantH = cw.screen.h;
                     break;
                 }
-            // Close the hand on the PRESS, not on the first movement — the
-            // grab is real from that instant, and waiting for motion reads
-            // as lag.
-            setOverviewCursor("grabbing");
+            // The hand takes hold on the PRESS, not on the first movement:
+            // open for a beat, then closed (see onHandTimer).
+            setOverviewCursor("grab", /*force=*/true);
+            if (g_handTimer)
+                g_handTimer->updateTimeout(std::chrono::milliseconds(HAND_CLOSE_MS));
             damageAll();
         } else {
             const int t = tileAt(m, c);
@@ -2192,6 +2217,11 @@ static void checkResizeDrag() {
 
 static void onDragCheckTimer(SP<CEventLoopTimer> self, void*) {
     checkResizeDrag();
+}
+
+static void onHandTimer(SP<CEventLoopTimer> self, void*) {
+    if (g_active && (g_dragWin.lock() || g_pressTile >= 0))
+        setOverviewCursor("grabbing", /*force=*/true);
 }
 
 // --- Overview → topbar (waverunner draws the bar over the overview) --------
@@ -2517,11 +2547,13 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     g_pEventLoopManager->addTimer(g_liveTimer);
     g_dragCheckTimer = makeShared<CEventLoopTimer>(std::nullopt, onDragCheckTimer, nullptr);
     g_pEventLoopManager->addTimer(g_dragCheckTimer);
+    g_handTimer = makeShared<CEventLoopTimer>(std::nullopt, onHandTimer, nullptr);
+    g_pEventLoopManager->addTimer(g_handTimer);
     HyprlandAPI::addNotification(handle, std::string("[waveview] loaded -- ") + waveview_hello(),
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.33"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.34"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
@@ -2563,6 +2595,10 @@ APICALL EXPORT void PLUGIN_EXIT() {
     if (g_dragCheckTimer) {
         g_pEventLoopManager->removeTimer(g_dragCheckTimer);
         g_dragCheckTimer.reset();
+    }
+    if (g_handTimer) {
+        g_pEventLoopManager->removeTimer(g_handTimer);
+        g_handTimer.reset();
     }
     freeCaptures();
     // Destroy any of OUR queued pass elements now, not next frame. Stock
