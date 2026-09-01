@@ -1779,6 +1779,24 @@ static void resetEdgeCursor() {
     }
 }
 
+// Apply an overview cursor shape (nullptr = back to the plain arrow). All
+// overview cursor changes go through here so exactly one place owns the
+// override and the "did it change" check — the desktop must never be left
+// wearing one of ours (see the resets on close/exit).
+static void setOverviewCursor(const char* shape) {
+    if (!shape) {
+        if (!g_edgeShape.empty()) {
+            g_pCursorManager->setCursorFromName("left_ptr");
+            g_edgeShape.clear();
+        }
+        return;
+    }
+    if (g_edgeShape != shape) {
+        g_pCursorManager->setCursorFromName(shape);
+        g_edgeShape = shape;
+    }
+}
+
 // Shared by motion and grid-scroll: recompute hover/drag targets at cursor `c`
 // (a scroll moves the tiles under a stationary cursor, so hover must follow).
 static void updateHoverAt(PHLMONITOR m, const Vector2D& c) {
@@ -1833,12 +1851,28 @@ static void updateHoverAt(PHLMONITOR m, const Vector2D& c) {
             }
     if (shape) {
         g_edgeWin = hov;
-        if (g_edgeShape != shape) {
-            g_pCursorManager->setCursorFromName(shape);
-            g_edgeShape = shape;
-        }
-    } else
-        resetEdgeCursor();
+        setOverviewCursor(shape);
+        return;
+    }
+    g_edgeWin.reset();
+    g_edgeCorner = Layout::CORNER_NONE;
+
+    // Everywhere else the cursor states what the gesture under it WOULD do,
+    // in the order the gestures themselves resolve:
+    //   dragging now      → closed hand
+    //   over a thumbnail  → open hand (press-and-move carries it)
+    //   over an empty tile→ finger (a click jumps to that workspace)
+    //   over the void     → plain arrow
+    // (A live resize never reaches here — onMouseMove handles and returns —
+    // so its edge shape is left standing rather than overwritten.)
+    if (g_dragMoved && (g_dragWin.lock() || g_pressTile >= 0))
+        setOverviewCursor("grabbing");
+    else if (hov.lock())
+        setOverviewCursor("grab");
+    else if (tileAt(m, c) >= 0)
+        setOverviewCursor("pointer");
+    else
+        setOverviewCursor(nullptr);
 }
 
 // Scroll while open flips between the two pages, clamped — never a loop.
@@ -1956,6 +1990,10 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
                     g_ghostH = g_ghostWantH = cw.screen.h;
                     break;
                 }
+            // Close the hand on the PRESS, not on the first movement — the
+            // grab is real from that instant, and waiting for motion reads
+            // as lag.
+            setOverviewCursor("grabbing");
             damageAll();
         } else {
             const int t = tileAt(m, c);
@@ -1981,6 +2019,9 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
     // un-park and restoreOriginal's workspace-restore both read it.
     g_dragMoved = false;
     g_pressTile = -1;
+    // Hand opens again on release; the hover pass below re-decides the shape
+    // from whatever the pointer now sits on.
+    setOverviewCursor(nullptr);
     if (dw && !moved) {
         g_dragWin.reset();
         jumpToWindow(dw); // click → switch to & focus that window, closing the overview
@@ -2034,6 +2075,9 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
         warpFocusFx(); // the drop's focus churn must not glow through the settle captures
         captureWorkspaces(m, g_dirtyTiles ? g_dirtyTiles : ALL_TILES);
     }
+    // Re-decide the cursor for wherever the drop left the pointer (the tiles
+    // just re-laid out under it).
+    updateHoverAt(m, c);
     damageAll();
 }
 
@@ -2477,7 +2521,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.32"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.33"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
