@@ -1852,6 +1852,13 @@ static void updateHoverAt(PHLMONITOR m, const Vector2D& c) {
     if (g_dragWin.lock()) {
         g_dragCursor = c;
         maybeCommit(m);
+        // AFTER the commit, and every motion: each commit ends and re-begins
+        // the compositor's drag, and its dragEnd unsets the "grabbing"
+        // override it set — leaving the plain arrow with nothing to restore
+        // it. This branch returns before the hover cursor logic below, so
+        // the closed hand has to be asserted here or not at all (Max,
+        // 2026-09-01: "when i start dragging, it becomes plain arrow").
+        holdGrabbingCursor();
         damageAll();
         return;
     }
@@ -1886,14 +1893,17 @@ static void updateHoverAt(PHLMONITOR m, const Vector2D& c) {
     // Everywhere else the cursor states what the gesture under it WOULD do,
     // in the order the gestures themselves resolve:
     //   dragging now       → closed hand (re-asserted; see holdGrabbingCursor)
-    //   over a thumbnail   → finger: a click jumps to that window
+    //   over a thumbnail   → open hand: it can be picked up
     //   over an empty tile → finger: a click jumps to that workspace
     //   over the void      → plain arrow
     // (A live resize never reaches here — onMouseMove handles and returns —
     // so its edge shape is left standing rather than overwritten.)
-    if (g_dragMoved && (g_dragWin.lock() || g_pressTile >= 0))
+    // (A window drag returned above; this reaches an empty-tile drag.)
+    if (g_dragMoved && g_pressTile >= 0)
         holdGrabbingCursor();
-    else if (hov.lock() || tileAt(m, c) >= 0)
+    else if (hov.lock())
+        setOverviewCursor("grab");
+    else if (tileAt(m, c) >= 0)
         setOverviewCursor("pointer");
     else
         setOverviewCursor(nullptr);
@@ -2553,7 +2563,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.34"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.36"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
