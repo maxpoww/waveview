@@ -166,12 +166,29 @@ static std::vector<CapWin> g_wins;
 // after a frame is laid out (`CapWin::screen` is filled during the draw), and
 // warping mid-zoom would land the pointer where the thumbnail *was* a moment
 // before it slid on.
+// The pointer is HIDDEN for the length of the zoom and shown again once it has
+// been placed, so the move is never seen: the cursor simply is where it should
+// be when the overview arrives, instead of visibly jumping across the screen
+// after the tiles land (Max, 2026-09-03: "can we hide the pointer during the
+// relocation?"). Every exit from the pending state must show it again — a
+// hidden pointer is the worst thing to leave behind.
 static PHLWINDOWREF g_warpWin;              // the window focused when we opened
 static bool         g_warpPending = false;  // still owed a warp this open
+static bool         g_warpHidCursor = false; // we are the ones hiding it
 static Vector2D     g_warpFromCursor;       // where the pointer sat at open
 // Deliberate pointer motion during the zoom cancels the warp: if the hand is
 // already driving, yanking the cursor away is worse than not helping.
 static constexpr double WARP_CANCEL_SLOP = 8.0;
+
+// Show the pointer again if the open warp hid it. Idempotent, and safe to call
+// from any path that ends the pending state (warp done, cancelled, overview
+// closed) — whoever gets there first restores it.
+static void endWarpHide() {
+    if (!g_warpHidCursor)
+        return;
+    g_warpHidCursor = false;
+    g_pHyprRenderer->setCursorHidden(false);
+}
 
 // Pointer interaction, all in "draw space" (whole monitor = [0,0,transformedSize]).
 // Tracked by window handle, not g_wins index — the vector is rebuilt every capture.
@@ -1318,6 +1335,7 @@ static void onMouseMove(Vector2D, Event::SCallbackInfo& info) {
     if (g_warpPending && (g_pInputManager->getMouseCoordsInternal() - g_warpFromCursor).size() > WARP_CANCEL_SLOP) {
         g_warpPending = false;
         g_warpWin.reset();
+        endWarpHide(); // a moving pointer must be visible, immediately
     }
     if (g_resizing) {
         const auto rw = g_resizeWin.lock();
@@ -2167,12 +2185,14 @@ static void warpToOpeningWindow(PHLMONITOR m) {
         // Land fully arrived: the hover border, the topbar pill and the cursor
         // shape all describe where the pointer now is, not where it came from.
         updateHoverAt(m, cursorDrawSpace(m));
+        endWarpHide(); // shown only now — with the right shape, in the right place
         damageAll();
         trace("open warp -> ws=%d", (int)w->workspaceID());
         return;
     }
     // No thumbnail for it (fullscreen, a special workspace, off-grid): leave
-    // the pointer where the user put it rather than guess.
+    // the pointer where the user put it rather than guess — but show it again.
+    endWarpHide();
     trace("open warp: focused window has no tile; pointer left alone");
 }
 
@@ -2410,6 +2430,12 @@ static void flipToPage(int page) {
 static void closeOverview() {
     if (g_animTarget < 0.5f)
         return;
+    // Closed before the zoom ever settled (Escape on the way in): drop the
+    // warp we still owe and give the pointer back. Nothing may leave this
+    // function with a hidden cursor.
+    g_warpPending = false;
+    g_warpWin.reset();
+    endWarpHide();
     endRealResize();   // sizes applied live are final; just settle
     resetEdgeCursor(); // the desktop must not inherit a resize pointer
     restoreOriginal(); // never leave a real drag dangling; a commit is undone
@@ -2466,6 +2492,14 @@ static void toggle() {
         // default arrow for the overview's lifetime.
         g_pHyprRenderer->setCursorHidden(false);
         g_pCursorManager->setCursorFromName("left_ptr");
+        // …and then hide it again for exactly as long as it is being moved, so
+        // the relocation is never seen. Ordered after the unhide above on
+        // purpose: that call is what guarantees there IS a cursor to show when
+        // `endWarpHide` runs.
+        if (g_warpPending) {
+            g_warpHidCursor = true;
+            g_pHyprRenderer->setCursorHidden(true);
+        }
         if (g_liveTimer)
             g_liveTimer->updateTimeout(REFRESH_MS);
     }
@@ -2633,7 +2667,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.37"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.38"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
@@ -2647,6 +2681,11 @@ APICALL EXPORT void PLUGIN_EXIT() {
         restoreOriginal(); // ends a live drag; float + workspace restored
         notifyWaverunner(false);
     }
+    // Unloaded mid-open-warp: hand the pointer back before our code is gone,
+    // or the session is left with an invisible cursor and no one to restore it.
+    g_warpPending = false;
+    g_warpWin.reset();
+    endWarpHide();
     g_active     = false;
     g_animTarget = 0.0f;
     g_dragWin.reset();
