@@ -1905,6 +1905,8 @@ static void clearBorderResizeIcon() {
 static void reassertOverviewCursor() {
     if (!g_pInputManager || g_pInputManager->m_borderIconDirection == BORDERICON_NONE)
         return;
+    trace("reassert: compositor set borderIcon=%d, reapplying '%s'", (int)g_pInputManager->m_borderIconDirection,
+          g_edgeShape.empty() ? "left_ptr" : g_edgeShape.c_str());
     g_pInputManager->m_borderIconDirection = BORDERICON_NONE;
     g_pCursorManager->setCursorFromName(g_edgeShape.empty() ? "left_ptr" : g_edgeShape);
 }
@@ -1920,12 +1922,16 @@ static void setOverviewCursor(const char* shape, bool force = false) {
         // how a caller says "I don't know what's on the pointer, make it the
         // arrow" (see the overview taking the pointer over).
         if (force || !g_edgeShape.empty()) {
+            if (!g_edgeShape.empty())
+                trace("shape '%s' -> left_ptr%s", g_edgeShape.c_str(), force ? " (forced)" : "");
             g_pCursorManager->setCursorFromName("left_ptr");
             g_edgeShape.clear();
         }
         return;
     }
     if (force || g_edgeShape != shape) {
+        if (g_edgeShape != shape)
+            trace("shape '%s' -> '%s'", g_edgeShape.empty() ? "left_ptr" : g_edgeShape.c_str(), shape);
         g_pCursorManager->setCursorFromName(shape);
         g_edgeShape = shape;
     }
@@ -2243,10 +2249,19 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
 // when `CapWin::screen` holds the final boxes. One shot per open, whether or
 // not a target is found — a warp owed forever would fire on some later frame
 // after the user had moved on.
-static void warpToOpeningWindow(PHLMONITOR m) {
-    g_warpPending  = false;
-    const auto w   = g_warpWin.lock();
+static void warpToOpeningWindow() {
+    g_warpPending = false;
+    const auto w  = g_warpWin.lock();
     g_warpWin.reset();
+    // ALWAYS the capture monitor — never the monitor whose render pass we
+    // happen to be in. onRender fires once per monitor, and on a multi-head
+    // desk another head's pass usually reaches the settle first; converting
+    // the thumbnail centre through THAT head's position and scale put the
+    // pointer somewhere arbitrary, and the follow-up hover then dressed it
+    // as resize / hand / arrow depending on what it found (Max, 2026-09-03:
+    // "at any shape and supr+r will change the shape … resize/hand/plain
+    // arrow"). Single-monitor test rigs never see this; his desk always did.
+    const auto m = g_captureMon.lock();
     if (!w || !m)
         return;
     for (const auto& cw : g_wins) {
@@ -2348,9 +2363,10 @@ static void onRender(eRenderStage stage) {
     drawOverview(m, easeOutCubic(g_anim), g_zoomTile);
 
     // The zoom has landed and every thumbnail now has its final box: put the
-    // pointer on the one we came from.
+    // pointer on the one we came from. (The warp resolves the CAPTURE monitor
+    // itself — `m` here is whichever head is currently rendering.)
     if (g_warpPending && g_anim >= g_animTarget)
-        warpToOpeningWindow(m);
+        warpToOpeningWindow();
 
     // Keep frames coming while the zoom is still moving.
     if (g_anim != g_animTarget) {
@@ -2777,7 +2793,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.46"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.48"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
