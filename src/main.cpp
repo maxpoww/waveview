@@ -339,6 +339,7 @@ static double easeInOutCubic(double t) {
 static void jumpTo(int wsId);
 static void jumpToWindow(PHLWINDOW w);
 static void updateHoverAt(PHLMONITOR m, const Vector2D& c);
+static void reassertOverviewCursor(); // undo the compositor's border icon (defined with the cursor owner)
 static void closeOverview();
 static void beginRealDrag(PHLWINDOW dw, bool capture = true);
 static void endRealDrag(std::optional<Vector2D> at, PHLWINDOW splitTarget = nullptr);
@@ -1317,6 +1318,10 @@ static void onMouseMove(Vector2D, Event::SCallbackInfo& info) {
     const auto m = g_captureMon.lock();
     if (!m)
         return;
+    // The compositor's motion handling already ran (it precedes this hook) and
+    // may have re-applied its border icon from the invisible desktop windows
+    // underneath — undo that before any shape decision below.
+    reassertOverviewCursor();
     // Hand the OPTIONS strip back to the bar (mid-gesture events stay ours,
     // so a drag or resize that wanders under the bar isn't interrupted).
     if (!g_busy && !g_resizing && !g_dragWin.lock() && inTopbarStrip(m)) {
@@ -1859,6 +1864,24 @@ static void clearBorderResizeIcon() {
         g_pInputManager->m_borderIconDirection = BORDERICON_NONE;
 }
 
+// The inconsistency that survived v0.43: the compositor's own motion
+// processing runs BEFORE our hook (see the note on onMouseMove), and it
+// computes its border icon against the REAL windows still lying under the
+// overlay — invisible, but very much there. So a pointer crossing a hidden
+// desktop window's border mid-overview got flipped back to ew-resize right
+// after we set our shape, depending purely on what happened to be underneath
+// (Max, 2026-09-03: "almost solved, with inconsistencies"). Detect exactly
+// that — the direction went non-NONE while the overview owns the pointer —
+// release it, and re-assert the shape the overview meant to show. A no-op
+// branch when the compositor hasn't interfered, so it's safe on every
+// motion and every frame.
+static void reassertOverviewCursor() {
+    if (!g_pInputManager || g_pInputManager->m_borderIconDirection == BORDERICON_NONE)
+        return;
+    g_pInputManager->m_borderIconDirection = BORDERICON_NONE;
+    g_pCursorManager->setCursorFromName(g_edgeShape.empty() ? "left_ptr" : g_edgeShape);
+}
+
 static void setOverviewCursor(const char* shape, bool force = false) {
     // Whatever we are about to put on the pointer, the compositor's border
     // icon outranks it — drop that first or it wins the next frame.
@@ -2243,6 +2266,13 @@ static void onRender(eRenderStage stage) {
     const auto m = g_pHyprRenderer->m_renderData.pMonitor.lock();
     if (!m)
         return;
+
+    // Per-frame belt to the motion-hook fix: anything that re-applied the
+    // compositor's border icon between events (a refocus, a warp, a layout
+    // change — not everything arrives as pointer motion) is undone within a
+    // frame. Only while we own the pointer; the close animation hands it back.
+    if (g_animTarget > 0.5f)
+        reassertOverviewCursor();
 
     // Advance the zoom animation by wall-clock dt (guard first-frame / stalls).
     const auto now = Time::steadyNow();
@@ -2712,7 +2742,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.43"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.44"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
