@@ -2644,14 +2644,26 @@ static void toggle() {
         g_tourDone   = false;
         // Remember where we were called from; the warp itself happens on the
         // first settled frame, once that window has a drawn box.
-        g_warpWin        = Desktop::focusState()->window();
+        // "The window I'm calling it from" is the one under the POINTER, not
+        // the one holding keyboard focus. This desktop runs follow_mouse = 2,
+        // where focus moves only on CLICK — so the focused window is merely
+        // the last one clicked, often a different window, sometimes a
+        // different workspace, and the warp dutifully went there. Every
+        // landing in the trace was mechanically perfect and humanly wrong
+        // (Max, 2026-09-03: "well.. its not working"). Keyboard focus is only
+        // the fallback for a pointer over nothing (the void, a layer).
+        const auto underPtr = g_pCompositor->vectorToWindowUnified(
+            g_pInputManager->getMouseCoordsInternal(),
+            Desktop::View::RESERVED_EXTENTS | Desktop::View::INPUT_EXTENTS | Desktop::View::ALLOW_FLOATING);
+        g_warpWin        = underPtr ? underPtr : Desktop::focusState()->window();
         g_warpPending    = g_warpWin.lock() != nullptr;
         g_warpFromCursor = g_pInputManager->getMouseCoordsInternal();
         // The one silent way to get no warp at all is opening with nothing
-        // focused (a bare workspace, focus on a layer) — name it in the log so
-        // "it didn't move" is always attributable.
-        trace("open: warp %s (swipeLive=%d)", g_warpPending ? "armed" : "SKIPPED - no focused window",
-              (int)g_swipeLive);
+        // under the pointer AND nothing focused — name it in the log so "it
+        // didn't move" is always attributable.
+        trace("open: warp %s via %s (swipeLive=%d)",
+              g_warpPending ? "armed" : "SKIPPED - no window",
+              underPtr ? "pointer" : "focus fallback", (int)g_swipeLive);
         captureWorkspaces(m); // snapshot on open, outside the render pass
         // The pointer must exist over the overview: the capture's workspace
         // juggling can leave the cursor surfaceless (shouldRenderCursor
@@ -2842,7 +2854,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.49"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.50"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
