@@ -156,6 +156,23 @@ struct CapWin {
 static constexpr float PREVIEW_RATE = 9.f;
 static std::vector<CapWin> g_wins;
 
+// ---- Open warp ---------------------------------------------------------------
+// The overview opens under your hand: the pointer lands on the thumbnail of the
+// window you called it FROM, so the first gesture is already aimed at where you
+// were. Without it the pointer stays wherever it was parked — usually nowhere
+// near the window you just left — and every open starts with a hunt.
+//
+// It has to wait for the zoom to settle: a window's drawn box is only known
+// after a frame is laid out (`CapWin::screen` is filled during the draw), and
+// warping mid-zoom would land the pointer where the thumbnail *was* a moment
+// before it slid on.
+static PHLWINDOWREF g_warpWin;              // the window focused when we opened
+static bool         g_warpPending = false;  // still owed a warp this open
+static Vector2D     g_warpFromCursor;       // where the pointer sat at open
+// Deliberate pointer motion during the zoom cancels the warp: if the hand is
+// already driving, yanking the cursor away is worse than not helping.
+static constexpr double WARP_CANCEL_SLOP = 8.0;
+
 // Pointer interaction, all in "draw space" (whole monitor = [0,0,transformedSize]).
 // Tracked by window handle, not g_wins index — the vector is rebuilt every capture.
 static PHLWINDOWREF g_hoverWin;              // window under the cursor (gets a border)
@@ -1205,6 +1222,12 @@ static Vector2D cursorDrawSpace(PHLMONITOR m) {
     return Vector2D(local.x * m->m_transformedSize.x / m->m_size.x, local.y * m->m_transformedSize.y / m->m_size.y);
 }
 
+// The inverse: a draw-space point back to a global cursor position, so we can
+// put the pointer somewhere the overview drew (see the open warp).
+static Vector2D drawSpaceToGlobal(PHLMONITOR m, const Vector2D& d) {
+    return m->m_position + Vector2D(d.x * m->m_size.x / m->m_transformedSize.x, d.y * m->m_size.y / m->m_transformedSize.y);
+}
+
 // Topmost captured window whose last-drawn box contains `c`, or empty.
 static PHLWINDOWREF winAt(const Vector2D& c) {
     for (auto it = g_wins.rbegin(); it != g_wins.rend(); ++it)
@@ -1290,6 +1313,12 @@ static void onMouseMove(Vector2D, Event::SCallbackInfo& info) {
     info.cancelled   = true;
     if (g_busy)
         return; // the machinery's own cursor warps must not feed back into it
+    // The hand is already driving: drop the open warp rather than yank the
+    // pointer out from under a gesture the user has started.
+    if (g_warpPending && (g_pInputManager->getMouseCoordsInternal() - g_warpFromCursor).size() > WARP_CANCEL_SLOP) {
+        g_warpPending = false;
+        g_warpWin.reset();
+    }
     if (g_resizing) {
         const auto rw = g_resizeWin.lock();
         if (!rw || rw->isFullscreen() || !inLayoutSpace(rw)) {
@@ -2116,6 +2145,37 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
     damageAll();
 }
 
+// Put the pointer on the thumbnail of the window the overview was called from
+// (see the open-warp note by `g_warpWin`). Called on the first settled frame,
+// when `CapWin::screen` holds the final boxes. One shot per open, whether or
+// not a target is found — a warp owed forever would fire on some later frame
+// after the user had moved on.
+static void warpToOpeningWindow(PHLMONITOR m) {
+    g_warpPending  = false;
+    const auto w   = g_warpWin.lock();
+    g_warpWin.reset();
+    if (!w || !m)
+        return;
+    for (const auto& cw : g_wins) {
+        if (cw.win.lock() != w || cw.screen.w <= 0.0)
+            continue;
+        const Vector2D centre{cw.screen.x + cw.screen.w / 2.0, cw.screen.y + cw.screen.h / 2.0};
+        {
+            const SBusyScope busy; // our own warp must not feed the hover machinery
+            g_pCompositor->warpCursorTo(drawSpaceToGlobal(m, centre), true);
+        }
+        // Land fully arrived: the hover border, the topbar pill and the cursor
+        // shape all describe where the pointer now is, not where it came from.
+        updateHoverAt(m, cursorDrawSpace(m));
+        damageAll();
+        trace("open warp -> ws=%d", (int)w->workspaceID());
+        return;
+    }
+    // No thumbnail for it (fullscreen, a special workspace, off-grid): leave
+    // the pointer where the user put it rather than guess.
+    trace("open warp: focused window has no tile; pointer left alone");
+}
+
 static void onRender(eRenderStage stage) {
     if (!g_active || g_capturing || stage != eRenderStage::RENDER_POST_WINDOWS)
         return;
@@ -2168,6 +2228,11 @@ static void onRender(eRenderStage stage) {
     }
 
     drawOverview(m, easeOutCubic(g_anim), g_zoomTile);
+
+    // The zoom has landed and every thumbnail now has its final box: put the
+    // pointer on the one we came from.
+    if (g_warpPending && g_anim >= g_animTarget)
+        warpToOpeningWindow(m);
 
     // Keep frames coming while the zoom is still moving.
     if (g_anim != g_animTarget) {
@@ -2388,6 +2453,11 @@ static void toggle() {
         g_scrollFrom = g_scroll;
         g_scrollProg = 1.0f; // open lands settled — no flip animation
         g_tourDone   = false;
+        // Remember where we were called from; the warp itself happens on the
+        // first settled frame, once that window has a drawn box.
+        g_warpWin        = Desktop::focusState()->window();
+        g_warpPending    = g_warpWin.lock() != nullptr;
+        g_warpFromCursor = g_pInputManager->getMouseCoordsInternal();
         captureWorkspaces(m); // snapshot on open, outside the render pass
         // The pointer must exist over the overview: the capture's workspace
         // juggling can leave the cursor surfaceless (shouldRenderCursor
@@ -2563,7 +2633,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.36"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.37"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
