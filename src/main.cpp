@@ -179,6 +179,16 @@ static Vector2D     g_warpFromCursor;       // where the pointer sat at open
 // Deliberate pointer motion during the zoom cancels the warp: if the hand is
 // already driving, yanking the cursor away is worse than not helping.
 static constexpr double WARP_CANCEL_SLOP = 8.0;
+// …but the 3-finger swipe OPENS the overview mid-gesture, with the fingers
+// still on the pad — lifting them delivers residual pointer motion that is
+// part of *invoking*, not of aiming, and it was cancelling the warp every
+// time (Max, 2026-09-03: "works with supr+r but not so well calling overview
+// with gesture" — Super+R produces no pointer motion, the swipe does). While
+// the swipe is live, and for a beat after the fingers leave, such motion
+// re-baselines the cancel reference instead of cancelling.
+static bool            g_swipeLive = false;
+static Time::steady_tp g_swipeEndAt{};
+static constexpr auto  SWIPE_SETTLE = std::chrono::milliseconds(300);
 
 // Show the pointer again if the open warp hid it. Idempotent, and safe to call
 // from any path that ends the pending state (warp done, cancelled, overview
@@ -1338,9 +1348,14 @@ static void onMouseMove(Vector2D, Event::SCallbackInfo& info) {
     // The hand is already driving: drop the open warp rather than yank the
     // pointer out from under a gesture the user has started.
     if (g_warpPending && (g_pInputManager->getMouseCoordsInternal() - g_warpFromCursor).size() > WARP_CANCEL_SLOP) {
-        g_warpPending = false;
-        g_warpWin.reset();
-        endWarpHide(); // a moving pointer must be visible, immediately
+        if (g_swipeLive || Time::steadyNow() - g_swipeEndAt < SWIPE_SETTLE) {
+            // Finger-lift jitter from the swipe that opened us: not aiming.
+            g_warpFromCursor = g_pInputManager->getMouseCoordsInternal();
+        } else {
+            g_warpPending = false;
+            g_warpWin.reset();
+            endWarpHide(); // a moving pointer must be visible, immediately
+        }
     }
     if (g_resizing) {
         const auto rw = g_resizeWin.lock();
@@ -2589,6 +2604,7 @@ static void onSwipeBegin(IPointer::SSwipeBeginEvent e, Event::SCallbackInfo& inf
     g_swipeFingers = e.fingers;
     g_swipeAcc     = Vector2D(0.0, 0.0);
     g_swipeFired   = false;
+    g_swipeLive    = true; // motion until the fingers leave belongs to the gesture
     if (g_active)
         info.cancelled = true;
 }
@@ -2619,6 +2635,8 @@ static void onSwipeEnd(IPointer::SSwipeEndEvent, Event::SCallbackInfo& info) {
         info.cancelled = true;
     g_swipeFingers = 0;
     g_swipeFired   = false;
+    g_swipeLive    = false;
+    g_swipeEndAt   = Time::steadyNow(); // the settle grace runs from here
 }
 
 // Jump to workspace `wsId` (1..9) and close the overview by zooming into that
@@ -2742,7 +2760,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.44"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.45"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
