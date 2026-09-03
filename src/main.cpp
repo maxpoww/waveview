@@ -1844,7 +1844,12 @@ static void resetEdgeCursor() {
 // arrow while the cache still says "grabbing" (Max, 2026-09-01).
 static void setOverviewCursor(const char* shape, bool force = false) {
     if (!shape) {
-        if (!g_edgeShape.empty()) {
+        // `force` matters here too: the cache only knows about shapes WE set,
+        // so an empty cache does not mean the pointer is wearing the arrow —
+        // it may still be wearing whatever the desktop left on it. Forcing is
+        // how a caller says "I don't know what's on the pointer, make it the
+        // arrow" (see the overview taking the pointer over).
+        if (force || !g_edgeShape.empty()) {
             g_pCursorManager->setCursorFromName("left_ptr");
             g_edgeShape.clear();
         }
@@ -2182,6 +2187,14 @@ static void warpToOpeningWindow(PHLMONITOR m) {
             const SBusyScope busy; // our own warp must not feed the hover machinery
             g_pCompositor->warpCursorTo(drawSpaceToGlobal(m, centre), true);
         }
+        // The pointer arrives wearing whatever the DESKTOP last put on it — an
+        // ew-resize from a window edge, a text caret, a client's own cursor
+        // (Max, 2026-09-03: "if im resizing and i call overview, the pointer
+        // goes to the window but on resize shape"). Wipe it to the arrow and
+        // drop the cache with it, so the hover logic below cannot look at a
+        // cache that says "nothing of ours is set" and conclude there is
+        // nothing to change.
+        setOverviewCursor(nullptr, /*force=*/true);
         // Land fully arrived: the hover border, the topbar pill and the cursor
         // shape all describe where the pointer now is, not where it came from.
         updateHoverAt(m, cursorDrawSpace(m));
@@ -2491,7 +2504,11 @@ static void toggle() {
         // "overview opens sometimes with no pointer". Unhide and pin the
         // default arrow for the overview's lifetime.
         g_pHyprRenderer->setCursorHidden(false);
-        g_pCursorManager->setCursorFromName("left_ptr");
+        // Through the one owner, forced: the overview is taking the pointer
+        // over, and whatever shape the desktop had on it (a resize arrow from
+        // a window edge, a client's caret) is not ours and must not survive
+        // into the grid.
+        setOverviewCursor(nullptr, /*force=*/true);
         // …and then hide it again for exactly as long as it is being moved, so
         // the relocation is never seen. Ordered after the unhide above on
         // purpose: that call is what guarantees there IS a cursor to show when
@@ -2667,7 +2684,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.38"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.39"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
