@@ -177,8 +177,15 @@ static bool         g_warpPending = false;  // still owed a warp this open
 static bool         g_warpHidCursor = false; // we are the ones hiding it
 static Vector2D     g_warpFromCursor;       // where the pointer sat at open
 // Deliberate pointer motion during the zoom cancels the warp: if the hand is
-// already driving, yanking the cursor away is worse than not helping.
-static constexpr double WARP_CANCEL_SLOP = 8.0;
+// already driving, yanking the cursor away is worse than not helping. But the
+// whole pending window is ANIM_SECONDS (~280 ms) during which the pointer is
+// HIDDEN — nobody is aiming a pointer they cannot see. At 8 px, touchpad noise
+// (finger-lift, a resting palm, the pad's own settling) cancelled gesture
+// opens at random and the feature read as unreliable (Max, 2026-09-03: "it
+// works sometimes, sometimes it does not"). Consistency IS the feature; the
+// cancel only needs to catch a genuine flick — a hand demonstrably going
+// somewhere — so the threshold is a flick, not a jitter.
+static constexpr double WARP_CANCEL_SLOP = 150.0;
 // …but the 3-finger swipe OPENS the overview mid-gesture, with the fingers
 // still on the pad — lifting them delivers residual pointer motion that is
 // part of *invoking*, not of aiming, and it was cancelling the warp every
@@ -1347,14 +1354,19 @@ static void onMouseMove(Vector2D, Event::SCallbackInfo& info) {
         return; // the machinery's own cursor warps must not feed back into it
     // The hand is already driving: drop the open warp rather than yank the
     // pointer out from under a gesture the user has started.
-    if (g_warpPending && (g_pInputManager->getMouseCoordsInternal() - g_warpFromCursor).size() > WARP_CANCEL_SLOP) {
-        if (g_swipeLive || Time::steadyNow() - g_swipeEndAt < SWIPE_SETTLE) {
-            // Finger-lift jitter from the swipe that opened us: not aiming.
-            g_warpFromCursor = g_pInputManager->getMouseCoordsInternal();
-        } else {
-            g_warpPending = false;
-            g_warpWin.reset();
-            endWarpHide(); // a moving pointer must be visible, immediately
+    if (g_warpPending) {
+        const double moved = (g_pInputManager->getMouseCoordsInternal() - g_warpFromCursor).size();
+        if (moved > WARP_CANCEL_SLOP) {
+            if (g_swipeLive || Time::steadyNow() - g_swipeEndAt < SWIPE_SETTLE) {
+                // Finger-lift jitter from the swipe that opened us: not aiming.
+                trace("open warp: rebaseline (moved=%.0f, swipe)", moved);
+                g_warpFromCursor = g_pInputManager->getMouseCoordsInternal();
+            } else {
+                trace("open warp: CANCELLED (moved=%.0f, flick)", moved);
+                g_warpPending = false;
+                g_warpWin.reset();
+                endWarpHide(); // a moving pointer must be visible, immediately
+            }
         }
     }
     if (g_resizing) {
@@ -2570,6 +2582,11 @@ static void toggle() {
         g_warpWin        = Desktop::focusState()->window();
         g_warpPending    = g_warpWin.lock() != nullptr;
         g_warpFromCursor = g_pInputManager->getMouseCoordsInternal();
+        // The one silent way to get no warp at all is opening with nothing
+        // focused (a bare workspace, focus on a layer) — name it in the log so
+        // "it didn't move" is always attributable.
+        trace("open: warp %s (swipeLive=%d)", g_warpPending ? "armed" : "SKIPPED - no focused window",
+              (int)g_swipeLive);
         captureWorkspaces(m); // snapshot on open, outside the render pass
         // The pointer must exist over the overview: the capture's workspace
         // juggling can leave the cursor surfaceless (shouldRenderCursor
@@ -2760,7 +2777,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.45"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.46"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
