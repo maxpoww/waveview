@@ -1937,11 +1937,52 @@ static void setOverviewCursor(const char* shape, bool force = false) {
     }
 }
 
+// Hover shapes change only once the pointer has MEANT the new zone for a
+// beat. The trace from a real session (2026-09-03) showed a card crossing
+// flick grab → ew-resize → pointer → ew-resize → grab within 35 ms — four
+// cursor repaints nobody asked for, reading as the pointer glitching
+// ("keeps failing every once in a while"). A 60 ms dwell swallows transit
+// flicker entirely, while a genuine rest in any zone still gets its shape
+// faster than a human notices the wait. The closed hand (drag feedback) and
+// the open-warp landing bypass the dwell — those must be instant.
+static std::string     g_shapeWant;           // desired shape; "" = the arrow
+static bool            g_shapeWantSet = false;
+static Time::steady_tp g_shapeWantAt{};
+static constexpr auto  SHAPE_DWELL = std::chrono::milliseconds(60);
+
+static void settleCursor(const char* shape) {
+    const std::string want = shape ? shape : "";
+    if (want == g_edgeShape) { // already worn — nothing pending
+        g_shapeWantSet = false;
+        return;
+    }
+    if (!g_shapeWantSet || g_shapeWant != want) {
+        g_shapeWant    = want;
+        g_shapeWantSet = true;
+        g_shapeWantAt  = Time::steadyNow();
+        return; // keep the current shape until the new one persists
+    }
+    if (Time::steadyNow() - g_shapeWantAt >= SHAPE_DWELL) {
+        g_shapeWantSet = false;
+        setOverviewCursor(want.empty() ? nullptr : want.c_str());
+    }
+}
+
+// Motion stops mid-dwell → no more events to confirm the want; the render
+// loop ticks it so a rest always gets its shape.
+static void tickCursorSettle() {
+    if (g_shapeWantSet && Time::steadyNow() - g_shapeWantAt >= SHAPE_DWELL) {
+        g_shapeWantSet = false;
+        setOverviewCursor(g_shapeWant.empty() ? nullptr : g_shapeWant.c_str());
+    }
+}
+
 // While dragging, re-assert the closed hand on a throttle rather than on
 // every motion event (a fast mouse delivers hundreds a second, and each
 // re-assert re-renders the cursor).
 static std::chrono::steady_clock::time_point g_handReassert{};
 static void                                  holdGrabbingCursor() {
+    g_shapeWantSet = false; // a pending hover want must not overwrite the drag hand
     const auto now = std::chrono::steady_clock::now();
     if (now - g_handReassert < std::chrono::milliseconds(60)) {
         setOverviewCursor("grabbing");
@@ -2012,7 +2053,7 @@ static void updateHoverAt(PHLMONITOR m, const Vector2D& c) {
             }
     if (shape) {
         g_edgeWin = hov;
-        setOverviewCursor(shape);
+        settleCursor(shape);
         return;
     }
     g_edgeWin.reset();
@@ -2028,13 +2069,13 @@ static void updateHoverAt(PHLMONITOR m, const Vector2D& c) {
     // so its edge shape is left standing rather than overwritten.)
     // (A window drag returned above; this reaches an empty-tile drag.)
     if (g_dragMoved && g_pressTile >= 0)
-        holdGrabbingCursor();
+        holdGrabbingCursor(); // immediate: drag feedback never waits
     else if (hov.lock())
-        setOverviewCursor("grab");
+        settleCursor("grab");
     else if (tileAt(m, c) >= 0)
-        setOverviewCursor("pointer");
+        settleCursor("pointer");
     else
-        setOverviewCursor(nullptr);
+        settleCursor(nullptr);
 }
 
 // Scroll while open flips between the two pages, clamped — never a loop.
@@ -2288,6 +2329,11 @@ static void warpToOpeningWindow() {
         // input stack yet, and hovering the OLD point put the plain arrow on a
         // pointer sitting squarely on a thumbnail (should be the open hand).
         updateHoverAt(m, centre);
+        tickCursorSettle(); // the landing shape is applied NOW, not a dwell later
+        if (g_shapeWantSet) {
+            g_shapeWantSet = false;
+            setOverviewCursor(g_shapeWant.empty() ? nullptr : g_shapeWant.c_str());
+        }
         endWarpHide(); // shown only now — with the right shape, in the right place
         damageAll();
         // Traced together because they are one story: what the desktop had put
@@ -2313,8 +2359,10 @@ static void onRender(eRenderStage stage) {
     // compositor's border icon between events (a refocus, a warp, a layout
     // change — not everything arrives as pointer motion) is undone within a
     // frame. Only while we own the pointer; the close animation hands it back.
-    if (g_animTarget > 0.5f)
+    if (g_animTarget > 0.5f) {
         reassertOverviewCursor();
+        tickCursorSettle(); // a rest mid-dwell still gets its shape
+    }
 
     // Advance the zoom animation by wall-clock dt (guard first-frame / stalls).
     const auto now = Time::steadyNow();
@@ -2547,7 +2595,8 @@ static void closeOverview() {
     // Closed before the zoom ever settled (Escape on the way in): drop the
     // warp we still owe and give the pointer back. Nothing may leave this
     // function with a hidden cursor.
-    g_warpPending = false;
+    g_warpPending  = false;
+    g_shapeWantSet = false; // no dwelled shape may land after the close
     g_warpWin.reset();
     endWarpHide();
     endRealResize();   // sizes applied live are final; just settle
@@ -2793,7 +2842,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.48"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.49"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
@@ -2809,7 +2858,8 @@ APICALL EXPORT void PLUGIN_EXIT() {
     }
     // Unloaded mid-open-warp: hand the pointer back before our code is gone,
     // or the session is left with an invisible cursor and no one to restore it.
-    g_warpPending = false;
+    g_shapeWantSet = false;
+    g_warpPending  = false;
     g_warpWin.reset();
     endWarpHide();
     g_active     = false;
