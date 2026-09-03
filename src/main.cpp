@@ -1842,7 +1842,27 @@ static void resetEdgeCursor() {
 // during a real drag: the compositor's own drag machinery sets the cursor
 // too, so our cached name goes stale and the shape silently reverts to the
 // arrow while the cache still says "grabbing" (Max, 2026-09-01).
+// Hyprland has its OWN cursor state for "the pointer is on a window border":
+// `CInputManager::m_borderIconDirection`, applied by setCursorIconOnBorder and
+// re-asserted from the compositor's own motion handling. It is not our cache
+// and not the theme name we set, so setting a shape over it does nothing — the
+// resize arrow simply comes back, which is why the pointer kept arriving in the
+// overview still wearing it (Max, 2026-09-03, twice). Clearing the direction is
+// the only thing that actually releases it.
+// setBorderCursorIcon() itself is not exported from the Hyprland binary (the
+// plugin failed to load with an undefined symbol), so the direction is cleared
+// by writing the member — reachable through the private/public hack at the top
+// of this file, and no symbol needed. Clearing it does not repaint on its own;
+// it stops the compositor re-asserting, and the shape we set next is what stays.
+static void clearBorderResizeIcon() {
+    if (g_pInputManager)
+        g_pInputManager->m_borderIconDirection = BORDERICON_NONE;
+}
+
 static void setOverviewCursor(const char* shape, bool force = false) {
+    // Whatever we are about to put on the pointer, the compositor's border
+    // icon outranks it — drop that first or it wins the next frame.
+    clearBorderResizeIcon();
     if (!shape) {
         // `force` matters here too: the cache only knows about shapes WE set,
         // so an empty cache does not mean the pointer is wearing the arrow —
@@ -2194,13 +2214,21 @@ static void warpToOpeningWindow(PHLMONITOR m) {
         // drop the cache with it, so the hover logic below cannot look at a
         // cache that says "nothing of ours is set" and conclude there is
         // nothing to change.
+        const int borderIconWas = g_pInputManager ? (int)g_pInputManager->m_borderIconDirection : -1;
         setOverviewCursor(nullptr, /*force=*/true);
         // Land fully arrived: the hover border, the topbar pill and the cursor
         // shape all describe where the pointer now is, not where it came from.
-        updateHoverAt(m, cursorDrawSpace(m));
+        // Hover from the point we just warped TO, not from a re-read of the
+        // mouse coords — the warp may not have propagated back through the
+        // input stack yet, and hovering the OLD point put the plain arrow on a
+        // pointer sitting squarely on a thumbnail (should be the open hand).
+        updateHoverAt(m, centre);
         endWarpHide(); // shown only now — with the right shape, in the right place
         damageAll();
-        trace("open warp -> ws=%d", (int)w->workspaceID());
+        // Traced together because they are one story: what the desktop had put
+        // on the pointer, and what the overview decided instead.
+        trace("open warp -> ws=%d borderIconWas=%d shape='%s' hover=%d", (int)w->workspaceID(), borderIconWas,
+              g_edgeShape.empty() ? "left_ptr" : g_edgeShape.c_str(), (int)(g_hoverWin.lock() != nullptr));
         return;
     }
     // No thumbnail for it (fullscreen, a special workspace, off-grid): leave
@@ -2684,7 +2712,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.39"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.43"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
