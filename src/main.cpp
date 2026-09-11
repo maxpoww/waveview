@@ -33,6 +33,7 @@
 #include <hyprland/src/render/pass/RectPassElement.hpp>
 #include <hyprland/src/render/pass/TexPassElement.hpp>
 #include <hyprland/src/render/pass/BorderPassElement.hpp>
+#include <hyprland/src/config/ConfigValue.hpp>
 #include <hyprland/src/managers/XWaylandManager.hpp>
 #include <hyprland/src/desktop/state/FocusState.hpp>
 #include <hyprland/src/managers/animation/DesktopAnimationManager.hpp>
@@ -83,11 +84,36 @@ static constexpr double DSN_TOP_GAP    = 12.0; // below the bar
 static constexpr double DSN_TILE_ROUND = 28.0; // hover/drop frame corners
 static constexpr double DSN_WIN_ROUND  = 20.0; // window mini corners
 static constexpr double DSN_WIN_GAP    = 0.028; // in-tile gap, fraction of tile
-// Overview borders mirror the DESKTOP's window borders (hyprland.lua:
-// general.border_size 3, active color #ffbe98) — same thickness on every
-// window regardless of its size, same amber, per Max.
+// Overview borders mirror the DESKTOP's window borders — same thickness on
+// every window regardless of its size, per Max. The desktop's border is no
+// longer a fixed amber: waverunner pushes `general:col.active_border` as a
+// live gradient of the screen's own sampled colours, so the overview reads
+// THAT (see activeBorderGradient) rather than a baked constant, and the two
+// can never drift (Max, 2026-09-11: "the overview tiles border ... match
+// dynamically too"). The constant stays as the fallback for a compositor
+// whose config read fails.
 static constexpr double     DSN_BORDER_W = 3.0; // logical, scaled at use
 static const CHyprColor     DSN_BORDER_COL{1.0, 0.745, 0.596, 1.0};   // #ffbe98
+
+// The compositor's LIVE active-border gradient — the very object the desktop
+// draws its own window borders from (Window.cpp reads it exactly this way),
+// so the overview inherits the colours, the stop count AND the angle for
+// free, including whatever waverunner pushed a moment ago.
+//
+// nullptr whenever the value is missing, is not a gradient, or carries no
+// colours; callers then fall back to the flat DSN_BORDER_COL. This runs
+// inside the render hook, where a wrong colour is cosmetic but a null deref
+// ends the session — hence a check at every step rather than a bare cast.
+static Config::CGradientValueData* activeBorderGradient() {
+    static CConfigValue<Config::IComplexConfigValue> s_col("general:col.active_border");
+    if (!s_col.good() || !s_col.m_p) // ptr() dereferences m_p unconditionally
+        return nullptr;
+    auto* const v = s_col.ptr();
+    if (!v || v->getDataType() != Config::CVD_TYPE_GRADIENT)
+        return nullptr;
+    auto* const grad = static_cast<Config::CGradientValueData*>(v);
+    return grad->m_colors.empty() ? nullptr : grad;
+}
 
 inline HANDLE              PHANDLE = nullptr;
 static bool                g_active = false;
@@ -944,14 +970,36 @@ static void drawOverview(PHLMONITOR m, float p, int zoomTile) {
         }
         g_pHyprRenderer->m_renderPass.add(makeUnique<CTexPassElement>(td));
     };
-    // A rounded border, drawn as a filled rounded rect *behind* the window:
-    // the texture (rounded to `round`) covers the interior, leaving a ring.
-    // CONSTANT width matching the desktop's borders — never proportional
-    // (small windows used to get thin halos).
+    // A rounded border around the window mini. CONSTANT width matching the
+    // desktop's borders — never proportional (small windows used to get thin
+    // halos).
+    //
+    // Drawn with the compositor's OWN border pass, from the live
+    // `general:col.active_border` gradient, so an overview ring is the same
+    // paint as the ring around the real window — gradient, stops and angle
+    // included. `renderBorder` grows the box outward by borderSize (and
+    // scales that by the monitor scale itself, so it takes the LOGICAL
+    // width), leaving the interior for the thumbnail: same footprint the old
+    // filled-rect halo had.
+    //
+    // Without a readable gradient, fall back to that old halo in flat amber:
+    // a filled rounded rect *behind* the window, the texture covering its
+    // interior and leaving a ring.
     const double bw = DSN_BORDER_W * m->m_scale;
     auto         haloBorder = [&](const CBox& box, int round) {
-        renderRect(CBox{box.x - bw, box.y - bw, box.w + 2.0 * bw, box.h + 2.0 * bw}, DSN_BORDER_COL,
-                   round + (int)std::lround(bw));
+        auto* const grad = activeBorderGradient();
+        if (!grad) {
+            renderRect(CBox{box.x - bw, box.y - bw, box.w + 2.0 * bw, box.h + 2.0 * bw}, DSN_BORDER_COL,
+                       round + (int)std::lround(bw));
+            return;
+        }
+        CBorderPassElement::SBorderData bd;
+        bd.box        = box;
+        bd.grad1      = *grad;
+        bd.round      = round;
+        bd.borderSize = (int)std::lround(DSN_BORDER_W);
+        bd.a          = 1.F;
+        g_pHyprRenderer->m_renderPass.add(makeUnique<CBorderPassElement>(std::move(bd)));
     };
 
     const auto hoverW = g_hoverWin.lock();
