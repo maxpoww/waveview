@@ -2610,7 +2610,18 @@ static void closeOverview() {
     damageAll();
 }
 
+// While Golem's STAGE mode owns the screen (one task, the deck, the OPTIONS bar
+// and nothing else), the overview must not be reachable at all. waverunner sets
+// this over `hl.plugin.waveview.set_stage(...)` as it enters and leaves.
+//
+// Unbinding Super+R on the Hyprland side is not enough on its own: the 3-finger
+// swipe is handled HERE, inside the plugin, and never passes through the bind
+// system. Guarding at `toggle()` covers every route into the overview at once.
+static bool g_stageMode = false;
+
 static void toggle() {
+    if (g_stageMode)
+        return; // the stage owns the screen
     const bool opening = g_animTarget < 0.5f; // currently closed/closing -> open
     // The Super+R tour: pressed while open, and the other page holds
     // windows we haven't visited → flip there instead of closing. A third
@@ -2699,7 +2710,13 @@ static void onSwipeBegin(IPointer::SSwipeBeginEvent e, Event::SCallbackInfo& inf
     g_swipeAcc     = Vector2D(0.0, 0.0);
     g_swipeFired   = false;
     g_swipeLive    = true; // motion until the fingers leave belongs to the gesture
-    if (g_active)
+    // STAGE mode eats every swipe, in BOTH axes. Vertical would open the
+    // overview from here; horizontal is passed through untouched below and the
+    // compositor's own `hl.gesture` turns it into a workspace change — and that
+    // gesture cannot be unregistered from Lua at all (no unregister exists,
+    // re-registering is refused, `action = "none"` is rejected). Consuming it
+    // here is the only place either can actually be stopped.
+    if (g_active || g_stageMode)
         info.cancelled = true;
 }
 
@@ -2710,6 +2727,10 @@ static void onSwipeBegin(IPointer::SSwipeBeginEvent e, Event::SCallbackInfo& inf
 static void onSwipeUpdate(IPointer::SSwipeUpdateEvent e, Event::SCallbackInfo& info) {
     if (g_active)
         info.cancelled = true; // overview owns the trackpad while open
+    if (g_stageMode) {
+        info.cancelled = true; // stage owns the trackpad: no overview, no ws swipe
+        return;
+    }
     if (g_swipeFingers != 3 || g_swipeFired)
         return;
     g_swipeAcc += e.delta;
@@ -2725,7 +2746,7 @@ static void onSwipeUpdate(IPointer::SSwipeUpdateEvent e, Event::SCallbackInfo& i
 }
 
 static void onSwipeEnd(IPointer::SSwipeEndEvent, Event::SCallbackInfo& info) {
-    if (g_active)
+    if (g_active || g_stageMode)
         info.cancelled = true;
     g_swipeFingers = 0;
     g_swipeFired   = false;
@@ -2823,6 +2844,276 @@ static int luaToggle(lua_State*) {
     return 0;
 }
 
+// ---- Deck thumbnails for Golem's STAGE mode --------------------------------
+//
+// waverunner draws the stage's deck in its own process, so it cannot reach
+// these textures — this is the one place a capture leaves the compositor.
+//
+// It exists because the client-side alternatives are all worse for the job.
+// `grim` can only photograph what is on screen, so a tile stayed blank until
+// its task had been staged at least once, and every capture cost a subprocess
+// plus a PNG encode and decode. The capture protocols
+// (`hyprland_toplevel_export`, `ext_image_copy_capture`) can reach an unmapped
+// window but hand back a full-resolution frame, ~95% of which is thrown away to
+// fill a 256px tile. Here the GPU does the downscale as part of the blit and
+// only the tile comes back — a couple of hundred KB instead of tens of MB.
+//
+// Called twice per visit (arrival and departure), never on a timer: the deck is
+// a working surface, not a live view. That is also what makes the whole thing
+// affordable — the overview, which *is* live, had to be throttled to
+// REFRESH_MS with dirty-tile masking to stay smooth.
+static PHLWINDOW windowByAddr(const std::string& addrStr) {
+    for (auto& w : g_pCompositor->m_windows) {
+        if (!w || !w->m_isMapped || w->isHidden())
+            continue;
+        if (std::format("0x{:x}", (uintptr_t)w.get()) == addrStr)
+            return w;
+    }
+    return {};
+}
+
+/// Blit one already-cropped window texture down into `out` and read it back.
+///
+/// `out` is reused across a batch: it is the same size for every tile, so
+/// allocating it per window would be pure churn — the same churn that, in the
+/// overview's own capture loop, "churned the driver into a progressive mid-drag
+/// slowdown".
+static bool blitAndRead(PHLMONITOR m, SP<Render::IFramebuffer> src, SP<Render::IFramebuffer> out, int size,
+                        double tileAspect, std::vector<uint8_t>& px) {
+    const auto srcTex = src ? src->getTexture() : nullptr;
+    if (!srcTex)
+        return false;
+
+    // Mipmap the source before the blit. This is a ~12x reduction (a
+    // monitor-resolution crop into a 256px tile) and plain GL_LINEAR
+    // minification samples only 2x2 texels, which turns text into aliased mush —
+    // that was the whole of the "quality sucks" problem, not the resolution.
+    // Restored afterwards: the texture belongs to the overview, which draws it
+    // at a gentler scale and wants its own filtering back.
+    const GLenum prevMin = srcTex->minFilter;
+    bool         mipped  = false;
+    glBindTexture(GL_TEXTURE_2D, srcTex->m_texID);
+    while (glGetError() != GL_NO_ERROR) {}
+    glGenerateMipmap(GL_TEXTURE_2D);
+    if (glGetError() == GL_NO_ERROR) {
+        mipped            = true;
+        srcTex->minFilter = GL_LINEAR_MIPMAP_LINEAR;
+        srcTex->setTexParameter(GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    }
+    glBindTexture(GL_TEXTURE_2D, 0);
+
+    // The atlas layer is square and the tile stretches it back out to the tile's
+    // aspect. Filling the whole square therefore makes EVERY window come out
+    // looking like the tile's shape, whatever shape it actually is: a staged
+    // window (1.84) came out 15% too wide, and a tall half-screen window (0.82)
+    // came out nearly 2:1 wrong. That is the "broken thumbnail".
+    //
+    // So the window is drawn into a sub-rect of the square whose aspect is
+    // `source / tile` — after the tile's stretch that lands back at the source's
+    // true aspect. What is left over stays transparent and the tile's own dark
+    // body shows through, which is the right backdrop anyway.
+    const double srcA  = srcTex->m_size.y > 0 ? (double)srcTex->m_size.x / (double)srcTex->m_size.y : 1.0;
+    const double want  = tileAspect > 0.0 ? srcA / tileAspect : 1.0;
+    double       destW = size, destH = size;
+    if (want >= 1.0)
+        destH = (double)size / want;
+    else
+        destW = (double)size * want;
+    const CBox dest{(size - destW) / 2.0, (size - destH) / 2.0, destW, destH};
+
+    CRegion fakeDamage{0, 0, INT16_MAX, INT16_MAX};
+    g_pHyprRenderer->beginRender(m, fakeDamage, Render::RENDER_MODE_FULL_FAKE, nullptr, out);
+    glClearColor(0.0F, 0.0F, 0.0F, 0.0F);
+    glClear(GL_COLOR_BUFFER_BIT);
+    Render::GL::CHyprOpenGLImpl::STextureRenderData td;
+    Render::GL::g_pHyprOpenGL->renderTexture(srcTex, dest, td);
+    g_pHyprRenderer->m_renderData.blockScreenShader = true;
+    // endRender first: the render pass is not submitted until it runs, so
+    // anything read before it is the cleared framebuffer, not the blit.
+    g_pHyprRenderer->endRender();
+
+    if (mipped) {
+        srcTex->minFilter = prevMin;
+        glBindTexture(GL_TEXTURE_2D, srcTex->m_texID);
+        srcTex->setTexParameter(GL_TEXTURE_MIN_FILTER, prevMin);
+        glBindTexture(GL_TEXTURE_2D, 0);
+    }
+
+    // Then read through an FBO of our own, wrapping the result texture. Going
+    // via the framebuffer's own binding after endRender fails with
+    // GL_INVALID_FRAMEBUFFER_OPERATION — by then Hyprland has torn its binding
+    // down — and this owes nothing to that lifecycle.
+    px.assign((size_t)size * size * 4, 0);
+    Render::GL::g_pHyprOpenGL->makeEGLCurrent();
+    const auto tex = out->getTexture();
+    GLuint     fbo = 0;
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex ? tex->m_texID : 0, 0);
+    while (glGetError() != GL_NO_ERROR) {} // drop errors left by earlier passes, so the one below is ours
+    const GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    if (status == GL_FRAMEBUFFER_COMPLETE)
+        glReadPixels(0, 0, size, size, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+    const GLenum glErr = glGetError();
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDeleteFramebuffers(1, &fbo);
+    if (status != GL_FRAMEBUFFER_COMPLETE || glErr != GL_NO_ERROR) {
+        trace("deck-capture: readback failed status=0x%x glErr=0x%x", status, glErr);
+        return false;
+    }
+    return true;
+}
+
+/// Written to a temp and renamed, so a reader can never open a half-written
+/// file — it looks for the path rather than being signalled.
+static bool writeRaw(const std::string& path, const std::vector<uint8_t>& px) {
+    const std::string tmp = path + ".part";
+    FILE*             f   = fopen(tmp.c_str(), "wb");
+    if (!f)
+        return false;
+    const bool ok = fwrite(px.data(), 1, px.size(), f) == px.size();
+    fclose(f);
+    if (!ok || rename(tmp.c_str(), path.c_str()) != 0) {
+        unlink(tmp.c_str());
+        return false;
+    }
+    return true;
+}
+
+/// Capture a whole set of windows in **one** workspace pass.
+///
+/// This is the point of the batch form. `captureWorkspaces` renders every tile
+/// in its mask together and `captureWindows` then crops all of them, so asking
+/// for eight tiles costs about what asking for one does — whereas eight separate
+/// `capture_window` calls pay the monitor-resolution workspace render eight
+/// times over. Filling the deck when the mode opens is only affordable this way.
+///
+/// Each window is written to `<dir>/<addr>.rgba`. Returns how many landed.
+static int captureDeckToDir(const std::string& addrsCsv, int size, double tileAspect, const std::string& dir) {
+    if (size <= 0 || size > 1024)
+        return 0;
+
+    struct Want {
+        std::string addr;
+        PHLWINDOW   win;
+    };
+    std::vector<Want> wants;
+    uint32_t          mask = 0;
+    PHLMONITOR        m;
+    for (size_t at = 0; at <= addrsCsv.size();) {
+        const size_t end  = std::min(addrsCsv.find(',', at), addrsCsv.size());
+        const auto   addr = addrsCsv.substr(at, end - at);
+        at                = end + 1;
+        if (addr.empty())
+            continue;
+        const auto w = windowByAddr(addr);
+        if (!w)
+            continue;
+        const auto wm = g_pCompositor->getMonitorFromID(w->monitorID());
+        if (!wm)
+            continue;
+        // One monitor per pass: the workspace snapshots are rendered for a
+        // specific output and a tile is only valid on that one.
+        if (!m)
+            m = wm;
+        else if (m != wm)
+            continue;
+        wants.push_back({addr, w});
+    }
+    if (wants.empty() || !m)
+        return 0;
+
+    // Context first: allocating a framebuffer is a GL call, and doing it before
+    // the context is current leaves it unallocated — which then shows up much
+    // later as GL_INVALID_FRAMEBUFFER_OPERATION on the read, not at the alloc.
+    Render::GL::g_pHyprOpenGL->makeEGLCurrent();
+    auto out = g_pHyprRenderer->createFB("waveview-deck");
+    if (!out->alloc(size, size, DRM_FORMAT_ABGR8888) || !out->isAllocated()) {
+        trace("deck-capture: alloc %dx%d failed", size, size);
+        return 0;
+    }
+    // One scratch framebuffer for the whole batch, resized as windows differ.
+    auto scratch = g_pHyprRenderer->createFB("waveview-deck-src");
+
+    std::vector<uint8_t> px;
+    int                  done = 0;
+    for (const auto& want : wants) {
+        // Render the WINDOW, not a slice of its workspace.
+        //
+        // The overview's per-window crops are cut out of a whole-workspace
+        // snapshot, which cannot work here: while the stage is up a task's
+        // siblings are covered by the maximized staged window, so their pixels
+        // in that snapshot are the *staged* window's. `captureWindows` knows
+        // this and deliberately keeps the last clean crop for an overlapped
+        // window — the overview then cover-crops it when drawing, but a
+        // thumbnail blitted straight from it comes out at the wrong scale and
+        // offset. That was the "uncentered and too big" tile: a stale crop of a
+        // window that had since changed size.
+        //
+        // Rendering the window on its own has no such problem, needs no
+        // workspace snapshot at all (so no monitor-resolution framebuffer per
+        // workspace), and works for a window on any workspace — including one
+        // the grid does not map.
+        const auto box = want.win->getWindowMainSurfaceBox();
+        const int  pw  = (int)std::round(box.w * m->m_scale);
+        const int  ph  = (int)std::round(box.h * m->m_scale);
+        if (pw < 1 || ph < 1)
+            continue;
+        if (scratch->m_size != Vector2D(pw, ph)) {
+            scratch->release();
+            if (!scratch->alloc(pw, ph, DRM_FORMAT_ABGR8888))
+                continue;
+        }
+
+        CRegion fakeDamage{0, 0, INT16_MAX, INT16_MAX};
+        g_pHyprRenderer->m_bBlockSurfaceFeedback = true; // a thumbnail must not drive the client's frame clock
+        g_pHyprRenderer->beginRender(m, fakeDamage, Render::RENDER_MODE_FULL_FAKE, nullptr, scratch);
+        glClearColor(0.0F, 0.0F, 0.0F, 0.0F);
+        glClear(GL_COLOR_BUFFER_BIT);
+        // `ignorePosition` puts it at the origin rather than wherever it lives,
+        // and `standalone` leaves off the border and shadow — a tile draws its
+        // own frame.
+        g_pHyprRenderer->renderWindow(want.win, m, Time::steadyNow(), false, Render::RENDER_PASS_MAIN, true, true);
+        g_pHyprRenderer->m_renderData.blockScreenShader = true;
+        g_pHyprRenderer->endRender();
+        g_pHyprRenderer->m_bBlockSurfaceFeedback = false;
+
+        if (!blitAndRead(m, scratch, out, size, tileAspect, px))
+            continue;
+        if (writeRaw(dir + "/" + want.addr + ".rgba", px))
+            ++done;
+    }
+    scratch->release();
+    out->release();
+    return done;
+}
+
+// `hl.plugin.waveview.capture_deck(addrs, size, tile_aspect, dir)` — `addrs` is a
+// comma-separated list of window addresses; each lands at `<dir>/<addr>.rgba` as
+// `size`×`size` raw RGBA. Returns how many were written. Best effort by
+// contract: the deck falls back to a title-only tile, never to an error.
+static int luaCaptureDeck(lua_State* L) {
+    const char* addrs = lua_tostring(L, 1);
+    const int   size  = (int)lua_tointeger(L, 2);
+    const double aspect = lua_tonumber(L, 3);
+    const char*  dir    = lua_tostring(L, 4);
+    int          n      = 0;
+    if (addrs && dir)
+        n = captureDeckToDir(addrs, size, aspect, dir);
+    lua_pushinteger(L, n);
+    return 1;
+}
+
+// `hl.plugin.waveview.set_stage(true|false)` — waverunner tells us when Golem's
+// STAGE mode owns the screen. Entering also shuts the overview if it happens to
+// be open, so the stage never comes up underneath it.
+static int luaSetStage(lua_State* L) {
+    g_stageMode = lua_toboolean(L, 1) != 0;
+    if (g_stageMode && g_active)
+        closeOverview();
+    return 0;
+}
+
 APICALL EXPORT std::string PLUGIN_API_VERSION() {
     return HYPRLAND_API_VERSION;
 }
@@ -2836,6 +3127,8 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     // happens at keypress (plugin loads after config eval):
     //   hl.bind(mainMod .. " + G", function() hl.plugin.waveview.toggle() end)
     HyprlandAPI::addLuaFunction(handle, "waveview", "toggle", luaToggle);
+    HyprlandAPI::addLuaFunction(handle, "waveview", "set_stage", luaSetStage);
+    HyprlandAPI::addLuaFunction(handle, "waveview", "capture_deck", luaCaptureDeck);
     g_renderListener = Event::bus()->m_events.render.stage.listen([](eRenderStage s) { onRender(s); });
     g_keyListener    = Event::bus()->m_events.input.keyboard.key.listen(onKey);
     g_moveListener   = Event::bus()->m_events.input.mouse.move.listen(onMouseMove);
@@ -2854,7 +3147,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.50"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.67"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
