@@ -52,6 +52,9 @@
 #undef private
 #undef protected
 
+// Golem's titlebars for floating windows (a stripped fork of hyprbars).
+#include "hyprbars/bars.hpp"
+
 extern "C" {
 #include <lua.h>
 }
@@ -126,6 +129,7 @@ static CHyprSignalListener g_swipeBeginListener;  // 3-finger swipe up/down togg
 static CHyprSignalListener g_swipeUpdateListener;
 static CHyprSignalListener g_swipeEndListener;
 static CHyprSignalListener g_axisListener; // wheel while open scrolls the 3x6 grid (see onMouseAxis)
+static CHyprSignalListener g_windowOpenListener; // gives each new window its (floating-only) titlebar — see src/hyprbars/
 static SP<CEventLoopTimer> g_liveTimer; // re-arms every REFRESH_MS while open to keep thumbnails live
 static SP<CEventLoopTimer> g_dragCheckTimer; // one-shot after a button event: the compositor's drag state settles around our listener
 static SP<CEventLoopTimer> g_handTimer;      // one-shot: the open hand shown at press closes shortly after
@@ -365,6 +369,18 @@ static uint32_t         g_swipeFingers = 0;
 static Vector2D         g_swipeAcc;
 static bool             g_swipeFired   = false;
 static constexpr double SWIPE_TRIGGER  = 120.0; // accumulated px of vertical travel
+
+// While Golem's STAGE owns the screen the same 3/4-finger swipe walks the
+// border along its deck instead of changing workspace, and waverunner stages
+// whatever it lands on when the fingers leave. We only report travel: how far a
+// tile is, and which tile that makes, is the deck's business.
+static bool             g_stageSwipe     = false; // this gesture belongs to the deck
+static double           g_stageSwipeDx   = 0.0;   // total travel, positive rightward
+static double           g_stageSwipeSent = 0.0;   // travel at the last message
+// Travel between messages. Finer than the deck's own per-tile distance so the
+// border never lags a tile behind the fingers, coarse enough that a long swipe
+// is a dozen messages rather than a hundred.
+static constexpr double STAGE_SWIPE_GRAIN = 25.0;
 
 static double mix(double a, double b, double t) {
     return a + (b - a) * t;
@@ -2476,7 +2492,10 @@ static void onRender(eRenderStage stage) {
 // Takes the message BY VALUE and moves it into the thread: callers build
 // verbs with payloads (titles, sizes) in temporaries, and a captured
 // `const char*` into one of those would dangle before the write.
-static void sendWaverunner(std::string msg) {
+// Not static: Golem's titlebars (src/hyprbars/) send through it too — a button
+// there is a Golem action, so it goes to the daemon rather than to the
+// compositor.
+void sendWaverunner(std::string msg) {
     std::thread([msg = std::move(msg)] {
         const char* rt = getenv("XDG_RUNTIME_DIR");
         if (!rt)
@@ -2535,20 +2554,25 @@ static void onHandTimer(SP<CEventLoopTimer> self, void*) {
 // is being resized. Both are fire-and-forget verbs; the resize stream is
 // throttled because it rides pointer motion (one socket write per motion
 // event would be one detached thread per event).
-static std::string                                 g_sentHoverTitle;
+static std::string                                 g_sentHoverLine;
 static bool                                        g_sentHoverValid = false;
 static std::string                                 g_sentSize;
 static std::chrono::steady_clock::time_point       g_sizeSentAt{};
 static constexpr std::chrono::milliseconds         SIZE_SEND_EVERY{50};
 
 static void sendOverviewHover(PHLWINDOW w) {
-    const std::string title = w ? w->m_title : std::string{};
-    if (g_sentHoverValid && title == g_sentHoverTitle)
+    // The ADDRESS rides in front of the title. The pill only ever needed the
+    // words, but the daemon needs to know which window they belong to: entering
+    // the stage from the map stages the one under the pointer, and by then the
+    // map is closing and there is nothing left to ask.
+    const std::string payload =
+        w ? std::format("0x{:x} {}", (uintptr_t)w.get(), w->m_title) : std::string{};
+    if (g_sentHoverValid && payload == g_sentHoverLine)
         return;
-    g_sentHoverTitle = title;
+    g_sentHoverLine  = payload;
     g_sentHoverValid = true;
     // Titles can hold anything except our line terminator; strip newlines.
-    std::string line = "overview-hover " + title;
+    std::string line = "overview-hover " + payload;
     for (auto& c : line)
         if (c == '\n' || c == '\r')
             c = ' ';
@@ -2577,7 +2601,7 @@ static void sendOverviewSize(PHLWINDOW w, bool force) {
 // always re-sends (the daemon drops both overrides when the overview ends).
 static void resetOverviewPill() {
     g_sentHoverValid = false;
-    g_sentHoverTitle.clear();
+    g_sentHoverLine.clear();
     g_sentSize.clear();
 }
 
@@ -2658,18 +2682,17 @@ static void closeOverview() {
     damageAll();
 }
 
-// While Golem's STAGE mode owns the screen (one task, the deck, the OPTIONS bar
-// and nothing else), the overview must not be reachable at all. waverunner sets
-// this over `hl.plugin.waveview.set_stage(...)` as it enters and leaves.
+// Whether Golem's STAGE owns the screen — waverunner sets it over
+// `hl.plugin.waveview.set_stage(...)` as it enters and leaves.
 //
-// Unbinding Super+R on the Hyprland side is not enough on its own: the 3-finger
-// swipe is handled HERE, inside the plugin, and never passes through the bind
-// system. Guarding at `toggle()` covers every route into the overview at once.
+// It no longer bars the overview: Max asked for the map to be reachable from
+// inside the stage (2026-09-12), so `toggle()` is open to every route again and
+// this flag only says who owns the TRACKPAD — the deck's border takes the
+// horizontal swipes while the stage is up, and the workspace swipe must not run
+// underneath it.
 static bool g_stageMode = false;
 
 static void toggle() {
-    if (g_stageMode)
-        return; // the stage owns the screen
     const bool opening = g_animTarget < 0.5f; // currently closed/closing -> open
     // The Super+R tour: pressed while open, and the other page holds
     // windows we haven't visited → flip there instead of closing. A third
@@ -2764,38 +2787,151 @@ static void onSwipeBegin(IPointer::SSwipeBeginEvent e, Event::SCallbackInfo& inf
     // gesture cannot be unregistered from Lua at all (no unregister exists,
     // re-registering is refused, `action = "none"` is rejected). Consuming it
     // here is the only place either can actually be stopped.
+    // The stage's own gesture: 3 or 4 fingers, the same counts the config gives
+    // the workspace swipe, so the hand does what it already knew — it just
+    // travels the deck instead of the workspaces while the stage is up.
+    g_stageSwipe     = g_stageMode && (e.fingers == 3 || e.fingers == 4);
+    g_stageSwipeDx   = 0.0;
+    g_stageSwipeSent = 0.0;
     if (g_active || g_stageMode)
         info.cancelled = true;
 }
 
-// Accumulate the swipe; on a decisive 3-finger vertical move (once per
-// gesture): swipe UP walks the same ladder as Super+R — open, then tour the
-// other inhabited page, then close; swipe DOWN is Escape (immediate close,
-// no touring). libinput reports fingers-up as negative dy.
+// Whether a swipe has travelled far enough, vertically enough, to mean it. Every
+// vertical gesture asks the same question, so they ask it here.
+static bool decisiveVertical() {
+    return std::abs(g_swipeAcc.y) >= SWIPE_TRIGGER && std::abs(g_swipeAcc.y) > std::abs(g_swipeAcc.x);
+}
+
+// Sideways travel that hands the whole gesture to whatever owns horizontal —
+// the compositor's workspace swipe out on the desktop, the deck's border while
+// staged.
+//
+// Well under SWIPE_TRIGGER, because the compositor starts sliding the
+// workspaces on the first few millimetres: by the time this much has gone by
+// the user is watching a slide, and lifting the fingers afterwards is the hand
+// coming off the pad, not a new instruction. Without it a swipe that went
+// sideways and then up opened the stage *mid-slide*, halfway between two
+// workspaces (Max, 2026-09-12).
+static constexpr double SWIPE_CLAIM_X = 40.0;
+
+// Whether this gesture has already been claimed by its horizontal owner.
+static bool claimedSideways() {
+    return std::abs(g_swipeAcc.x) >= SWIPE_CLAIM_X && std::abs(g_swipeAcc.x) > std::abs(g_swipeAcc.y);
+}
+
+// Accumulate the swipe; act once per gesture on a decisive vertical move.
+// libinput reports fingers-up as negative dy.
+//
+// It is the FINGER COUNT that says which room you are asking for, and UP that
+// asks for it (Max, 2026-09-12 — the direction carried both at first, and the
+// count reads better: two places, two hands, one motion):
+//
+//   3 UP    — the overview. Same ladder as Super+R: open, tour the other
+//             inhabited page, close.
+//   3 DOWN  — out of the overview (its long-standing Escape). Nothing when it
+//             is not up.
+//   4 UP    — Golem's STAGE. Also the way back out of it, and it works from
+//             inside the overview too — the daemon shuts that on its way in.
+//   4 DOWN  — out of the stage. Nothing when it is not up.
+//
+// So each room is opened by a count and left by the same count, with down as
+// the extra "out" for whichever one you are in.
+//
+// A gesture that went SIDEWAYS first belongs to whoever owns that axis and is
+// latched away from all of this — see [`claimedSideways`].
 static void onSwipeUpdate(IPointer::SSwipeUpdateEvent e, Event::SCallbackInfo& info) {
     if (g_active)
         info.cancelled = true; // overview owns the trackpad while open
-    if (g_stageMode) {
-        info.cancelled = true; // stage owns the trackpad: no overview, no ws swipe
+    // The stage owns the trackpad — but only while it is the thing on screen.
+    // With the overview open OVER it, the map owns the gestures and they run the
+    // ordinary path below (which is where its own ladder and Escape live).
+    if (g_stageMode && !g_active) {
+        info.cancelled = true; // no workspace swipe underneath the stage
+        g_swipeAcc += e.delta;
+        // A gesture is one axis or the other, and the first one to be decisive
+        // takes it. Sideways first means the deck has it: the border is already
+        // walking, and lifting the fingers away at the end must not also throw
+        // you out of the mode.
+        if (!g_swipeFired && claimedSideways())
+            g_swipeFired = true; // the deck's, for the rest of this gesture
+        // Vertical first wins outright and takes the gesture OFF the deck, so a
+        // swipe out of the mode cannot leave a half-finished tile selection
+        // behind it.
+        if (!g_swipeFired && decisiveVertical()) {
+            g_swipeFired = true;
+            g_stageSwipe = false;
+            // FOUR fingers leave, either direction: the count that opened the
+            // stage is the count that closes it, and down is the extra way out.
+            // THREE still means the overview, which now opens over the stage
+            // rather than being refused — the map is how you find the task you
+            // want to put on it. Down does nothing here: the overview is not up
+            // (this branch only runs when it isn't), so there is nothing to
+            // escape from.
+            if (g_swipeFingers == 4)
+                sendWaverunner("stage-toggle\n");
+            else if (g_swipeAcc.y < 0.0)
+                toggle(); // 3 up: the overview, over the stage
+            return;
+        }
+        if (g_stageSwipe) {
+            g_stageSwipeDx += e.delta.x;
+            // The TOTAL is sent, never the step: messages go out on their own
+            // threads, so one arriving late (or not at all) must not be able to
+            // leave the border out of step with the fingers.
+            if (std::abs(g_stageSwipeDx - g_stageSwipeSent) >= STAGE_SWIPE_GRAIN) {
+                g_stageSwipeSent = g_stageSwipeDx;
+                sendWaverunner(std::format("stage-swipe {:.1f}\n", g_stageSwipeDx));
+            }
+        }
         return;
     }
-    if (g_swipeFingers != 3 || g_swipeFired)
+    if ((g_swipeFingers != 3 && g_swipeFingers != 4) || g_swipeFired)
         return;
     g_swipeAcc += e.delta;
-    if (std::abs(g_swipeAcc.y) < SWIPE_TRIGGER || std::abs(g_swipeAcc.x) > std::abs(g_swipeAcc.y))
+    // The workspace swipe has it: the compositor is already sliding, and this
+    // gesture is theirs to finish. Latched — NOT consumed, since they still need
+    // the events — so a lift at the end cannot open the stage halfway between
+    // two workspaces.
+    if (claimedSideways()) {
+        g_swipeFired = true;
+        return;
+    }
+    if (!decisiveVertical())
         return; // not yet decisive, or dominantly horizontal
 
-    if (g_swipeAcc.y < 0.0)
-        toggle(); // up: open → tour → close (the Super+R ladder)
-    else
-        closeOverview(); // down: Esc (no-op when already closed)
-    g_swipeFired   = true;
-    info.cancelled = true; // consume so no built-in gesture also reacts
+    const bool up    = g_swipeAcc.y < 0.0;
+    bool       acted = true;
+    if (g_swipeFingers == 3) {
+        if (up)
+            toggle(); // the overview ladder (open → tour → close)
+        else if (g_animTarget >= 0.5f)
+            closeOverview(); // down, with the overview showing: Escape out of it
+        else
+            acted = false; // down on a bare desktop: nothing to leave
+    } else if (up) {
+        // Four up is the stage wherever you are. From inside the overview it
+        // still means the stage — the daemon closes that on its way in.
+        sendWaverunner("stage-toggle\n");
+    } else {
+        acted = false; // four down with no stage up: nothing to leave
+    }
+    // Latched either way: one gesture makes one decision, so a hand that drifts
+    // back the other way mid-swipe cannot fire the opposite one behind it.
+    g_swipeFired = true;
+    if (acted)
+        info.cancelled = true; // consume so no built-in gesture also reacts
 }
 
 static void onSwipeEnd(IPointer::SSwipeEndEvent, Event::SCallbackInfo& info) {
     if (g_active || g_stageMode)
         info.cancelled = true;
+    // The fingers left: waverunner stages whatever the border reached. The final
+    // travel rides along, so this message alone decides where that is.
+    if (g_stageSwipe) {
+        sendWaverunner(std::format("stage-swipe-end {:.1f}\n", g_stageSwipeDx));
+        g_stageSwipe = false;
+    }
     g_swipeFingers = 0;
     g_swipeFired   = false;
     g_swipeLive    = false;
@@ -3136,6 +3272,136 @@ static int captureDeckToDir(const std::string& addrsCsv, int size, double tileAs
     return done;
 }
 
+/// Capture a set of whole WORKSPACES, one file each.
+///
+/// The deck's other half. In Golem's per-workspace stage a tile stands for a
+/// desk rather than a window, so its picture has to be the workspace as the user
+/// built it — every window where they put it — which is a different render from
+/// `captureDeckToDir`'s standalone window, not a crop of it.
+///
+/// It is the overview's own workspace snapshot (`captureWorkspaces`) reduced to
+/// what a thumbnail needs: no tile grid, no backdrop, no per-window crops, and
+/// written out instead of kept. The delicate parts are copied from there because
+/// they were learned the hard way — the solitary-client reset, hiding the live
+/// workspace so its windows do not bleed into every tile, and snapping each
+/// workspace's windows on-screen before rendering it.
+///
+/// Each workspace is written to `<dir>/ws-<id>.rgba`. Returns how many landed.
+static int captureDesksToDir(const std::string& wsCsv, int size, double tileAspect, const std::string& dir) {
+    if (size <= 0 || size > 1024)
+        return 0;
+
+    std::vector<PHLWORKSPACE> wants;
+    PHLMONITOR                m;
+    for (size_t at = 0; at <= wsCsv.size();) {
+        const size_t end = std::min(wsCsv.find(',', at), wsCsv.size());
+        const auto   tok = wsCsv.substr(at, end - at);
+        at               = end + 1;
+        if (tok.empty())
+            continue;
+        int id = 0;
+        try {
+            id = std::stoi(tok);
+        } catch (...) { continue; }
+        const auto ws = g_pCompositor->getWorkspaceByID((WORKSPACEID)id);
+        if (!ws)
+            continue;
+        // The monitor comes from a window on the workspace, the way the window
+        // capture takes it from the window itself: one monitor per pass, since a
+        // snapshot is rendered for a specific output and is only valid there.
+        PHLMONITOR wm;
+        for (auto& w : g_pCompositor->m_windows) {
+            if (w && w->m_isMapped && !w->isHidden() && w->workspaceID() == ws->m_id) {
+                wm = g_pCompositor->getMonitorFromID(w->monitorID());
+                break;
+            }
+        }
+        if (!wm)
+            continue; // an empty desk has no tile, so nothing is owed one
+        if (!m)
+            m = wm;
+        else if (m != wm)
+            continue;
+        wants.push_back(ws);
+    }
+    if (wants.empty() || !m)
+        return 0;
+
+    Render::GL::g_pHyprOpenGL->makeEGLCurrent();
+    auto out = g_pHyprRenderer->createFB("waveview-desk");
+    if (!out->alloc(size, size, DRM_FORMAT_ABGR8888) || !out->isAllocated()) {
+        trace("desk-capture: alloc %dx%d failed", size, size);
+        return 0;
+    }
+    // One monitor-resolution scratch for the whole batch: every workspace
+    // renders at exactly this size, so it is allocated once.
+    const CBox monbox{0.0, 0.0, m->m_pixelSize.x, m->m_pixelSize.y};
+    auto       scratch = g_pHyprRenderer->createFB("waveview-desk-src");
+    if (!scratch->alloc(monbox.w, monbox.h, DRM_FORMAT_ABGR8888)) {
+        out->release();
+        return 0;
+    }
+
+    const auto startedOn = m->m_activeWorkspace;
+    g_pHyprRenderer->m_bBlockSurfaceFeedback = true; // a thumbnail must not drive the client's frame clock
+    g_capturing                              = true; // suppress our own render hook
+    m->m_solitaryClient.reset(); // else renderWorkspace draws only the one fullscreen window
+    if (startedOn)
+        startedOn->m_visible = false; // the live workspace's windows would bleed into every tile
+
+    std::vector<uint8_t> px;
+    int                  done = 0;
+    for (const auto& ws : wants) {
+        CRegion fakeDamage{0, 0, INT16_MAX, INT16_MAX};
+        g_pHyprRenderer->beginRender(m, fakeDamage, Render::RENDER_MODE_FULL_FAKE, nullptr, scratch);
+        glClearColor(0.0F, 0.0F, 0.0F, 0.0F);
+        glClear(GL_COLOR_BUFFER_BIT);
+        m->m_activeWorkspace = ws; // renderWorkspace draws the monitor's active ws
+        // Non-active workspaces are parked offscreen; without this snap the
+        // render captures nothing of them. instant=true so the real desktop
+        // does not visibly animate.
+        g_pDesktopAnimationManager->startAnimation(ws, CDesktopAnimationManager::ANIMATION_TYPE_IN, true, true);
+        ws->m_visible = true;
+        g_pHyprRenderer->renderWorkspace(m, ws, Time::steadyNow(), monbox);
+        ws->m_visible = false;
+        g_pDesktopAnimationManager->startAnimation(ws, CDesktopAnimationManager::ANIMATION_TYPE_OUT, false, true);
+        g_pHyprRenderer->m_renderData.blockScreenShader = true;
+        g_pHyprRenderer->endRender();
+
+        if (!blitAndRead(m, scratch, out, size, tileAspect, px))
+            continue;
+        if (writeRaw(dir + "/ws-" + std::to_string((int)ws->m_id) + ".rgba", px))
+            ++done;
+    }
+
+    g_capturing                              = false;
+    g_pHyprRenderer->m_bBlockSurfaceFeedback = false;
+    m->m_activeWorkspace                     = startedOn;
+    if (startedOn) {
+        startedOn->m_visible = true;
+        g_pDesktopAnimationManager->startAnimation(startedOn, CDesktopAnimationManager::ANIMATION_TYPE_IN, true, true);
+    }
+    scratch->release();
+    out->release();
+    return done;
+}
+
+// `hl.plugin.waveview.capture_desks(workspaces, size, tile_aspect, dir)` —
+// `workspaces` is a comma-separated list of ids; each lands at
+// `<dir>/ws-<id>.rgba` as `size`×`size` raw RGBA. Returns how many were written.
+// Best effort by contract, exactly like `capture_deck`.
+static int luaCaptureDesks(lua_State* L) {
+    const char*  wss    = lua_tostring(L, 1);
+    const int    size   = (int)lua_tointeger(L, 2);
+    const double aspect = lua_tonumber(L, 3);
+    const char*  dir    = lua_tostring(L, 4);
+    int          n      = 0;
+    if (wss && dir)
+        n = captureDesksToDir(wss, size, aspect, dir);
+    lua_pushinteger(L, n);
+    return 1;
+}
+
 // `hl.plugin.waveview.capture_deck(addrs, size, tile_aspect, dir)` — `addrs` is a
 // comma-separated list of window addresses; each lands at `<dir>/<addr>.rgba` as
 // `size`×`size` raw RGBA. Returns how many were written. Best effort by
@@ -3150,6 +3416,19 @@ static int luaCaptureDeck(lua_State* L) {
         n = captureDeckToDir(addrs, size, aspect, dir);
     lua_pushinteger(L, n);
     return 1;
+}
+
+// `hl.plugin.waveview.close()` — shut the overview if it is up, and do nothing
+// if it is not.
+//
+// A toggle cannot serve as a close, and this is where that bit: waverunner shuts
+// the map as it opens the stage, and `set_stage` below shuts it too. Through
+// `toggle()` the second call REOPENED it, so opening the stage from inside the
+// overview left the overview on screen (Max, 2026-09-12). `closeOverview` is
+// idempotent by construction — it returns early unless the map is actually up.
+static int luaClose(lua_State* L) {
+    closeOverview();
+    return 0;
 }
 
 // `hl.plugin.waveview.set_stage(true|false)` — waverunner tells us when Golem's
@@ -3175,8 +3454,10 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     // happens at keypress (plugin loads after config eval):
     //   hl.bind(mainMod .. " + G", function() hl.plugin.waveview.toggle() end)
     HyprlandAPI::addLuaFunction(handle, "waveview", "toggle", luaToggle);
+    HyprlandAPI::addLuaFunction(handle, "waveview", "close", luaClose);
     HyprlandAPI::addLuaFunction(handle, "waveview", "set_stage", luaSetStage);
     HyprlandAPI::addLuaFunction(handle, "waveview", "capture_deck", luaCaptureDeck);
+    HyprlandAPI::addLuaFunction(handle, "waveview", "capture_desks", luaCaptureDesks);
     g_renderListener = Event::bus()->m_events.render.stage.listen([](eRenderStage s) { onRender(s); });
     g_keyListener    = Event::bus()->m_events.input.keyboard.key.listen(onKey);
     g_moveListener   = Event::bus()->m_events.input.mouse.move.listen(onMouseMove);
@@ -3185,6 +3466,11 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     g_swipeBeginListener  = Event::bus()->m_events.gesture.swipe.begin.listen(onSwipeBegin);
     g_swipeUpdateListener = Event::bus()->m_events.gesture.swipe.update.listen(onSwipeUpdate);
     g_swipeEndListener    = Event::bus()->m_events.gesture.swipe.end.listen(onSwipeEnd);
+    // Golem's titlebars for floating windows (src/hyprbars/, a stripped fork of
+    // hyprbars — see PROVENANCE.md there). They live in this plugin rather than
+    // beside it so there is ONE thing to keep in ABI lockstep with Hyprland.
+    Bars::init(handle);
+    g_windowOpenListener = Event::bus()->m_events.window.open.listen([](PHLWINDOW w) { Bars::onWindowOpen(w); });
     g_liveTimer      = makeShared<CEventLoopTimer>(std::nullopt, onLiveTimer, nullptr);
     g_pEventLoopManager->addTimer(g_liveTimer);
     g_dragCheckTimer = makeShared<CEventLoopTimer>(std::nullopt, onDragCheckTimer, nullptr);
@@ -3225,6 +3511,11 @@ APICALL EXPORT void PLUGIN_EXIT() {
     resetEdgeCursor();
     g_commit  = {};
     g_pending = {};
+    // The bars hold per-window decorations and their own listeners; drop them
+    // while this .so is still mapped, for the same reason the render pass is
+    // flushed above.
+    g_windowOpenListener.reset();
+    Bars::shutdown();
     g_renderListener.reset();
     g_keyListener.reset();
     g_moveListener.reset();

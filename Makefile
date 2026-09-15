@@ -11,8 +11,13 @@ all: $(OUT)
 $(RUST_LIB):
 	cd rust && cargo build --release --offline
 
-$(OUT): src/main.cpp $(RUST_LIB)
-	$(CXX) $(CXXFLAGS) `$(PKG)` src/main.cpp $(RUST_LIB) -lpthread -ldl -o $(OUT)
+# Golem's titlebars live in src/hyprbars/ (a stripped fork — see the
+# PROVENANCE.md there). Built into this .so rather than shipped as a second
+# plugin, so there is one thing in ABI lockstep with Hyprland.
+SRC = src/main.cpp $(wildcard src/hyprbars/*.cpp)
+
+$(OUT): $(SRC) $(RUST_LIB)
+	$(CXX) $(CXXFLAGS) `$(PKG)` $(SRC) $(RUST_LIB) -lpthread -ldl -o $(OUT)
 
 clean:
 	rm -f $(OUT); cd rust && cargo clean
