@@ -11,6 +11,7 @@
 #include <hyprland/src/Compositor.hpp>
 #include <hyprland/src/desktop/view/Window.hpp>
 #include <hyprland/src/render/Renderer.hpp>
+#include <hyprland/src/managers/CursorManager.hpp>
 
 #include "barsGlobals.hpp"
 #include "golemBar.hpp"
@@ -42,21 +43,47 @@ namespace Bars {
         g_barsHandle = handle;
         g_pBarsState = makeUnique<SGolemBarsState>();
 
-        // Right to left, the way a titlebar is read: close is outermost, where
-        // every desktop has taught the hand to expect it.
+        golemBarCursorTimerInit();
+
+        // GOLEM'S TRAFFIC LIGHTS (Max, 2026-09-15: *"three colors, macOS style
+        // but different colors, that make sense"*): the familiar three-disc
+        // row, recoloured to mean what the buttons actually DO here.
+        //
+        // Left to right: close is outermost, where every desktop has taught
+        // the hand to expect it. The glyphs are dark on all three — every disc
+        // is a light colour now, and one ink keeps the row reading as a set.
+        //
+        // VIVID, not pastel (Max, 2026-09-15: *"super saturated colors that
+        // outstand"*) — the first cut used soft Golem-family tones and read as
+        // washed out against the muted bar. These are near-full-saturation and
+        // deliberately louder than everything around them: the frame whispers,
+        // the three controls shout.
+        //
+        // RED — destroy. The one meaning no desktop gets to reinvent.
         g_pBarsState->buttons.push_back(SGolemButton{
             .action = GOLEM_BAR_CLOSE,
-            .bgcol  = CHyprColor{0xFFEB6F6FULL},
+            .bgcol  = CHyprColor{0xFFFF2E2EULL},
             .fgcol  = CHyprColor{0xFF1A1A1AULL},
             .icon   = "×",
         });
-        // Back into the layout — a floating window's way home. Golem has no
-        // minimise and no maximise: the tiling is the thing a float left.
+        // GREEN — back into the layout. Where macOS's green means "grow to
+        // fullscreen", Golem's means "grow back into the tiling": the same
+        // gesture of order, Golem's own answer.
         g_pBarsState->buttons.push_back(SGolemButton{
             .action = GOLEM_BAR_TILE,
-            .bgcol  = CHyprColor{0xFF5A5F6AULL},
-            .fgcol  = CHyprColor{0xFFE8E6E3ULL},
+            .bgcol  = CHyprColor{0xFF21D758ULL},
+            .fgcol  = CHyprColor{0xFF1A1A1AULL},
             .icon   = "▤",
+        });
+        // ORANGE — Golem's peach pushed to full blaze, on the slot Golem has
+        // not spoken for yet. No glyph on purpose: a symbol would promise a
+        // behaviour the button does not have. Give it one in the same breath
+        // as giving it an action (`GOLEM_BAR_UNWIRED`).
+        g_pBarsState->buttons.push_back(SGolemButton{
+            .action = GOLEM_BAR_UNWIRED,
+            .bgcol  = CHyprColor{0xFFFF9500ULL},
+            .fgcol  = CHyprColor{0xFF1A1A1AULL},
+            .icon   = "",
         });
 
         for (auto& w : g_pCompositor->m_windows) {
@@ -67,6 +94,20 @@ namespace Bars {
     }
 
     void shutdown() {
+        // FIRST, before anything else: no deferred callback may be queued from
+        // here on. The decorations are destroyed after PLUGIN_EXIT returns,
+        // and a callback their destructors queue outlives the library — the
+        // 2026-09-15 unload crash.
+        g_barsShuttingDown = true;
+
+        golemBarCursorTimerDrop();
+
+        // Give the pointer its arrow back. A bar that owned the "grab" shape
+        // when the plugin went away would leave the whole desktop wearing it,
+        // with nothing left to take it off.
+        if (g_pCursorManager)
+            g_pCursorManager->setCursorFromName("left_ptr");
+
         for (auto& m : g_pCompositor->m_monitors) {
             m->m_scheduledRecalc = true;
         }

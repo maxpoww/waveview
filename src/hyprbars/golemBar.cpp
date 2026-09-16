@@ -17,6 +17,8 @@
 #include <hyprland/src/desktop/view/Window.hpp>
 #include <hyprland/src/helpers/MiscFunctions.hpp>
 #include <hyprland/src/managers/SeatManager.hpp>
+#include <hyprland/src/managers/CursorManager.hpp>
+#include <hyprland/src/managers/eventLoop/EventLoopManager.hpp>
 #include <hyprland/src/managers/input/InputManager.hpp>
 #include <hyprland/src/managers/KeybindManager.hpp>
 #include <hyprland/src/render/Renderer.hpp>
@@ -34,6 +36,7 @@
 #include "bars.hpp"
 
 #include <climits>
+#include <algorithm>
 #include <cmath>
 
 using namespace Render::GL;
@@ -60,14 +63,6 @@ static CHyprColor barColor(PHLWINDOW w) {
     return CHyprColor{0xEE0D0F14ULL};
 }
 
-/// Ink that stays readable on whatever the border turns out to be: Golem's
-/// borders run from a light peach (focused) to a dark brown (not), and one fixed
-/// text colour cannot serve both.
-static CHyprColor inkOn(const CHyprColor& bg) {
-    const float L = 0.2126f * bg.r + 0.7152f * bg.g + 0.0722f * bg.b;
-    return L > 0.5f ? CHyprColor{0xFF14171CULL} : CHyprColor{0xFFE8E6E3ULL};
-}
-
 CGolemBar::CGolemBar(PHLWINDOW pWindow) : IHyprWindowDecoration(pWindow) {
     m_pWindow = pWindow;
 
@@ -91,6 +86,24 @@ CGolemBar::~CGolemBar() {
     // runs during teardown. The first cut dereferenced the state here and took
     // the session down with it (SEGV, 2026-09-13 — `unloadPlugin` →
     // `removeWindowDecoration` → here).
+    // Hand the window its own border colours back, or a float that outlives
+    // this plugin keeps a tint nothing owns any more. Unset only — NOT
+    // `updateDecorationValues`: teardown destroys decorations after
+    // PLUGIN_EXIT, and reaching back into the window from here is the
+    // re-entrancy that took the session down on 2026-09-13. Everything
+    // re-renders as the library unmaps.
+    if (m_tinted && validMapped(m_pWindow)) {
+        const auto PWINDOW = m_pWindow.lock();
+        PWINDOW->m_ruleApplicator->activeBorderColor().unset(Desktop::Types::PRIORITY_SET_PROP);
+        PWINDOW->m_ruleApplicator->inactiveBorderColor().unset(Desktop::Types::PRIORITY_SET_PROP);
+        PWINDOW->m_ruleApplicator->borderSize().unset(Desktop::Types::PRIORITY_SET_PROP);
+        m_tinted = false;
+    }
+
+    // If this bar was holding the grab hand, the pointer has to get its arrow
+    // back from somewhere — nothing else knows to.
+    releaseCursorIfOwner();
+
     if (g_pBarsState)
         std::erase(g_pBarsState->bars, m_self);
 
@@ -98,6 +111,122 @@ CGolemBar::~CGolemBar() {
     // calls back into the bar; letting it outlive us is the same shape of bug
     // as the one above, just with a longer fuse.
     m_cRealBarColor.reset();
+}
+
+/// The compositor's LIVE border gradient — the very object the desktop draws
+/// its own borders from, so the tint inherits the colours, stop count and
+/// angle for free, including whatever the daemon's colour pass pushed a moment
+/// ago. nullptr if the value is missing, is not a gradient, or has no colours.
+///
+/// Defined in `main.cpp`: reading it safely needs the privates-opening hack at
+/// the top of that file, and the overview's rings already read it the same way.
+extern Config::CGradientValueData* borderGradient(bool active);
+
+void CGolemBar::syncFloatTint() {
+    if (!validMapped(m_pWindow))
+        return;
+    const auto PWINDOW = m_pWindow.lock();
+
+    // Back in the layout: hand the window its own colours and its border back.
+    // A tiled window must look exactly like every other tiled window.
+    if (m_hidden) {
+        if (!m_tinted)
+            return;
+        PWINDOW->m_ruleApplicator->activeBorderColor().unset(Desktop::Types::PRIORITY_SET_PROP);
+        PWINDOW->m_ruleApplicator->inactiveBorderColor().unset(Desktop::Types::PRIORITY_SET_PROP);
+        PWINDOW->m_ruleApplicator->borderSize().unset(Desktop::Types::PRIORITY_SET_PROP);
+        m_tinted = false;
+        refreshDecorationsLater();
+        return;
+    }
+
+    const auto* const ACTIVE   = borderGradient(true);
+    const auto* const INACTIVE = borderGradient(false);
+    if (!ACTIVE || !INACTIVE)
+        return; // no readable colours; leave the window alone rather than guess
+
+    const auto tint = [](const Config::CGradientValueData& src) {
+        Config::CGradientValueData out = src;
+        for (auto& c : out.m_colors)
+            c.a *= GOLEM_FLOAT_ALPHA;
+        out.updateColorsOk(); // the shader reads this, not m_colors
+        return out;
+    };
+    auto wantActive   = tint(*ACTIVE);
+    auto wantInactive = tint(*INACTIVE);
+
+    // Only when they actually changed — see the note on `m_tintActive`.
+    if (m_tinted && wantActive == m_tintActive && wantInactive == m_tintInactive)
+        return;
+
+    PWINDOW->m_ruleApplicator->activeBorderColor().set(wantActive, Desktop::Types::PRIORITY_SET_PROP);
+    PWINDOW->m_ruleApplicator->inactiveBorderColor().set(wantInactive, Desktop::Types::PRIORITY_SET_PROP);
+    // ⭐ AND NO BORDER AT ALL WHILE IT FLOATS (Max, 2026-09-15: *"it IS the
+    // border, i still see it on the top corners — get rid of it"*).
+    //
+    // The border and the bar are the same translucent colour, so wherever their
+    // paint meets it doubles and reads as a bright line: along the top edge
+    // (fixed by cutting the strip back), and then along the corner arc, where
+    // the wedge fill runs beside the border's curve. Measured there: the strip
+    // reads 87,103,109 and the arc 117,114,117. Chasing that alignment pixel by
+    // pixel is a losing game — the decoration box, the border ring and the fill
+    // bands all round independently.
+    //
+    // With no border, the whole class of seam goes away: the bar meets the
+    // window's own edge directly and the fill's only neighbour is the OPAQUE
+    // content, which cannot double-blend. Everything downstream adapts on its
+    // own, because it all reads `getRealBorderSize()` — the corner radius, the
+    // button centring, and where the strip stops.
+    //
+    // It is the whole ring, not just the top: Hyprland has no per-side border.
+    // Floats therefore carry no frame line on any side; the bar is their chrome.
+    PWINDOW->m_ruleApplicator->borderSize().set(0, Desktop::Types::PRIORITY_SET_PROP);
+    m_tintActive   = std::move(wantActive);
+    m_tintInactive = std::move(wantInactive);
+    m_tinted       = true;
+    refreshDecorationsLater();
+}
+
+/// Make the compositor pick the overrides up — NEVER inline.
+///
+/// ⚠️ `updateDecorationValues()` re-applies a window's rules and walks its
+/// decorations. Everything that calls `syncFloatTint` reaches it from inside
+/// the RENDER PASS (`renderPass`, and `syncHidden` by way of `draw`), so
+/// calling it there re-enters the very list the pass is iterating — for every
+/// window at once when Golem's float mode flips the whole desktop. That froze
+/// the session (Max, 2026-09-15, tile→floating).
+///
+/// `doLater` runs it on the event loop between frames instead: same effect,
+/// one frame later, with nothing re-entered. Guarded so a burst of frames
+/// cannot queue a pile of them.
+void CGolemBar::refreshDecorationsLater() {
+    // Never during teardown, and always through a cancellable LOCK: the lock
+    // dies with the bar, withdrawing the callback — a plain doLater's lambda
+    // lives in this .so and outliving the unload is the 2026-09-15 crash.
+    if (g_barsShuttingDown || !g_pEventLoopManager)
+        return;
+    if (m_refreshLock)
+        return; // one pending refresh is enough for any burst of frames
+
+    m_refreshLock = g_pEventLoopManager->doLaterLock([self = m_self]() {
+        const auto BAR = self.lock();
+        if (!BAR)
+            return; // the bar (and its window) went away before we ran
+        BAR->m_refreshLock.reset();
+        if (!validMapped(BAR->m_pWindow))
+            return;
+        const auto PWINDOW = BAR->m_pWindow.lock();
+        PWINDOW->updateDecorationValues();
+        // ⭐ AND DAMAGE THE FRAME, or the change is invisible on a still
+        // window: the border ring's OLD pixels stay on screen until something
+        // else happens to repaint them. Seen live (2026-09-15): the first
+        // windows after a reboot sat quietly with their border still drawn,
+        // and it vanished only when they were MOVED — the move was just the
+        // first full repaint. Windows that map mid-session never showed it
+        // because the popin animation damages everything while the override
+        // lands. Safe here: this runs on the event loop, not the render pass.
+        g_pHyprRenderer->damageWindow(PWINDOW, true);
+    });
 }
 
 // The bar belongs to windows that have LEFT the layout. Upstream drove this
@@ -124,6 +253,14 @@ void CGolemBar::syncHidden() {
     // event socket nor the internal bus has one — checked both, 2026-09-13.)
     if (const auto PMONITOR = m_pWindow->m_monitor.lock())
         PMONITOR->m_scheduledRecalc = true;
+    // Going back into the layout takes the bar out from under the pointer with
+    // no motion to notice it — give the arrow back now, or the grab hand sticks
+    // until the pointer happens to cross another bar.
+    if (m_hidden)
+        releaseCursorIfOwner();
+    // The frame is translucent only while the window floats, so the tint
+    // arrives and leaves with the bar itself.
+    syncFloatTint();
     damageEntire();
 }
 
@@ -143,9 +280,6 @@ SDecorationPositioningInfo CGolemBar::getPositioningInfo() {
 }
 
 void CGolemBar::onPositioningReply(const SDecorationPositioningReply& reply) {
-    if (reply.assignedGeometry.size() != m_bAssignedBox.size())
-        m_bWindowSizeChanged = true;
-
     m_bAssignedBox = reply.assignedGeometry;
 }
 
@@ -209,8 +343,236 @@ void CGolemBar::onMouseButton(Event::SCallbackInfo& info, IPointer::SButtonEvent
     handleDownEvent(info);
 }
 
+/// The shape the BARS currently have on the pointer, "" when they have given it
+/// back. One global rather than one per bar: only one bar can be under the
+/// pointer, and the pointer is one thing — a per-bar cache would let a bar the
+/// pointer has already left believe it still owns the shape.
+static std::string g_barCursor;
+
+/// WHICH bar put it there. Every bar hears every motion — `inputIsValid()`
+/// passes for the window under the pointer OR the focused one — so without an
+/// owner a bar the pointer is nowhere near would "helpfully" clear the shape
+/// the hovered bar had just set, and which one won came down to listener order.
+/// That is why the hint worked on some windows and not others (Max,
+/// 2026-09-15). Only the owner may hand the pointer back.
+// A RAW pointer compared by IDENTITY only, never dereferenced. NOT a weak
+// pointer: the bars are held as UNIQUE pointers, and hyprutils' WP::lock() on
+// a unique-backed weak always returns null — so `owner.lock().get() == this`
+// was FALSE even one line after the assignment, the release branch was dead
+// code, and the hand never let go (proven by the 2026-09-15 trace: owner=0 on
+// every event). Identity stays safe because the destructor and shutdown clear
+// it before the object can die.
+static CGolemBar* g_barCursorOwner = nullptr;
+
+/// The pending deferred apply, as a CANCELLABLE lock: destroying it (a new
+/// assignment, or `Bars::shutdown`) withdraws the callback from the event
+/// loop. Plain `doLater` has no way back, and a callback that outlives the
+/// unload jumps into unmapped memory — the 2026-09-15 unload crash.
+static UP<SEventLoopDoLaterLock> g_barCursorLock;
+static void                      applyBarCursorLater();
+
+/// One-shot settle timer. The immediate set and the `doLater` both run before
+/// the CLIENT's own cursor request has crossed the wire — a terminal asks for
+/// its text beam on pointer enter, the request arrives milliseconds later, and
+/// the beam wins over whatever we set. That is the "unstable" hand (Max,
+/// 2026-09-15): ours and the app's alternating, with the app's arriving last.
+/// One re-assert ~60ms after we take the shape lands after any such request
+/// and settles it; released (empty `g_barCursor`) it does nothing.
+static SP<CEventLoopTimer> g_barCursorTimer;
+
+void golemBarCursorTimerInit() {
+    g_barCursorTimer = makeShared<CEventLoopTimer>(
+        std::nullopt,
+        [](SP<CEventLoopTimer> self, void*) {
+            // Owner too, not just the shape: this timer is the thing that
+            // stamped a STALE hand back over the app's cursor when the release
+            // was broken. A shape without a live owner is by definition stale.
+            if (g_barCursor.empty() || !g_barCursorOwner || !g_pCursorManager)
+                return;
+            if (g_pInputManager)
+                g_pInputManager->m_borderIconDirection = BORDERICON_NONE;
+            g_pCursorManager->setCursorFromName(g_barCursor);
+        },
+        nullptr);
+    g_pEventLoopManager->addTimer(g_barCursorTimer);
+}
+
+void golemBarCursorTimerDrop() {
+    // The callback's code lives in this .so — a timer that survives the unload
+    // fires into unmapped memory.
+    if (g_barCursorTimer && g_pEventLoopManager)
+        g_pEventLoopManager->removeTimer(g_barCursorTimer);
+    g_barCursorTimer.reset();
+
+    // The pending deferred apply dies here too, for the same reason.
+    g_barCursorLock.reset();
+
+    // And the cursor bookkeeping is emptied BEFORE the decorations are
+    // destroyed (which happens after PLUGIN_EXIT returns), so the destructors'
+    // releaseCursorIfOwner finds nothing held and queues nothing. A destructor
+    // that queued a callback here is exactly how the 2026-09-15 unload crash
+    // happened: pointer parked on a button, dtor released the shape, the
+    // release queued a doLater, the doLater outlived the library.
+    g_barCursorOwner = nullptr;
+    g_barCursor.clear();
+}
+
+/// Put a shape on the pointer, or `nullptr` to hand it back to the arrow.
+///
+/// ⚠️ Hyprland has its OWN cursor state for "the pointer is on a window edge"
+/// (`m_borderIconDirection`, re-asserted from the compositor's motion handling,
+/// which runs BEFORE ours). It outranks whatever we set, so it has to be
+/// cleared first or the resize arrow simply comes back the next frame — the
+/// lesson the overview's edge cursors already cost (see `main.cpp`). Writing
+/// the member is how it is cleared: `setBorderCursorIcon()` is not exported
+/// from the Hyprland binary, and the plugin fails to LOAD on the undefined
+/// symbol. It is reachable thanks to the privates hack in `golemBar.hpp`.
+static void setBarCursor(const char* shape) {
+    if (!shape) {
+        if (g_barCursor.empty())
+            return;
+        g_barCursor.clear();
+        if (g_pCursorManager)
+            g_pCursorManager->setCursorFromName("left_ptr");
+        applyBarCursorLater();
+        return;
+    }
+    if (g_pInputManager)
+        g_pInputManager->m_borderIconDirection = BORDERICON_NONE;
+    g_barCursor = shape;
+    // Immediately AND deferred, and that redundancy is the stability. The
+    // motion listeners run after the compositor's own motion handling, so the
+    // immediate set usually lands last and the shape holds; the deferred one
+    // catches the cases where something later in the same dispatch (a focus
+    // change, the app's own cursor request) takes the pointer back — without
+    // it the hand flickered against whatever kept re-setting the arrow.
+    if (g_pCursorManager)
+        g_pCursorManager->setCursorFromName(shape);
+    applyBarCursorLater();
+    // And once more after the client's enter-time cursor request has had time
+    // to arrive — see `g_barCursorTimer`.
+    if (g_barCursorTimer)
+        g_barCursorTimer->updateTimeout(std::chrono::milliseconds(60));
+}
+
+/// ⭐ SET THE SHAPE *AFTER* THE COMPOSITOR HAS FINISHED THE MOTION, NOT DURING.
+///
+/// Our motion listener runs from inside Hyprland's own `mouseMoveUnified`,
+/// which decides the cursor for itself once it knows what is under the pointer.
+/// Setting the shape from the listener is therefore a write the compositor
+/// overwrites moments later in the same event: verified with `grim -c` (which
+/// DOES capture the cursor — plain `grim` does not), the pointer sat on the bar
+/// wearing the arrow while our log showed `setBarCursor(grab)` firing every
+/// motion with the manager present and the theme carrying a `grab` cursor.
+///
+/// `doLater` puts the set on the event loop, so it lands after the compositor
+/// is done and ours is the last word. Coalesced by a flag: a burst of motion
+/// events queues one apply, not one per event.
+static void applyBarCursorLater() {
+    // Never during teardown: the destructors run after `Bars::shutdown`, and a
+    // callback queued from them survives the unload — see `g_barsShuttingDown`.
+    if (g_barsShuttingDown || !g_pEventLoopManager)
+        return;
+
+    // Assigning over a pending lock CANCELS it — a burst of motion coalesces
+    // to the newest request, and the callback re-reads the wanted shape anyway.
+    g_barCursorLock = g_pEventLoopManager->doLaterLock([]() {
+        if (!g_pCursorManager)
+            return;
+        // Re-read the wanted shape at apply time rather than capturing it: the
+        // pointer may have crossed onto — or off — a bar since this was queued.
+        const std::string WANT = g_barCursor.empty() ? "left_ptr" : g_barCursor;
+        // ⛔ DO NOT reach into `g_pInputManager->m_cursorSurfaceInfo` to make
+        // the compositor believe this shape is its own. Tried 2026-09-15 —
+        // writing `.name`/`.wlSurface` from here **crashed the session**. That
+        // struct is the compositor's live cursor state, torn down and rebuilt
+        // on its own schedule; a plugin writing it from an event-loop callback
+        // is writing under the compositor's feet. The privates hack makes it
+        // reachable, not safe.
+        if (g_pInputManager)
+            g_pInputManager->m_borderIconDirection = BORDERICON_NONE;
+        g_pCursorManager->setCursorFromName(WANT);
+    });
+}
+
+// Hand the pointer back, but only if this bar is the one holding it. Called
+// from the paths where a bar stops being hoverable without a motion event to
+// notice it: tiling (the bar hides) and teardown.
+void CGolemBar::releaseCursorIfOwner() {
+    if (g_barCursorOwner != this)
+        return;
+    g_barCursorOwner = nullptr;
+    setBarCursor(nullptr);
+}
+
+// Where the pointer stands on this bar: on a button, on the strip between
+// them, or not on the bar at all. One probe feeding both the cursor shape and
+// the ownership logic, so they can never disagree about what is hovered.
+CGolemBar::eBarHover CGolemBar::hoverZone() {
+    if (m_hidden || !inputIsValid())
+        return HOVER_NONE;
+
+    // Only the window ACTUALLY UNDER the pointer may claim a hover.
+    // `inputIsValid` passes for the hovered window OR the focused one — right
+    // for clicks (a drag must keep working wherever focus sits), wrong for a
+    // hover hint: a focused window whose bar rect lies BEHIND another window's
+    // content would claim the hand while the pointer is somewhere else
+    // entirely, and nothing under the pointer would ever release it.
+    const auto WINDOWATCURSOR = g_pCompositor->vectorToWindowUnified(g_pInputManager->getMouseCoordsInternal(),
+                                                                     Desktop::View::RESERVED_EXTENTS | Desktop::View::INPUT_EXTENTS | Desktop::View::ALLOW_FLOATING);
+    if (WINDOWATCURSOR != m_pWindow)
+        return HOVER_NONE;
+
+    const auto COORDS = cursorRelativeToBar();
+    if (!VECINRECT(COORDS, 0, 0, assignedBoxGlobal().w, GOLEM_BAR_HEIGHT - 1))
+        return HOVER_NONE;
+
+    for (size_t i = 0; i < g_pBarsState->buttons.size(); ++i) {
+        const auto BARBUF     = Vector2D{(int)assignedBoxGlobal().w, GOLEM_BAR_HEIGHT};
+        Vector2D   currentPos = Vector2D{golemButtonX(i, 1.F), golemButtonY(BARBUF.y, borderBelow(), GOLEM_BUTTON_SIZE)}.floor();
+        if (VECINRECT(COORDS, currentPos.x, currentPos.y, currentPos.x + GOLEM_BUTTON_SIZE + GOLEM_BUTTON_PADDING, currentPos.y + GOLEM_BUTTON_SIZE))
+            return HOVER_BUTTON;
+    }
+    return HOVER_STRIP;
+}
+
 void CGolemBar::onMouseMove(Vector2D coords) {
     damageOnButtonHover();
+
+    // The bar says what it is by how the pointer looks on it (Max, 2026-09-15):
+    // an OPEN HAND over the strip — the thing you pick the window up by — a
+    // CLOSED one while it is actually held, and the INDEX FINGER over the
+    // buttons, which are things you press, not things you drag.
+    //
+    // Re-asserted on every motion rather than only on the crossing: the
+    // compositor recomputes its own cursor against whatever lies under the
+    // pointer before this runs, so a shape set once quietly reverts.
+    if (m_bDraggingThis || m_bDragPending) {
+        // Held: the hand stays closed even when a fast drag outruns the strip.
+        g_barCursorOwner = this;
+        setBarCursor("grabbing");
+    } else {
+        switch (hoverZone()) {
+            // Taking the shape also takes ownership, so whichever order the
+            // bars' listeners run in, the one under the pointer ends up
+            // holding it: if the old owner runs after us it sees the
+            // ownership has moved and leaves the pointer alone.
+            case HOVER_STRIP:
+                g_barCursorOwner = this;
+                setBarCursor("grab");
+                break;
+            case HOVER_BUTTON:
+                g_barCursorOwner = this;
+                setBarCursor("pointer");
+                break;
+            case HOVER_NONE:
+                if (g_barCursorOwner == this) {
+                    g_barCursorOwner = nullptr;
+                    setBarCursor(nullptr);
+                }
+                break;
+        }
+    }
 
     if (!m_bDragPending || !validMapped(m_pWindow))
         return;
@@ -247,13 +609,21 @@ void CGolemBar::handleDownEvent(Event::SCallbackInfo& info) {
         return;
 
     m_bDragPending = true;
+    // The hand closes ON THE PRESS, not when motion starts: taking hold is
+    // the press, the drag is just where the hand goes afterwards.
+    g_barCursorOwner = this;
+    setBarCursor("grabbing");
 }
 
 void CGolemBar::handleUpEvent(Event::SCallbackInfo& info) {
-    if (m_pWindow.lock() != Desktop::focusState()->window())
-        return;
-
-    if (m_bCancelledDown)
+    // ⚠️ The focus check guards ONLY the event-swallowing. It used to guard the
+    // whole function — and when focus had shifted between press and release
+    // (the daemon rearranges focus; a drag can land it elsewhere), the early
+    // return skipped ALL cleanup: `m_bDragPending`/`m_bDraggingThis` stayed
+    // true forever, and every later motion re-asserted the hand. That is the
+    // "open hand gets stuck" (Max, 2026-09-15). State cleanup on button-up is
+    // unconditional; a release ends the press NO MATTER where focus went.
+    if (m_bCancelledDown && m_pWindow.lock() == Desktop::focusState()->window())
         info.cancelled = true;
 
     m_bCancelledDown = false;
@@ -265,6 +635,19 @@ void CGolemBar::handleUpEvent(Event::SCallbackInfo& info) {
     }
 
     m_bDragPending = false;
+
+    // Let go: the hand reopens over the strip, points over a button, or goes
+    // back to the arrow if the release landed elsewhere.
+    if (g_barCursorOwner == this) {
+        switch (hoverZone()) {
+            case HOVER_STRIP: setBarCursor("grab"); break;
+            case HOVER_BUTTON: setBarCursor("pointer"); break;
+            case HOVER_NONE:
+                g_barCursorOwner = nullptr;
+                setBarCursor(nullptr);
+                break;
+        }
+    }
 }
 
 void CGolemBar::handleMovement() {
@@ -295,31 +678,16 @@ bool CGolemBar::doButtonPress(Vector2D COORDS) {
                 // already focused this window, which is the one the verb acts
                 // on.
                 case GOLEM_BAR_TILE: sendWaverunner("window-mode tiled\n"); break;
+                // Swallows the press deliberately: the button is real, it just
+                // has no job yet. Returning true below still consumes the
+                // click, so it never falls through to a window drag.
+                case GOLEM_BAR_UNWIRED: break;
             }
             return true;
         }
 
     }
     return false;
-}
-
-void CGolemBar::renderBarTitle(const Vector2D& bufferSize, const float scale) {
-    const int   scaledSize        = std::round(GOLEM_TITLE_SIZE * scale);
-    const auto  scaledButtonsSize = golemButtonsWidth(g_pBarsState->buttons.size()) * scale;
-    const auto  scaledBarPadding  = GOLEM_BAR_PADDING * scale;
-    // Room for the title: the bar, less the buttons standing at its LEFT (their
-    // own inset included) and the air at its right end.
-    const int   paddingTotal = GOLEM_BUTTONS_LEFT * scale + scaledButtonsSize + scaledBarPadding;
-    const int   maxWidth     = std::clamp(static_cast<int>(bufferSize.x - paddingTotal), 0, INT_MAX);
-
-    if (m_szLastTitle.empty() || maxWidth < 1) {
-        m_pTextTex = nullptr;
-        return;
-    }
-
-    // `m_lastInk` is set by the caller, which is also what decides when this
-    // has to run again.
-    m_pTextTex = g_pHyprRenderer->renderText(m_szLastTitle, m_lastInk, scaledSize, false, GOLEM_TITLE_FONT, maxWidth);
 }
 
 size_t CGolemBar::getVisibleButtonCount(const Vector2D& bufferSize, const float scale) {
@@ -346,8 +714,22 @@ void CGolemBar::renderBarButtons(CBox* barBox, const float scale, const float a)
         auto&      button           = g_pBarsState->buttons[i];
         const auto scaledButtonSize = GOLEM_BUTTON_SIZE * scale;
 
+        // The buttons keep their OWN colour at full strength — they are the one
+        // thing on the bar you aim at, and a target you can see through is a
+        // worse target (Max, 2026-09-15: *"the buttons stay 100% opacity"*).
+        // `GOLEM_FLOAT_ALPHA` tints the frame's colour, never these; `a` is the
+        // window's own fade, which they do follow.
         auto       color = button.bgcol;
         color.a *= a;
+
+        // Hover lifts the disc toward white — the same answer at the same
+        // strength on all three, so the row reads as one control set. State
+        // comes from `m_iButtonHoverState`, written on the motion path.
+        if ((m_iButtonHoverState >> i) & 1u) {
+            color.r += (1.0 - color.r) * GOLEM_BUTTON_HOVER_LIFT;
+            color.g += (1.0 - color.g) * GOLEM_BUTTON_HOVER_LIFT;
+            color.b += (1.0 - color.b) * GOLEM_BUTTON_HOVER_LIFT;
+        }
 
         CBox buttonBox = {barBox->x + golemButtonX(i, scale), barBox->y + golemButtonY(barBox->h, BORDER * scale, scaledButtonSize), scaledButtonSize, scaledButtonSize};
         buttonBox.round();
@@ -358,19 +740,14 @@ void CGolemBar::renderBarButtons(CBox* barBox, const float scale, const float a)
 
 void CGolemBar::renderBarButtonsText(CBox* barBox, const float scale, const float a) {
     const auto visibleCount = getVisibleButtonCount(Vector2D{barBox->w, barBox->h}, scale);
-    const auto COORDS       = cursorRelativeToBar();
     const auto BORDER       = borderBelow();
 
     for (size_t i = 0; i < visibleCount; ++i) {
         auto&      button           = g_pBarsState->buttons[i];
         const auto scaledButtonSize = GOLEM_BUTTON_SIZE * scale;
 
-        const auto BARBUF     = Vector2D{(int)assignedBoxGlobal().w, GOLEM_BAR_HEIGHT};
-        Vector2D   currentPos = Vector2D{golemButtonX(i, 1.F), golemButtonY(BARBUF.y, borderBelow(), GOLEM_BUTTON_SIZE)}.floor();
-        bool       hovering = VECINRECT(COORDS, currentPos.x, currentPos.y, currentPos.x + GOLEM_BUTTON_SIZE + GOLEM_BUTTON_PADDING, currentPos.y + GOLEM_BUTTON_SIZE);
-
         if ((!button.iconTex || button.iconTex->m_texID == 0) && !button.icon.empty())
-            button.iconTex = g_pHyprRenderer->renderText(button.icon, button.fgcol, std::round(GOLEM_BUTTON_SIZE * 0.62 * scale), false, GOLEM_TITLE_FONT, scaledButtonSize);
+            button.iconTex = g_pHyprRenderer->renderText(button.icon, button.fgcol, std::round(GOLEM_BUTTON_SIZE * 0.62 * scale), false, GOLEM_BAR_FONT, scaledButtonSize);
 
         if (!button.iconTex || button.iconTex->m_texID == 0)
             continue;
@@ -385,12 +762,6 @@ void CGolemBar::renderBarButtonsText(CBox* barBox, const float scale, const floa
         CBox       pos   = {iconX, iconY, button.iconTex->m_size.x, button.iconTex->m_size.y};
 
         g_pHyprOpenGL->renderTexture(button.iconTex, pos, {.a = a});
-
-        bool currentBit = (m_iButtonHoverState & (1 << i)) != 0;
-        if (hovering != currentBit) {
-            m_iButtonHoverState ^= (1 << i);
-            damageEntire();
-        }
     }
 }
 
@@ -411,6 +782,11 @@ void CGolemBar::draw(PHLMONITOR pMonitor, const float& a) {
 
 void CGolemBar::renderPass(PHLMONITOR pMonitor, const float& a) {
     const auto PWINDOW = m_pWindow.lock();
+
+    // Keep the translucent frame in step with the colour pass. Guarded inside
+    // to a no-op unless the colours actually moved, so this is a comparison
+    // per frame and a real update only when the desktop's colour changes.
+    syncFloatTint();
 
     // Retargeted every frame: the border colour is itself animated by the
     // compositor (focus) and rewritten by the daemon (the colour pass), so the
@@ -445,6 +821,26 @@ void CGolemBar::renderPass(PHLMONITOR pMonitor, const float& a) {
     if (titleBarBox.w < 1 || titleBarBox.h < 1)
         return;
 
+    // ⭐ STOP THE STRIP WHERE THE BORDER STARTS — they must not share a pixel.
+    //
+    // The bar and the border are the same colour at the same alpha, so on an
+    // opaque frame an overlap of a pixel or two at their junction was invisible
+    // and nobody noticed the decoration box and the border's outer edge round
+    // independently. Translucent, that overlap DOUBLE-BLENDS: measured down a
+    // column through the top edge, the strip reads 87,103,109 and the two rows
+    // where they meet jump to 117,118,116 — a bright line along the top edge and
+    // around the top corners, which is what reads as "the window's border"
+    // showing through the frame (Max, 2026-09-15).
+    //
+    // So the strip is cut back to the border's OUTER edge, derived from the
+    // window itself rather than from the decoration box, and FLOORED so a
+    // rounding wobble can only ever leave the border a hair short — which is
+    // invisible, because the border paints that hair itself. Overlapping is the
+    // failure; abutting is not.
+    const double BORDEROUT = std::floor((PWINDOW->m_realPosition->value().y + PWINDOW->m_floatingOffset.y - PWINDOW->getRealBorderSize() - pMonitor->m_position.y) * pMonitor->m_scale);
+    if (BORDEROUT > clipBox.y)
+        clipBox.h = std::min(clipBox.h, BORDEROUT - clipBox.y);
+
     // ⭐ THE OVERHANG IS CLIPPED BY **DAMAGE**, AND ONLY BY DAMAGE.
     //
     // `renderRect` scissors the GL state itself, once per rect of the damage
@@ -478,45 +874,47 @@ void CGolemBar::renderPass(PHLMONITOR pMonitor, const float& a) {
     // down here; its bottom rounding is 2·R further down and never gets in),
     // and there is no second shape to seam against.
     //
-    // ⚠️ THE REGION HUGS THE CURVE — it is NOT two solid corner boxes. Window
-    // content can be TRANSLUCENT (a terminal's alpha, an opacity rule), and
-    // anything painted under it shows through: solid boxes ghosted through the
-    // content as a lighter square in each top corner (Max, 2026-09-15, zoom in
-    // hand: *"there is a square on each side, inside the content"*). So the
-    // region is a staircase of row-bands tracing the border's OUTER curve —
-    // Hyprland's own corner shape, radius `ROUNDING`, exponent
-    // `roundingPower()` — each band as wide as the curve's inset at its top
-    // row, plus 2px that tuck under the opaque border. The paint therefore
-    // stops at the border band and NOTHING lies under the content.
+    // ⚠️ THE REGION HUGS THE CURVE — it is NOT two solid corner boxes, and it
+    // must not reach a pixel PAST the curve either. Two different artefacts,
+    // both of which Max caught by zooming in, and both caused by paint landing
+    // somewhere it is not the only layer:
     //
-    // The staircase's jagged inner edge never shows: it is under the border,
-    // and the border draws over it. It runs to the tangent depth `R`, where
-    // the wedge closes on its own — no bottom cut — and is clamped to half the
-    // window's height and half the bar's width so it can never reach a short
-    // window's bottom corners: the slab standing outside the window is the
-    // failure this file has already had twice today.
+    //   · under the CONTENT — content can be translucent (a terminal's alpha,
+    //     an opacity rule), so solid corner boxes ghosted through it as a
+    //     lighter square in each top corner: *"there is a square on each side,
+    //     inside the content"*;
+    //   · under the BORDER — the frame is translucent on floats now
+    //     (`syncFloatTint`), so a fill tucked beneath it double-blends into a
+    //     brighter arc tracing each corner. Measured: the border reads
+    //     189,142,115 down the straight side and 236,175,140 where the old
+    //     2px tuck sat under it.
+    //
+    // So the fill stops exactly AT the border's outer edge and nowhere beyond.
+    // One band per physical row, each as wide as the curve's inset at the row's
+    // BOTTOM — the narrowest the wedge gets anywhere in that row, so the paint
+    // can never cross the curve. The shortfall is under a pixel and lands in
+    // the border's own antialiased edge; the doubling was two full pixels.
+    //
+    // The curve is Hyprland's own corner: radius `ROUNDING`, exponent
+    // `roundingPower()`. It falls away fast (~35 rows at Golem's radius), so
+    // the loop ends itself once the wedge is thinner than a pixel — no bottom
+    // cut, and nothing painted down at a short window's own corners.
     {
         const double P    = std::max(2.0, static_cast<double>(PWINDOW->roundingPower()));
         const double R    = ROUNDING * pMonitor->m_scale;
         const double seam = clipBox.y + clipBox.h;
         const double HMAX = std::min(R, PWINDOW->m_realSize->value().y * pMonitor->m_scale / 2.0);
         const double WMAX = clipBox.w / 2.0;
-        const auto   inset = [&](double d) { // curve's distance in from the side, at depth d below the seam
-            const double t = 1.0 - d / R;
+        const auto   inset = [&](double d) { // the curve's distance in from the side, at depth d below the seam
+            const double t = std::clamp(1.0 - d / R, 0.0, 1.0);
             return R - R * std::pow(1.0 - std::pow(t, P), 1.0 / P);
         };
-        double d = 0.0;
-        while (d < HMAX && R > 0.0) {
-            const double w = std::min(inset(d) + 2.0, WMAX);
-            if (w <= 0.5)
-                break;
-            // One band per whole pixel the curve moves in by — ~30 bands, not R.
-            double d2 = d + 1.0;
-            while (d2 < HMAX && inset(d) - inset(d2) <= 1.0)
-                d2 += 1.0;
-            barDamage.add(CBox{clipBox.x, seam + d, w, d2 - d});
-            barDamage.add(CBox{clipBox.x + clipBox.w - w, seam + d, w, d2 - d});
-            d = d2;
+        for (double d = 0.0; d + 1.0 <= HMAX && R > 0.0; d += 1.0) {
+            const double w = std::min(inset(d + 1.0), WMAX);
+            if (w < 1.0)
+                break; // thinner than a pixel — the border's own edge covers the rest
+            barDamage.add(CBox{clipBox.x, seam + d, w, 1.0});
+            barDamage.add(CBox{clipBox.x + clipBox.w - w, seam + d, w, 1.0});
         }
     }
 
@@ -525,42 +923,18 @@ void CGolemBar::renderPass(PHLMONITOR pMonitor, const float& a) {
     // window.
     g_pHyprOpenGL->renderRect(titleBarBox, color, {.damage = &barDamage, .round = scaledRounding, .roundingPower = m_pWindow->roundingPower()});
 
-    if (m_szLastTitle != PWINDOW->m_title || m_bWindowSizeChanged || !m_pTextTex || m_pTextTex->m_texID == 0 || inkOn(color) != m_lastInk) {
-        m_szLastTitle = PWINDOW->m_title;
-        m_lastInk     = inkOn(color);
-        renderBarTitle(BARBUF, pMonitor->m_scale);
-    }
-
+    // NO TITLE. The bar carries its buttons and nothing else (Max,
+    // 2026-09-15: *"get rid of the title on the bar"*) — the window's name is
+    // already on the OPTIONS bar at the top of the screen, and at Golem's
+    // transparency a second copy of it read as clutter over the wallpaper.
     // Truncated to whole pixels (upstream's), stated as doubles so the box's
     // own type does not have to narrow them.
-    CBox textBox = {titleBarBox.x, titleBarBox.y, static_cast<double>(static_cast<int>(BARBUF.x)), static_cast<double>(static_cast<int>(BARBUF.y))};
-    if (m_pTextTex) {
-        // LEFT, at the bar's own padding — the arrangement a titlebar has on
-        // every desktop these bars exist to feel familiar to, and the one that
-        // is honest about the texture: `renderText` pads it out to the width it
-        // was given and sets the glyphs at the left, so centring the texture
-        // would leave the words looking arbitrarily off-centre (measured — the
-        // title sat ~360px left of the middle of its own bar).
-        // After the buttons, which stand at the left — the title still starts
-        // at the bar's own padding, that padding just begins where the button
-        // row ends (Max, 2026-09-13).
-        const auto xOffset =
-            std::round((GOLEM_BUTTONS_LEFT + golemButtonsWidth(g_pBarsState->buttons.size())) * pMonitor->m_scale);
-        const auto yOffset  = std::round((BARBUF.y - m_pTextTex->m_size.y) / 2.0);
-        CBox       titleBox = {textBox.x + xOffset, textBox.y + yOffset, m_pTextTex->m_size.x, m_pTextTex->m_size.y};
+    CBox barBox = {titleBarBox.x, titleBarBox.y, static_cast<double>(static_cast<int>(BARBUF.x)), static_cast<double>(static_cast<int>(BARBUF.y))};
 
-        // Same damage clip as the bar: a title is padded out to the width it was
-        // given, and a window narrow enough for that padding to reach past its
-        // own edge would otherwise trail glyphs onto the desktop.
-        g_pHyprOpenGL->renderTexture(m_pTextTex, titleBox, {.damage = &barDamage, .a = a});
-    }
-
-    renderBarButtons(&textBox, pMonitor->m_scale, a);
+    renderBarButtons(&barBox, pMonitor->m_scale, a);
     m_bButtonsDirty = false;
 
-    renderBarButtonsText(&textBox, pMonitor->m_scale, a);
-
-    m_bWindowSizeChanged = false;
+    renderBarButtonsText(&barBox, pMonitor->m_scale, a);
 }
 
 eDecorationType CGolemBar::getDecorationType() {
@@ -627,18 +1001,25 @@ float CGolemBar::borderBelow() {
     return PWINDOW ? static_cast<float>(PWINDOW->getRealBorderSize()) : 0.F;
 }
 
+// The ONE writer of `m_iButtonHoverState`: input-side tracking on the motion
+// path, so the render functions only READ it. (Its predecessor kept a single
+// bool for all three buttons and toggled it per button per motion — while the
+// pointer sat on any button, two of the three comparisons disagreed with the
+// bool every event, and the bar damaged itself continuously.)
 void CGolemBar::damageOnButtonHover() {
-    const auto COORDS = cursorRelativeToBar();
-
-    for (size_t i = 0; i < g_pBarsState->buttons.size(); ++i) {
-        const auto BARBUF     = Vector2D{(int)assignedBoxGlobal().w, GOLEM_BAR_HEIGHT};
-        Vector2D   currentPos = Vector2D{golemButtonX(i, 1.F), golemButtonY(BARBUF.y, borderBelow(), GOLEM_BUTTON_SIZE)}.floor();
-
-        bool       hover = VECINRECT(COORDS, currentPos.x, currentPos.y, currentPos.x + GOLEM_BUTTON_SIZE + GOLEM_BUTTON_PADDING, currentPos.y + GOLEM_BUTTON_SIZE);
-
-        if (hover != m_bButtonHovered) {
-            m_bButtonHovered = hover;
-            damageEntire();
+    // Hidden or unhoverable, nothing may stay lit.
+    unsigned int mask = 0;
+    if (!m_hidden && inputIsValid()) {
+        const auto COORDS = cursorRelativeToBar();
+        for (size_t i = 0; i < g_pBarsState->buttons.size(); ++i) {
+            const auto BARBUF     = Vector2D{(int)assignedBoxGlobal().w, GOLEM_BAR_HEIGHT};
+            Vector2D   currentPos = Vector2D{golemButtonX(i, 1.F), golemButtonY(BARBUF.y, borderBelow(), GOLEM_BUTTON_SIZE)}.floor();
+            if (VECINRECT(COORDS, currentPos.x, currentPos.y, currentPos.x + GOLEM_BUTTON_SIZE + GOLEM_BUTTON_PADDING, currentPos.y + GOLEM_BUTTON_SIZE))
+                mask |= 1u << i;
         }
+    }
+    if (mask != m_iButtonHoverState) {
+        m_iButtonHoverState = mask;
+        damageEntire();
     }
 }

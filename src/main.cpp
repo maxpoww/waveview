@@ -107,15 +107,25 @@ static const CHyprColor     DSN_BORDER_COL{1.0, 0.745, 0.596, 1.0};   // #ffbe98
 // colours; callers then fall back to the flat DSN_BORDER_COL. This runs
 // inside the render hook, where a wrong colour is cosmetic but a null deref
 // ends the session — hence a check at every step rather than a bare cast.
-static Config::CGradientValueData* activeBorderGradient() {
-    static CConfigValue<Config::IComplexConfigValue> s_col("general:col.active_border");
-    if (!s_col.good() || !s_col.m_p) // ptr() dereferences m_p unconditionally
+// Not static: Golem's titlebars (src/hyprbars/) read it too, to tint a
+// floating window's frame from the same live colours. The `m_p` guard needs
+// the privates-opening hack at the top of this file, which is why the helper
+// lives here rather than being copied into the bar.
+Config::CGradientValueData* borderGradient(bool active) {
+    static CConfigValue<Config::IComplexConfigValue> s_active("general:col.active_border");
+    static CConfigValue<Config::IComplexConfigValue> s_inactive("general:col.inactive_border");
+    auto&                                            slot = active ? s_active : s_inactive;
+    if (!slot.good() || !slot.m_p) // ptr() dereferences m_p unconditionally
         return nullptr;
-    auto* const v = s_col.ptr();
+    auto* const v = slot.ptr();
     if (!v || v->getDataType() != Config::CVD_TYPE_GRADIENT)
         return nullptr;
     auto* const grad = static_cast<Config::CGradientValueData*>(v);
     return grad->m_colors.empty() ? nullptr : grad;
+}
+
+static Config::CGradientValueData* activeBorderGradient() {
+    return borderGradient(true);
 }
 
 inline HANDLE              PHANDLE = nullptr;
