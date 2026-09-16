@@ -208,10 +208,17 @@ void CGolemBar::refreshDecorationsLater() {
     if (m_refreshLock)
         return; // one pending refresh is enough for any burst of frames
 
+    // ⚠️ `valid()` + `get()`, NOT `lock()`: the bars are UNIQUE pointers, and
+    // hyprutils marks unique-backed impls `lockable = false` — lock() on
+    // `m_self` is null by design, ALWAYS. The first cut locked here, so this
+    // lambda silently did nothing (and the never-reset lock meant each bar
+    // could queue exactly one refresh in its life). The raw pointer is safe:
+    // valid() proves the bar alive, and nothing can destroy it between the
+    // check and the use — both run in this same event-loop dispatch.
     m_refreshLock = g_pEventLoopManager->doLaterLock([self = m_self]() {
-        const auto BAR = self.lock();
-        if (!BAR)
+        if (!self.valid())
             return; // the bar (and its window) went away before we ran
+        auto* const BAR = self.get();
         BAR->m_refreshLock.reset();
         if (!validMapped(BAR->m_pWindow))
             return;
