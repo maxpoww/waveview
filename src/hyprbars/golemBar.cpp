@@ -63,6 +63,14 @@ static CHyprColor barColor(PHLWINDOW w) {
     return CHyprColor{0xEE0D0F14ULL};
 }
 
+/// Ink that stays readable on whatever the bar turns out to be: the bar wears
+/// the border, and Golem's borders run from a light peach (focused) to a dark
+/// brown (not) — one fixed text colour cannot serve both.
+static CHyprColor inkOn(const CHyprColor& bg) {
+    const float L = 0.2126f * bg.r + 0.7152f * bg.g + 0.0722f * bg.b;
+    return L > 0.5f ? CHyprColor{0xFF14171CULL} : CHyprColor{0xFFE8E6E3ULL};
+}
+
 CGolemBar::CGolemBar(PHLWINDOW pWindow) : IHyprWindowDecoration(pWindow) {
     m_pWindow = pWindow;
 
@@ -121,6 +129,18 @@ CGolemBar::~CGolemBar() {
 /// Defined in `main.cpp`: reading it safely needs the privates-opening hack at
 /// the top of that file, and the overview's rings already read it the same way.
 extern Config::CGradientValueData* borderGradient(bool active);
+
+/// Whether waveview's overview or spread owns the screen (defined in
+/// `main.cpp`). While it does, pointer input belongs to their CARDS: a press
+/// must never take hold of an invisible bar beneath the overlay, and any
+/// hold from before the takeover ends immediately — a swallowed release used
+/// to leak `m_bDragPending` and every later motion re-asserted the closed
+/// hand ("the pointer is stuck on the closed hand", Max, 2026-09-16).
+extern bool waveviewOwnsScreen();
+
+/// Minimize `w` to the dock (defined in `../main.cpp` — it owns the capture
+/// plumbing, the fly animation and the daemon protocol).
+void golemMinimize(PHLWINDOW w);
 
 void CGolemBar::syncFloatTint() {
     if (!validMapped(m_pWindow))
@@ -339,6 +359,10 @@ bool CGolemBar::inputIsValid() {
 }
 
 void CGolemBar::onMouseButton(Event::SCallbackInfo& info, IPointer::SButtonEvent e) {
+    if (waveviewOwnsScreen()) {
+        standDown();
+        return;
+    }
     if (!inputIsValid())
         return;
 
@@ -543,7 +567,20 @@ CGolemBar::eBarHover CGolemBar::hoverZone() {
     return HOVER_STRIP;
 }
 
+void CGolemBar::standDown() {
+    if (m_bDraggingThis)
+        g_pKeybindManager->changeMouseBindMode(MBIND_INVALID); // never leave a real drag running under the overlay
+    m_bDraggingThis  = false;
+    m_bDragPending   = false;
+    m_bCancelledDown = false;
+    releaseCursorIfOwner();
+}
+
 void CGolemBar::onMouseMove(Vector2D coords) {
+    if (waveviewOwnsScreen()) {
+        standDown();
+        return;
+    }
     damageOnButtonHover();
 
     // The bar says what it is by how the pointer looks on it (Max, 2026-09-15):
@@ -685,16 +722,45 @@ bool CGolemBar::doButtonPress(Vector2D COORDS) {
                 // already focused this window, which is the one the verb acts
                 // on.
                 case GOLEM_BAR_TILE: sendWaverunner("window-mode tiled\n"); break;
-                // Swallows the press deliberately: the button is real, it just
-                // has no job yet. Returning true below still consumes the
-                // click, so it never falls through to a window drag.
-                case GOLEM_BAR_UNWIRED: break;
+                // Minimize to the dock — the plugin's own machinery (main.cpp):
+                // it owns the card capture, the fly animation and the
+                // special-workspace park, and tells the daemon when the card
+                // lands so the dock entry appears as the window arrives.
+                case GOLEM_BAR_MIN: golemMinimize(PWINDOW); break;
             }
             return true;
         }
 
     }
     return false;
+}
+
+/// (Re)render the title texture, TIGHT — sized to the words, not to the room
+/// they have — so the caller can truly centre it. `renderText` pads a
+/// width-capped texture out to that width with the glyphs at the LEFT, which
+/// is why the first cut of a centred title measured ~360px off centre; a
+/// tight texture is the only one whose middle is the words' middle. Only a
+/// title too wide for its room takes the capped (ellipsised, padded) render,
+/// and that one FILLS the room, so its middle is the room's middle anyway.
+///
+/// The room is symmetric: the button row's span (its inset and trailing gap
+/// included, `golemButtonX` one past the end) is kept clear on BOTH sides, so
+/// the centre of the title is the centre of the BAR, not of the leftovers.
+void CGolemBar::renderBarTitle(const Vector2D& bufferSize, const float scale) {
+    const int scaledSize = static_cast<int>(std::round(GOLEM_TITLE_SIZE * scale));
+    const int side       = static_cast<int>(std::round(std::max(golemButtonX(g_pBarsState->buttons.size(), scale), GOLEM_BAR_PADDING * scale)));
+    const int maxWidth   = static_cast<int>(bufferSize.x) - 2 * side;
+
+    if (m_szLastTitle.empty() || maxWidth < 1) {
+        m_pTextTex = nullptr;
+        return;
+    }
+
+    // `m_lastInk` is set by the caller, which is also what decides when this
+    // has to run again.
+    m_pTextTex = g_pHyprRenderer->renderText(m_szLastTitle, m_lastInk, scaledSize, false, GOLEM_BAR_FONT, 0);
+    if (m_pTextTex && m_pTextTex->m_size.x > maxWidth)
+        m_pTextTex = g_pHyprRenderer->renderText(m_szLastTitle, m_lastInk, scaledSize, false, GOLEM_BAR_FONT, maxWidth);
 }
 
 size_t CGolemBar::getVisibleButtonCount(const Vector2D& bufferSize, const float scale) {
@@ -930,13 +996,35 @@ void CGolemBar::renderPass(PHLMONITOR pMonitor, const float& a) {
     // window.
     g_pHyprOpenGL->renderRect(titleBarBox, color, {.damage = &barDamage, .round = scaledRounding, .roundingPower = m_pWindow->roundingPower()});
 
-    // NO TITLE. The bar carries its buttons and nothing else (Max,
-    // 2026-09-15: *"get rid of the title on the bar"*) — the window's name is
-    // already on the OPTIONS bar at the top of the screen, and at Golem's
-    // transparency a second copy of it read as clutter over the wallpaper.
+    // THE TITLE, BACK AND CENTRED (Max, 2026-09-15: *"put the title on the
+    // title bar, on the center"* — it left the bar earlier the same day, and
+    // its old seat was the LEFT). Re-rendered only when what it shows or the
+    // room it has changes: the name, the ink (the bar colour animates with
+    // focus, and the ink flips at its threshold), or the bar's width.
+    if (m_szLastTitle != PWINDOW->m_title || !m_pTextTex || m_pTextTex->m_texID == 0 || inkOn(color) != m_lastInk || m_lastBarW != static_cast<int>(BARBUF.x)) {
+        m_szLastTitle = PWINDOW->m_title;
+        m_lastInk     = inkOn(color);
+        m_lastBarW    = static_cast<int>(BARBUF.x);
+        renderBarTitle(BARBUF, pMonitor->m_scale);
+    }
+
     // Truncated to whole pixels (upstream's), stated as doubles so the box's
     // own type does not have to narrow them.
     CBox barBox = {titleBarBox.x, titleBarBox.y, static_cast<double>(static_cast<int>(BARBUF.x)), static_cast<double>(static_cast<int>(BARBUF.y))};
+
+    if (m_pTextTex) {
+        // Centred on the bar's own middle — the texture is tight (see
+        // `renderBarTitle`), so the texture's middle IS the words' middle —
+        // and on the buttons' optical line: centred in the bar PLUS the top
+        // border, like `golemButtonY`, or the words read as sitting high.
+        const auto xOffset  = std::round((BARBUF.x - m_pTextTex->m_size.x) / 2.0);
+        const auto yOffset  = std::round(golemButtonY(BARBUF.y, borderBelow() * pMonitor->m_scale, m_pTextTex->m_size.y));
+        CBox       titleBox = {barBox.x + xOffset, barBox.y + yOffset, m_pTextTex->m_size.x, m_pTextTex->m_size.y};
+
+        // Same damage clip as the bar, so a long title's ellipsised texture
+        // can never trail glyphs past the strip.
+        g_pHyprOpenGL->renderTexture(m_pTextTex, titleBox, {.damage = &barDamage, .a = a});
+    }
 
     renderBarButtons(&barBox, pMonitor->m_scale, a);
     m_bButtonsDirty = false;

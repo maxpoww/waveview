@@ -19,12 +19,12 @@ enum eGolemBarButton : uint8_t {
     /// Put it back in the layout — Golem's answer to "unmaximize", since a
     /// floating window's way home is the tiling it left.
     GOLEM_BAR_TILE,
-    /// Reserved: a third control, drawn and clickable but doing nothing yet
-    /// (Max, 2026-09-15: *"add another button (we are gonna wire it later)"*).
-    /// It is a real button so the row's spacing, hover and hit-testing are
-    /// settled now; give it an action in `doButtonPress` when we know what it
-    /// should do.
-    GOLEM_BAR_UNWIRED,
+    /// Minimize to the DOCK, macOS-style (Max, 2026-09-16: *"the yellow
+    /// button to minimize the window to dock. same as macos. (not to the
+    /// icon) to the dock"*): the window's decorated card flies into the
+    /// dock, the window itself parks on `special:minimized`, and waverunner
+    /// shows a per-window thumbnail entry that restores it on click.
+    GOLEM_BAR_MIN,
 };
 
 /// One button: what it does, what it looks like, and the glyph texture once it

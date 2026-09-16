@@ -37,25 +37,29 @@ namespace Event {
 // Constants, not config. Golem has one titlebar; a knob here would be a knob
 // nobody turns, and the values want to be read next to each other anyway.
 
-/// Bar height in logical px (Max, 2026-09-13: *"make the bar a little
-/// smaller"*, then 2026-09-15: *"make the bar thinner"* once the title left
-/// and the strip had only the button row to hold).
+/// Bar height in logical px. Started at the OPTIONS banner's height (Max,
+/// 2026-09-15: *"match the title bar size (height) with the banner one"* —
+/// waverunner's `config.options.height` = 28), then stepped down by eye with
+/// the buttons: 28 → 26 → 24 → 25 → **26** (*"bar 26 buttons 17"*).
+/// (Earlier: 2026-09-13 *"make the bar a little smaller"*, 2026-09-15 *"make
+/// the bar thinner"* down to 22, then the banner match.)
 ///
-/// ⚠️ The floor for an 18px button is **22**: the buttons are centred in the
-/// bar PLUS the window's top border (`golemButtonY`), so 22 + 3 leaves 3.5px
-/// of air above and below the disc. Going thinner means shrinking
-/// [`GOLEM_BUTTON_SIZE`] with it, or the discs start touching the window.
-inline constexpr int GOLEM_BAR_HEIGHT = 22;
+/// ⚠️ The buttons are centred in the bar PLUS the window's top border
+/// (`golemButtonY`), so 26 + 3 leaves 6px of air above and below a 17px
+/// disc. Shrinking the bar means shrinking [`GOLEM_BUTTON_SIZE`] with it, or
+/// the discs start touching the window.
+inline constexpr int GOLEM_BAR_HEIGHT = 26;
 /// Air at each end of the bar.
 inline constexpr int GOLEM_BAR_PADDING = 10;
 /// Air between the buttons.
 inline constexpr int GOLEM_BUTTON_PADDING = 7;
-/// Button diameter. Tuned by eye over two sessions: 14 → 16 → 18 (Max,
-/// 2026-09-13: *"make them little bigger"*, then *"slightly bigger"*), then
-/// 15 and back up to **17** on 2026-09-15 once the bar came down to 22px and
-/// the title was gone (*"that is too small, make them 17"*). In a 22px bar
-/// that leaves 2.5px of air above and below — the discs are the only thing in
-/// the strip, so they set its rhythm.
+/// Button diameter. Started from the OPTIONS bar's control circles (Max,
+/// 2026-09-15: *"match the button size on the title bar with the OPTIONS
+/// ones"* — a glyph pill there is a perfect circle of pill height = bar 28 −
+/// 2 × 2.5 margin = 23, waverunner's `options_pill_h`), then stepped down by
+/// eye: 23 read too big on the strip (*"that is too big, make them little
+/// smaller"*) → 21 → 20 → 19 → 16 → **17** (*"bar 25 buttons 17"*, settling
+/// back up half a step). Earlier history: 14 → 16 → 18 → 15 → 17.
 inline constexpr float GOLEM_BUTTON_SIZE = 17;
 /// How far the button row starts from the bar's left edge — its OWN inset, not
 /// the bar's end padding, so the buttons can sit in from the corner without
@@ -105,10 +109,15 @@ inline float golemButtonY(float barHeight, float border, float buttonSize) {
     return (barHeight + border - buttonSize) / 2.F;
 }
 
-/// The family the button glyphs are set in — the shell's own font rather than
-/// the compositor's default. (It carried the title too, until the title was
-/// dropped; the glyphs still need a name to render with.)
+/// The family the title and the button glyphs are set in — the shell's own
+/// font rather than the compositor's default.
 inline constexpr const char* GOLEM_BAR_FONT = "Sans";
+
+/// Title text size (pt at scale 1). The title is back on the bar and CENTRED
+/// (Max, 2026-09-15: *"put the title on the title bar, on the center"*) after
+/// a spell away earlier the same day — and its old seat was the LEFT, so the
+/// centring is new, not restored. 14 → 16 (*"bigger text"*) → **15**.
+inline constexpr int GOLEM_TITLE_SIZE = 15;
 
 /// How far a hovered button's disc lifts toward white, 0..1. Strong enough to
 /// answer the hand at a glance, weak enough that the disc keeps its identity —
@@ -153,6 +162,14 @@ class CGolemBar : public IHyprWindowDecoration {
     bool                 m_hidden         = true;
     bool                 m_bButtonsDirty  = true;
 
+    /// The centred title texture, and the state it was rendered from: the
+    /// title, the ink it was set in, and the bar width that capped it. Any of
+    /// the three changing re-renders it; nothing else does.
+    SP<Render::ITexture> m_pTextTex;
+    std::string          m_szLastTitle;
+    CHyprColor           m_lastInk  = CHyprColor{0ULL};
+    int                  m_lastBarW = -1;
+
     PHLANIMVAR<CHyprColor> m_cRealBarColor;
 
     /// True while this window carries our translucent-frame override.
@@ -189,6 +206,7 @@ class CGolemBar : public IHyprWindowDecoration {
     Vector2D cursorRelativeToBar();
 
     void     renderPass(PHLMONITOR, float const& a);
+    void     renderBarTitle(const Vector2D& bufferSize, const float scale);
     void     renderBarButtons(CBox* barBox, const float scale, const float a);
     void     renderBarButtonsText(CBox* barBox, const float scale, const float a);
     void     damageOnButtonHover();
@@ -210,6 +228,10 @@ class CGolemBar : public IHyprWindowDecoration {
     bool     inputIsValid();
     void     onMouseButton(Event::SCallbackInfo& info, IPointer::SButtonEvent e);
     void     onMouseMove(Vector2D coords);
+
+    /// End any press/drag/pointer-hint this bar holds — the overview or the
+    /// spread has taken the screen, and their cards own the pointer now.
+    void     standDown();
 
     void     handleDownEvent(Event::SCallbackInfo& info);
     void     handleUpEvent(Event::SCallbackInfo& info);

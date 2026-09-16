@@ -75,15 +75,14 @@ namespace Bars {
             .fgcol  = CHyprColor{0xFF1A1A1AULL},
             .icon   = "▤",
         });
-        // ORANGE — Golem's peach pushed to full blaze, on the slot Golem has
-        // not spoken for yet. No glyph on purpose: a symbol would promise a
-        // behaviour the button does not have. Give it one in the same breath
-        // as giving it an action (`GOLEM_BAR_UNWIRED`).
+        // ORANGE — minimize to the dock, macOS-style: the card flies into
+        // the dock and lives there as its own thumbnail until clicked back.
+        // The glyph arrives in the same breath as the action, as promised.
         g_pBarsState->buttons.push_back(SGolemButton{
-            .action = GOLEM_BAR_UNWIRED,
+            .action = GOLEM_BAR_MIN,
             .bgcol  = CHyprColor{0xFFFF9500ULL},
             .fgcol  = CHyprColor{0xFF1A1A1AULL},
-            .icon   = "",
+            .icon   = "–",
         });
 
         for (auto& w : g_pCompositor->m_windows) {
