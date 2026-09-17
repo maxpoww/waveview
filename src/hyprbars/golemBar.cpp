@@ -15,6 +15,7 @@
 #include <hyprland/src/Compositor.hpp>
 #include <hyprland/src/desktop/state/FocusState.hpp>
 #include <hyprland/src/desktop/view/Window.hpp>
+#include <hyprland/src/desktop/rule/windowRule/WindowRuleApplicator.hpp>
 #include <hyprland/src/helpers/MiscFunctions.hpp>
 #include <hyprland/src/managers/SeatManager.hpp>
 #include <hyprland/src/managers/CursorManager.hpp>
@@ -71,6 +72,20 @@ static CHyprColor inkOn(const CHyprColor& bg) {
     return L > 0.5f ? CHyprColor{0xFF14171CULL} : CHyprColor{0xFFE8E6E3ULL};
 }
 
+/// A window on the STAGE owns the whole screen (task mode maximizes it into the
+/// stage rect, the deck sitting in the gap below). A titlebar there is chrome on
+/// a window that is meant to stand alone — and it would float orphaned over the
+/// deck's band — so the bar stands down while the window is staged.
+///
+/// The daemon tags the staged window `golem-stage` (the SAME tag its
+/// `golem-stage-frame` rule matches to hand back the border + rounding), so the
+/// bar just reads that tag. Precise by construction: task mode's single staged
+/// window is tagged and loses its bar; desk-mode floats are never tagged (the
+/// tag only reaches a desk's window when it is alone and tiled) and keep theirs.
+static bool windowStaged(PHLWINDOW w) {
+    return w && w->m_ruleApplicator && w->m_ruleApplicator->m_tagKeeper.isTagged("golem-stage", true);
+}
+
 CGolemBar::CGolemBar(PHLWINDOW pWindow) : IHyprWindowDecoration(pWindow) {
     m_pWindow = pWindow;
 
@@ -78,7 +93,7 @@ CGolemBar::CGolemBar(PHLWINDOW pWindow) : IHyprWindowDecoration(pWindow) {
     if (PMONITOR)
         PMONITOR->m_scheduledRecalc = true;
 
-    m_hidden = !pWindow->m_isFloating;
+    m_hidden = !pWindow->m_isFloating || windowStaged(pWindow);
 
     m_pMouseButtonCallback =
         Event::bus()->m_events.input.mouse.button.listen([&](IPointer::SButtonEvent e, Event::SCallbackInfo& info) { onMouseButton(info, e); });
@@ -256,14 +271,15 @@ void CGolemBar::refreshDecorationsLater() {
     });
 }
 
-// The bar belongs to windows that have LEFT the layout. Upstream drove this
-// from a window rule; asking the window is the same mechanism with the one
-// condition Golem actually wants, and it costs a bool compare per update.
+// The bar belongs to windows that have LEFT the layout — and NOT to a window on
+// the stage (see `windowStaged`). Upstream drove this from a window rule; asking
+// the window is the same mechanism with the conditions Golem actually wants, and
+// it costs two bool compares per update.
 void CGolemBar::syncHidden() {
     if (!validMapped(m_pWindow))
         return;
 
-    const bool WANT = !m_pWindow->m_isFloating;
+    const bool WANT = !m_pWindow->m_isFloating || windowStaged(m_pWindow.lock());
     if (WANT == m_hidden)
         return;
 

@@ -438,7 +438,44 @@ static float           g_anim       = 0.0f;
 static float           g_animTarget = 0.0f;
 static int             g_zoomTile   = 0;
 static Time::steady_tp g_animLastT;
+// A close held over Golem's STAGE, waiting for waverunner to rebuild the stage
+// so the zoom can fly into a picture of it rather than of the bare workspace
+// (see `startClose`). `g_stageCloseAt` is when the hold began — the map must
+// never stay open because an answer never came.
+static bool            g_stageClosePending = false;
+// While true, `drawOverview` PAINTS the stage's dim over everything outside the
+// staged window — the only way it can land as a step, because a capture can
+// carry `dim_around` in one tile only. Set by `stage_ready` on the same frame as
+// the morph; cleared at the disengage and on every open.
+static bool            g_stageDimPaint     = false;
+// Ask waverunner for the REAL dim once, from the first linger frame — under the
+// overlay, so the desktop is already dark when it lifts and the painted dim it
+// replaces is the same shape.
+static bool            g_stageDimAsk       = false;
+/// Must match waverunner's `hypr::STAGE_DIM` — the stage's `decoration:dim_around`.
+static constexpr float GOLEM_STAGE_DIM     = 0.8f;
+static Time::steady_tp g_stageCloseAt;
+static constexpr auto  STAGE_CLOSE_WAIT    = std::chrono::milliseconds(400);
+/// Per-close override for the zoom clock (0 = use `ANIM_SECONDS`). Cleared at
+/// the disengage and on every open, so it can never leak into another close.
+static float           g_zoomSeconds       = 0.0f;
 static constexpr float ANIM_SECONDS = 0.28f;
+/// How fast the map OPENS — its own dial, so it can be quicker than the way
+/// back without touching the ordinary overview close (Max, 2026-09-17: *"in to
+/// overview faster"*).
+static constexpr float OPEN_ZOOM_SECONDS  = 0.14f; // 0.28 -> 0.20 -> 0.14
+/// How long the tile's windows take to spread apart when the map opens — the
+/// reveal, on its OWN clock so it can outlast the (much shorter) opening zoom.
+static constexpr float OPEN_SPREAD_SECONDS = 0.19f; // 0.30 -> 0.24 -> 0.19
+/// Its progress, 0..1. Reset on every open; advanced per frame in `onRender`.
+static float           g_openBlend         = 0.0f;
+/// How long the stage's way back takes — **the dial**.
+///
+/// Deliberately `ANIM_SECONDS`, the OPEN's own clock: the open is the one Max
+/// likes, and this is that same movement played the other way. The instant cut
+/// was right in substance and wrong in manner (*"it jumps in front… is good, but
+/// too fast"*, 2026-09-17); 0 here would be that cut again, larger reads calmer.
+static constexpr float STAGE_ZOOM_SECONDS = 0.34f; // 0.28 -> 0.36 -> 0.46 -> 0.40 -> 0.34
 // Closing gets its own, longer clock (the spread's glide home): a return is
 // a landing, not an invocation — it doesn't answer a keypress, so it may
 // take the time it needs to read as calm. Same family as the page flip's
@@ -610,7 +647,10 @@ void golemMinimize(PHLWINDOW w); // defined with the deck-capture plumbing it re
 static bool g_stageMode = false;
 
 // Defined further down; used by the pointer handlers above their definitions.
-static void jumpTo(int wsId);
+static void jumpTo(int wsId, bool startTheClose = true);
+static void beginCloseZoom(); // put the close on its curve (see `startClose`)
+static void snapCloseNow();          // end the map instantly (fallback)
+static void beginStageCloseZoom();   // the stage's way back: a short zoom
 static void jumpToWindow(PHLWINDOW w);
 static void updateHoverAt(PHLMONITOR m, const Vector2D& c);
 static void reassertOverviewCursor(); // undo the compositor's border icon (defined with the cursor owner)
@@ -1295,17 +1335,21 @@ static void captureSolosForTile(PHLMONITOR m, int tile, const CBox& monbox) {
         if (wb.w <= 1.0 || wb.h <= 1.0)
             continue;
 
-        // DECORATED and card-sized: the solo carries the window's bar and
-        // border. The tile's mini crops only the content region out of it,
-        // so level 2 stays bare (Max's rule) — but the close's landing act
-        // fades this very chrome in around the gliding window, so the
-        // desktop's bars no longer pop into existence at the overlay drop
-        // (Max, 2026-09-16: "i think is about the bars coming back").
-        CRegion fakeDamage{0, 0, INT16_MAX, INT16_MAX};
+        // Normally DECORATED and card-sized: the solo carries the window's
+        // bar and border, so the close's landing act can fade that chrome in
+        // (the "bars coming back" fix). BUT a window fully COVERED by a
+        // fullscreen sibling has effectiveAlpha 0, and renderWindow SKIPS an
+        // alpha-0 window unless it is `standalone` — so its solo came back
+        // blank and the overview tile dropped it entirely (Max, 2026-09-16:
+        // "i go from stage to overview and there is no windows"). Render a
+        // covered window STANDALONE (bare, but it appears); visible windows
+        // keep the decorated path.
+        const bool covered = w->effectiveAlpha() <= 0.001F;
+        CRegion    fakeDamage{0, 0, INT16_MAX, INT16_MAX};
         g_pHyprRenderer->beginRender(m, fakeDamage, Render::RENDER_MODE_FULL_FAKE, nullptr, g_spreadSrcFB);
         glClearColor(0.0F, 0.0F, 0.0F, 0.0F);
         glClear(GL_COLOR_BUFFER_BIT);
-        g_pHyprRenderer->renderWindow(w, m, Time::steadyNow(), true, Render::RENDER_PASS_ALL, false, false);
+        g_pHyprRenderer->renderWindow(w, m, Time::steadyNow(), !covered, Render::RENDER_PASS_ALL, false, covered);
         g_pHyprRenderer->m_renderData.blockScreenShader = true;
         g_pHyprRenderer->endRender();
 
@@ -1428,12 +1472,16 @@ static void captureSpreadTextures(PHLMONITOR m, bool alsoBackdrop) {
         // its DECORATIONS: the card is the window as it looks (bar, border,
         // baked corners; Max, 2026-09-16). `standalone` hard-disables
         // decorations, so this is a plain decorated render; it still reaches
-        // a buried window (occlusion lives in damage/pass logic, not here).
-        CRegion fakeDamage{0, 0, INT16_MAX, INT16_MAX};
+        // a buried window (occlusion lives in damage/pass logic, not here) —
+        // EXCEPT a window whose alpha is 0 (covered by a fullscreen sibling),
+        // which renderWindow skips unless `standalone`; render those bare so
+        // they still appear (the overview's covered-window fix, same class).
+        const bool covered = w->effectiveAlpha() <= 0.001F;
+        CRegion    fakeDamage{0, 0, INT16_MAX, INT16_MAX};
         g_pHyprRenderer->beginRender(m, fakeDamage, Render::RENDER_MODE_FULL_FAKE, nullptr, g_spreadSrcFB);
         glClearColor(0.0F, 0.0F, 0.0F, 0.0F);
         glClear(GL_COLOR_BUFFER_BIT);
-        g_pHyprRenderer->renderWindow(w, m, Time::steadyNow(), true, Render::RENDER_PASS_ALL, false, false);
+        g_pHyprRenderer->renderWindow(w, m, Time::steadyNow(), !covered, Render::RENDER_PASS_ALL, false, covered);
         g_pHyprRenderer->m_renderData.blockScreenShader = true;
         g_pHyprRenderer->endRender();
 
@@ -2069,6 +2117,57 @@ static void drawOverview(PHLMONITOR m, float p, float pl, int zoomTile) {
             drawTex(tex, b, round);
             break;
         }
+    }
+
+    // ── THE STAGE'S DIM, PAINTED OVER THE MAP ────────────────────────────────
+    //
+    // Everything OUTSIDE the tile we are flying into goes dark the instant the
+    // stage is back, so the dim lands as one step together with the picture —
+    // Max, 2026-09-17: *"the dimming should happen at the same time that the
+    // windows start coming, it comes too late."*
+    //
+    // ⭐ Why the plugin has to paint it at all: `dim_around` is drawn around the
+    // staged window ON ITS OWN WORKSPACE, so a capture can only ever carry it in
+    // ONE tile. Re-photographing every tile does not help — the other tiles and
+    // the wallpaper backdrop have no window to dim around, so they stay bright
+    // and the darkness still has to GROW with the zoom tile. That growth is the
+    // "200ms to dim" and the "BG becomes dimmed after i land". Only something
+    // covering the whole overlay can make it a step.
+    //
+    // A hole is left for the zoom tile because its own picture already carries
+    // the real dim (verified: a staged capture is 27% darker in RGB than the same
+    // capture with dim off). At p=0 that hole IS the whole monitor, so this draws
+    // nothing at the hand-off and the last frame stays pixel-identical to the
+    // desktop — the property the linger depends on.
+    if (g_stageDimPaint) {
+        // ⭐ The hole is the staged WINDOW's rect, never the tile's. The desktop
+        // dims everything AROUND the window, so at p=0 this has to be exactly
+        // that shape or the hand-off steps. Holing the whole tile instead meant
+        // the painted dim vanished as the tile filled the screen, leaving the
+        // last frames bright before the dimmed desktop appeared — the
+        // *"dimm well, then it goes bright, and dimm again"* (Max, 2026-09-17).
+        CBox hole{0.0, 0.0, mw, mh};
+        if (const auto w = Desktop::focusState()->window(); w && w->m_isMapped) {
+            const auto   wb = w->getWindowMainSurfaceBox();
+            const double sc = m->m_scale;
+            const double wx = (wb.x - m->m_position.x) * sc, wy = (wb.y - m->m_position.y) * sc;
+            // Into the tile's rest space, then through the very same zoom
+            // transform every tile uses — so the hole tracks the window as it
+            // flies, and lands on its real box.
+            hole = dispRect(CBox{az.x + wx / mw * az.w, az.y + wy / mh * az.h, wb.w * sc / mw * az.w,
+                                 wb.h * sc / mh * az.h});
+        }
+        const double x0 = hole.x, y0 = hole.y, x1 = hole.x + hole.w, y1 = hole.y + hole.h;
+        const CHyprColor dim{0.0, 0.0, 0.0, GOLEM_STAGE_DIM};
+        auto             band = [&](double bx, double by, double bw, double bh) {
+            if (bw > 0.5 && bh > 0.5)
+                renderRect(CBox{bx, by, bw, bh}, dim);
+        };
+        band(0.0, 0.0, mw, std::max(0.0, y0));                      // above
+        band(0.0, std::min(mh, y1), mw, std::max(0.0, mh - y1));    // below
+        band(0.0, std::max(0.0, y0), std::max(0.0, x0), std::max(0.0, std::min(mh, y1) - std::max(0.0, y0)));
+        band(std::min(mw, x1), std::max(0.0, y0), std::max(0.0, mw - x1),
+             std::max(0.0, std::min(mh, y1) - std::max(0.0, y0)));  // right
     }
 }
 
@@ -3477,6 +3576,12 @@ static void onRender(eRenderStage stage) {
     if (!m)
         return;
 
+    // The answer never came (waverunner gone, a daemon too old to know
+    // `stage-resume`): the close was never waiting on it, so this only drops the
+    // expectation — a late answer must not re-photograph into an unrelated close.
+    if (g_stageClosePending && Time::steadyNow() - g_stageCloseAt > STAGE_CLOSE_WAIT)
+        g_stageClosePending = false;
+
     // Per-frame belt to the motion-hook fix: anything that re-applied the
     // compositor's border icon between events (a refocus, a warp, a layout
     // change — not everything arrives as pointer motion) is undone within a
@@ -3493,7 +3598,10 @@ static void onRender(eRenderStage stage) {
     if (dt <= 0.f || dt > 0.1f)
         dt = 0.016f;
     g_frameDt        = dt;
-    const float step = dt / ANIM_SECONDS; // both zoom legs: the close's calm comes from the landing act, not a slow zoom
+    // Both zoom legs: the close's calm comes from the landing act, not a slow
+    // zoom. The stage's way back has no landing act, so it sets its own clock
+    // here instead (`beginStageCloseZoom`).
+    const float step = dt / (g_zoomSeconds > 0.f ? g_zoomSeconds : ANIM_SECONDS);
     if (g_anim < g_animTarget)
         g_anim = std::min(g_animTarget, g_anim + step);
     else if (g_anim > g_animTarget)
@@ -3527,6 +3635,17 @@ static void onRender(eRenderStage stage) {
     // at the swap (caught on video, 2026-09-16; absent on clean runs).
     if (g_animTarget <= 0.f && g_anim <= 0.f && g_landAnim <= 0.f) {
         if (g_closeLinger > 0) {
+            if (g_stageDimAsk) {
+                g_stageDimAsk = false;
+                sendWaverunner("stage-dim\n");
+            }
+            // The stage's dim goes back on HERE — under the overlay, which is
+            // still covering the whole screen for these linger frames, so the
+            // change itself is never seen. Told at the disengage instead, the
+            // daemon's round trip (plus its own work on that path) left two or
+            // three frames of UNDIMMED desktop on screen: Max, 2026-09-17,
+            // *"i see the brighter bg settle on the stage"*. The linger is
+            // lengthened for a stage close precisely to cover this round trip.
             --g_closeLinger;
             drawOverview(m, 0.0f, 0.0f, g_zoomTile);
             g_pHyprRenderer->damageMonitor(m);
@@ -3535,7 +3654,10 @@ static void onRender(eRenderStage stage) {
         }
         trace("close DISENGAGE");
         notifyWaverunner(false);
-        g_active = false;
+        g_active            = false;
+        g_zoomSeconds       = 0.0f;  // the stage's clock dies with its close
+        g_stageClosePending = false; // and a late answer must not fire into the next one
+        g_stageDimPaint     = false;
         g_freePending = true; // captures outlive the hand-off; the timer frees them once the desktop has settled
         g_hoverWin.reset();
         g_dragWin.reset();
@@ -3549,13 +3671,23 @@ static void onRender(eRenderStage stage) {
         return;
     }
 
-    // The layout blend rides its own clock: opening, it lags the zoom (the
-    // windows drift into their seats while shrinking); closing, it holds the
-    // arrangement through the zoom and only then glides home, flat.
+    // The layout blend rides its own clock: opening, the windows drift into
+    // their seats while shrinking; closing, it holds the arrangement through the
+    // zoom and only then glides home, flat.
+    //
+    // ⭐ OPENING, the spread runs on a clock of its OWN (`OPEN_SPREAD_SECONDS`),
+    // not on the zoom's. Tied to `zoomProgress` it could only ever finish when
+    // the zoom did — and with the open down to 0.14s that crammed the whole
+    // reveal into 140ms whatever curve it was given. Its own clock is the only
+    // way it can be asked to go SLOWER than the map opens (Max, 2026-09-17,
+    // after asking twice for faster and once for slower — the two requests are
+    // only compatible if these are separate clocks). It keeps drifting after the
+    // map has settled, which is what reads as the windows easing apart rather
+    // than snapping. **The dial.**
     float pl;
     if (g_animTarget >= 0.5f) {
-        const float pz = zoomProgress();
-        pl             = pz * pz;
+        g_openBlend = std::min(1.0f, g_openBlend + dt / OPEN_SPREAD_SECONDS);
+        pl          = (float)easeInOutCubic(g_openBlend);
     } else if (g_anim > LAND_EARLY) {
         pl = 1.0f;
     } else {
@@ -3608,6 +3740,30 @@ void sendWaverunner(std::string msg) {
 static void notifyWaverunner(bool on) {
     resetOverviewPill();
     sendWaverunner(on ? "overview-on\n" : "overview-off\n");
+}
+
+// Tell waverunner's STAGE it may put its shape back — sent the moment a close
+// STARTS, not at the touchdown `notifyWaverunner(false)` above.
+//
+// The map lifts the stage's concealment while it is up (un-maximized, floats
+// unparked) so it can show the whole workspace to pick from. Told only at the
+// disengage, waverunner rebuilt the stage AFTER the hand-off: the close landed
+// on the bare desktop and the stage snapped in a beat later — "it goes to
+// normal, and then focus the window and go to stage" (Max, 2026-09-17). Sent
+// here, the rebuild happens behind the still-covering overlay and the close
+// lands on the stage.
+//
+// Deliberately NOT an earlier `overview-off`: that one waits for touchdown on
+// purpose, because the dock popping back mid-animation reads as aggressive.
+// This is one extra word, for the stage alone, and the daemon ignores it unless
+// the map actually suspended the stage.
+//
+// Only while the stage owns the screen, so an ordinary overview close says
+// nothing new. Call it once the pick's focus is applied — waverunner stages
+// whatever the map left focused.
+static void tellStageResume() {
+    if (g_stageMode)
+        sendWaverunner("stage-resume\n");
 }
 
 // Tell waverunner when a window RESIZE drag begins/ends (a border click, or
@@ -3759,6 +3915,112 @@ static void flipToPage(int page) {
 }
 
 // Close unconditionally (Escape's path — no touring).
+// Put the close on its curve. The zoom flies into `g_zoomTile`, so whatever that
+// tile's snapshot holds is what the user watches grow to fill the screen.
+static void beginCloseZoom() {
+    g_zoomSeconds = 0.0f; // an ordinary close is the ordinary clock, never the open's
+    // Onto the closing curve from exactly the current progress; the landing
+    // glide (the close's second act) is armed behind the zoom. The daemon is
+    // told OFF when the close has LANDED (the disengage in onRender), never
+    // now — the dock popping back mid-animation was part of the "still
+    // aggressive" (the spread always had this right: off on touchdown).
+    g_anim        = invEaseInOutCubic(easeOutCubic(g_anim));
+    g_landAnim    = 1.0f;
+    g_closeLinger = 2;
+    g_animTarget  = 0.0f;
+    g_animLastT   = Time::steadyNow();
+    damageAll();
+}
+
+// End the map INSTANTLY — no zoom, no landing glide.
+//
+// Coming back to the stage is a task switch, and inside the stage a task switch
+// is a CUT: it is why the deck's tiles never fly, and why `stage-show` puts the
+// window there rather than animating it (Max's standing call). The way IN is a
+// movement — the open stays exactly as it is, he likes it — but the way back is
+// not a journey, it is arriving.
+//
+// A cut also has nothing left to mismatch, which is the point after four rounds
+// of trying to make a zoom land cleanly on a desktop that changes underneath it:
+// no picture to fly into, no landing glide to line up, no hand-off frame where
+// the overlay and the desktop can disagree.
+//
+// `g_closeLinger = 2` still applies, and the caller must have re-photographed the
+// zoom tile first: those two frames draw the overlay AT REST, which is fullscreen
+// `g_zoomTile`, and they must already show the stage or the cut would flash the
+// old workspace on its way out.
+static void snapCloseNow() {
+    g_anim        = 0.0f;
+    g_animTarget  = 0.0f;
+    g_landAnim    = 0.0f;
+    g_closeLinger = 2;
+    g_animLastT   = Time::steadyNow();
+    damageAll();
+}
+
+// The stage's way back: a SHORT zoom, and nothing else.
+//
+// The cut above was right in substance — no flicker, no mismatch, no workspace
+// step — and wrong in manner: *"too aggressive… too snappy… i click a window, on
+// overview, it jumps in front… is good, but too fast"* (Max, 2026-09-17). This is
+// that same arrival, given time to be seen.
+//
+// Motion is only safe here because of what now happens FIRST: `luaStageReady`
+// re-photographs the zoom tile, so this flies into a picture of the STAGE. Every
+// earlier animated attempt flew out of the bare workspace, which is what made
+// them all read the same — the journey itself was the workspace step.
+//
+// No landing glide (`g_landAnim = 0`): that second act walks a tile's windows
+// home from their collage arrangement, and the stage is one window already at
+// home, so it would add a third of a second of nothing.
+static void beginStageCloseZoom() {
+    g_anim        = invEaseInOutCubic(easeOutCubic(g_anim));
+    g_landAnim    = 0.0f;
+    g_closeLinger = 5; // must outlast one round trip: the real dim lands under these
+    g_animTarget  = 0.0f;
+    g_zoomSeconds = STAGE_ZOOM_SECONDS;
+    g_animLastT   = Time::steadyNow();
+    damageAll();
+}
+
+// Begin closing — and over Golem's STAGE, hold, then arrive (see `beginStageCloseZoom`).
+//
+// Max, 2026-09-17: *"i want it to go from overview direct to stage. no workspace
+// step."* The map lifts the stage's concealment while it is up, so any zoom home
+// flies into a picture of the BARE WORKSPACE and the stage can only arrive at the
+// end of it. Three shapes of that were tried and all three were the same to him —
+// rebuild behind the animation, hold-then-fly, morph mid-flight — because they
+// all kept a journey whose start is the workspace. *"the coming back to stage is
+// so bad that i dont care about the overview open."*
+//
+// So over the stage there is no journey: the map holds, unchanged, while
+// waverunner rebuilds the stage (`stage-resume`), and its answer (`stage_ready`,
+// ~60ms) CUTS to it. One frame the grid, the next the stage.
+//
+// Nothing animates here, so nothing can disagree at the hand-off, and nothing
+// changes under the pointer before it (the held map keeps the picture it had —
+// the re-photograph happens in the same breath as the cut).
+//
+// Call it with the pick's focus already applied: waverunner stages whatever the
+// map left focused.
+static void startClose() {
+    if (g_stageMode) {
+        g_stageClosePending = true;
+        g_stageCloseAt      = Time::steadyNow();
+        tellStageResume();
+        // NOT held. Holding let the map sit at full grid while waverunner worked,
+        // and both of the things that then changed the picture were visible as a
+        // rebuild: the live timer re-capturing every 150ms, and our own
+        // re-photograph popping the tile from six windows to one BEFORE any
+        // motion. Flying immediately means the picture only ever changes while
+        // it is already moving — and while it moves, the live timer holds off by
+        // itself (it never captures mid-animation).
+        beginStageCloseZoom();
+        return;
+    }
+    beginCloseZoom();
+}
+
 static void closeOverview() {
     if (g_animTarget < 0.5f)
         return;
@@ -3774,17 +4036,9 @@ static void closeOverview() {
     restoreOriginal(); // never leave a real drag dangling; a commit is undone
     g_dragWin.reset();
     g_dragMoved  = false;
-    // Onto the closing curve from exactly the current progress; the landing
-    // glide (the close's second act) is armed behind the zoom. The daemon is
-    // told OFF when the close has LANDED (the disengage in onRender), never
-    // now — the dock popping back mid-animation was part of the "still
-    // aggressive" (the spread always had this right: off on touchdown).
-    g_anim        = invEaseInOutCubic(easeOutCubic(g_anim));
-    g_landAnim    = 1.0f;
-    g_closeLinger = 2;
-    g_animTarget  = 0.0f;
-    g_animLastT   = Time::steadyNow();
-    damageAll();
+    // Escape / gesture / toggle: nothing was picked, so the stage comes back on
+    // whatever is focused — which is where it already was.
+    startClose();
 }
 
 // Whether Golem's STAGE owns the screen — waverunner sets it over
@@ -3825,6 +4079,10 @@ static void toggle() {
     // mid-close turns around in place; from fully closed this is a no-op).
     g_anim       = 1.0f - std::cbrt(std::clamp(1.0f - (float)easeInOutCubic(g_anim), 0.0f, 1.0f));
     g_landAnim    = 0.0f; // an open never lands; a stale glide must not hold the close condition
+    g_zoomSeconds = OPEN_ZOOM_SECONDS; // the open runs on its own, quicker clock
+    g_openBlend   = 0.0f;                // and the reveal starts from bunched, every time
+    g_stageDimPaint = false;
+    g_stageDimAsk   = false;
     g_closeLinger = 0;
     g_freePending = false; // reopened before the deferred free: the captures are live again
     g_animTarget  = 1.0f;
@@ -4074,28 +4332,29 @@ static void onSwipeEnd(IPointer::SSwipeEndEvent, Event::SCallbackInfo& info) {
 // workspace's tile. Switching workspace happens under the still-covering
 // overview; the close animation then flies into the chosen tile, so releasing
 // the overview reveals the workspace we just switched to — seamless.
-static void jumpTo(int wsId) {
+static void jumpTo(int wsId, bool startTheClose) {
     if (!g_active)
         return;
     const int t = waveview_tile_for_workspace(wsId);
     if (t < 0)
         return;
 
-    g_zoomTile   = t;    // close animation pivots on (zooms into) the chosen tile
-    // Onto the closing curve from exactly the current progress; the landing
-    // glide (the close's second act) is armed behind the zoom. Daemon OFF
-    // waits for touchdown (see closeOverview) — no dock mid-animation.
-    g_anim        = invEaseInOutCubic(easeOutCubic(g_anim));
-    g_landAnim    = 1.0f;
-    g_closeLinger = 2;
-    g_animTarget  = 0.0f; // animate closed
-    g_animLastT   = Time::steadyNow();
+    g_zoomTile = t; // close animation pivots on (zooms into) the chosen tile
 
+    // The workspace switch happens FIRST now, still under the covering map, so
+    // that the close we start below is decided against the workspace we are
+    // actually landing on — over the stage, `startClose` hands this moment to
+    // waverunner, which stages whatever is focused by then.
     if (g_pKeybindManager) {
         const auto it = g_pKeybindManager->m_dispatchers.find("workspace");
         if (it != g_pKeybindManager->m_dispatchers.end())
             it->second(std::to_string(wsId));
     }
+    // `jumpToWindow` passes false and closes itself, once it has focused the
+    // exact window that was clicked — from here the focus is still the old one,
+    // and over the stage that would stage the window we are leaving.
+    if (startTheClose)
+        startClose();
     damageAll();
 }
 
@@ -4105,8 +4364,11 @@ static void jumpTo(int wsId) {
 static void jumpToWindow(PHLWINDOW w) {
     if (!w)
         return;
-    jumpTo(static_cast<int>(w->workspaceID())); // switch workspace + start the close
+    jumpTo(static_cast<int>(w->workspaceID()), false); // switch workspace, hold the close
     Desktop::focusState()->fullWindowFocus(w, Desktop::FOCUS_REASON_CLICK);
+    // Only NOW: the stage rebuilds itself on whatever the map left focused, and
+    // that is only this window once the focus above has landed.
+    startClose();
 }
 
 // While the overview is open, a digit 1..9 jumps to that workspace ON THE
@@ -4497,11 +4759,12 @@ static SP<Render::IFramebuffer> captureCardFly(PHLWINDOW w, PHLMONITOR m, CBox& 
         g_spreadSrcFB->alloc(monbox.w, monbox.h, DRM_FORMAT_ABGR8888);
     }
 
-    CRegion fakeDamage{0, 0, INT16_MAX, INT16_MAX};
+    const bool covered = w->effectiveAlpha() <= 0.001F; // covered by a fullscreen sibling → render bare, else it is skipped
+    CRegion    fakeDamage{0, 0, INT16_MAX, INT16_MAX};
     g_pHyprRenderer->beginRender(m, fakeDamage, Render::RENDER_MODE_FULL_FAKE, nullptr, g_spreadSrcFB);
     glClearColor(0.0F, 0.0F, 0.0F, 0.0F);
     glClear(GL_COLOR_BUFFER_BIT);
-    g_pHyprRenderer->renderWindow(w, m, Time::steadyNow(), true, Render::RENDER_PASS_ALL, false, false);
+    g_pHyprRenderer->renderWindow(w, m, Time::steadyNow(), !covered, Render::RENDER_PASS_ALL, false, covered);
     g_pHyprRenderer->m_renderData.blockScreenShader = true;
     g_pHyprRenderer->endRender();
 
@@ -4556,6 +4819,18 @@ void golemMinimize(PHLWINDOW w) {
     if (!m)
         return;
     const std::string addr = windowAddr(w);
+    // NEVER minimize a window that is already minimized, or any window on a
+    // special workspace. Max, 2026-09-16: the orange button on a Chrome that
+    // was already parked (special:minimized, id -98) fired minimize THREE
+    // times in a row — the special ws was showing, so the window still looked
+    // present, he re-clicked, and each re-minimize recorded a bogus special
+    // return ws and churned focus until nothing could be focused. Both guards
+    // make a re-minimize a no-op.
+    if (w->workspaceID() < 0)
+        return;
+    for (const auto& r : g_minimized)
+        if (r.addr == addr)
+            return;
     const std::string dir  = minThumbDir();
     mkdir(dir.c_str(), 0700);
     // Capture the dock thumbnail at the window's OWN aspect: blitAndRead
@@ -4571,11 +4846,33 @@ void golemMinimize(PHLWINDOW w) {
     const auto fb = captureCardFly(w, m, from);
     const CBox to = dockTargetBox(m, aspect);
 
+    const int64_t     ws  = w->workspaceID(); // the return ws (recorded pre-move)
+    const std::string cls = w->fetchClass();
+
+    // PARK FIRST, then VERIFY — the dock tile is only committed once the
+    // window has actually left the workspace. `movetoworkspacesilent`
+    // occasionally does not take (Max, 2026-09-16: "the windows were on the
+    // WS and on the dock at the same time"); if the window is still on a
+    // normal ws afterwards, abort cleanly — release the card, drop the
+    // thumbnail, send NOTHING to the daemon — so the button is a harmless
+    // no-op the user can retry, never a tile for a window that's still there.
+    runDispatcher("movetoworkspacesilent", "special:minimized,address:" + addr);
+    if (w->workspaceID() >= 0) {
+        trace("minimize ABORT: %s still on ws %d after move", addr.c_str(), (int)w->workspaceID());
+        if (fb)
+            fb->release();
+        unlink((dir + "/" + addr + ".rgba").c_str());
+        return;
+    }
+    // The park must be INVISIBLE: if moving the window left special:minimized
+    // showing on the monitor (it overlays with the window and its titlebar,
+    // so the app "is there but isn't"), hide it. Only our own special ws,
+    // never a scratchpad the user opened.
+    if (const auto sw = m->m_activeSpecialWorkspace; sw && sw->m_name == "special:minimized")
+        m->setSpecialWorkspace(nullptr);
+
     // The app's class rides along so the daemon can badge the tile with the
-    // small app icon (Max: "and the small icon too") — resolved by class,
-    // the same way running apps match their .desktop entry.
-    const int64_t     ws   = w->workspaceID();
-    const std::string cls  = w->fetchClass();
+    // small app icon — resolved by class, like running apps match .desktop.
     const std::string land =
         std::format("min-add {} {} {:.4f} {} {}/{}.rgba {}\n", addr, ws, aspect, cls.empty() ? "?" : cls, dir, addr, w->m_title);
     if (fb) {
@@ -4583,8 +4880,6 @@ void golemMinimize(PHLWINDOW w) {
         g_minFlies.push_back(MinFly{fb, from, to, 0.0f, m, land});
     } else
         sendWaverunner(land); // no card, no fly — the entry just appears
-
-    runDispatcher("movetoworkspacesilent", "special:minimized,address:" + addr);
     std::erase_if(g_minimized, [&](const MinRec& r) { return r.addr == addr; });
     g_minimized.push_back(MinRec{addr, ws, w});
     trace("minimize %s ws=%d fly=%d", addr.c_str(), (int)ws, (int)(bool)fb);
@@ -4814,6 +5109,62 @@ static int luaClose(lua_State* L) {
     return 0;
 }
 
+// `hl.plugin.waveview.stage_ready()` — waverunner has finished rebuilding the
+// STAGE after our `stage-resume`, so the close it was holding may now run.
+//
+// This is the second beat of `startClose`: the tile we are about to fly into
+// still holds a picture of the bare workspace (the map lifted the stage's
+// concealment when it opened), so it is RE-PHOTOGRAPHED here — just that one
+// tile, the only one the rebuild changed, because a full pass stalls a frame
+// and we are about to animate. The zoom then flies into the stage and lands on
+// the stage it already shows: no workspace step (Max, 2026-09-17).
+//
+// waverunner answers whether or not it actually had a stage to rebuild, so the
+// ordinary paths (the daemon shutting the map as it opens the stage) cost one
+// socket round-trip and not the fallback wait.
+// `hl.plugin.waveview.recapture()` — waverunner has just changed the desktop
+// under an OPEN map and wants it photographed NOW.
+//
+// The live timer refuses to capture mid-animation, so opening over a stage used
+// to show the STAGE picture for the whole zoom and only pop to the real
+// workspace once it settled — the windows "moving out of the way" arrived after
+// the map had finished opening, which is what reads as slow no matter how fast
+// the zoom is (Max, 2026-09-17, twice). This is the open's half of the close's
+// mid-flight morph: same cost, 1-4ms, and the spread then plays ON the zoom.
+static int luaRecapture(lua_State*) {
+    if (!g_active)
+        return 0;
+    if (const auto m = g_captureMon.lock())
+        captureWorkspaces(m, ALL_TILES);
+    damageAll();
+    return 0;
+}
+
+static int luaStageReady(lua_State*) {
+    if (!g_stageClosePending)
+        return 0;
+    g_stageClosePending = false;
+    // The arrival is already in flight (`startClose`). Re-photograph MID-MOTION —
+    // exactly where the open does it, and exactly why the open reads well: its
+    // tile morphs while it zooms OUT, and nobody sees a rebuild, they see one
+    // movement. Doing it before the motion is what Max saw as *"the rebuilding"*.
+    //
+    // EVERY tile, not just the one we fly into: the dim is back on the desktop
+    // by now and it is baked into whatever we photograph, so re-shooting only the
+    // zoom tile left ONE dark tile growing across a bright grid — darkness that
+    // arrives gradually, over the whole flight. Max, 2026-09-17: *"the dimming
+    // should happen at the same time that the windows start coming, it comes too
+    // late."* Shooting all of them lands the dim as ONE step, on the same frame
+    // the picture morphs — which is the moment he is pointing at.
+    // A full pass is 1-4ms (measured, see the trace) against a 16ms frame.
+    if (const auto m = g_captureMon.lock(); m && g_zoomTile >= 0 && g_zoomTile < N_TILES)
+        captureWorkspaces(m, 1u << g_zoomTile);
+    g_stageDimPaint = true; // same frame as the morph: one step, not a growth
+    g_stageDimAsk   = true;
+    damageAll();
+    return 0;
+}
+
 // `hl.plugin.waveview.spread()` — the 3-up decision without a trackpad (a
 // swipe cannot be faked from a script; this is the spread's debug/CLI route,
 // same idiom as the toggle dispatch trick). Walks the ladder exactly like the
@@ -4857,6 +5208,8 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     //   hl.bind(mainMod .. " + G", function() hl.plugin.waveview.toggle() end)
     HyprlandAPI::addLuaFunction(handle, "waveview", "toggle", luaToggle);
     HyprlandAPI::addLuaFunction(handle, "waveview", "close", luaClose);
+    HyprlandAPI::addLuaFunction(handle, "waveview", "stage_ready", luaStageReady);
+    HyprlandAPI::addLuaFunction(handle, "waveview", "recapture", luaRecapture);
     HyprlandAPI::addLuaFunction(handle, "waveview", "spread", luaSpread);
     HyprlandAPI::addLuaFunction(handle, "waveview", "minimize", luaMinimize);
     HyprlandAPI::addLuaFunction(handle, "waveview", "restore_min", luaRestoreMin);
@@ -4898,7 +5251,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.78"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "0.82"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
