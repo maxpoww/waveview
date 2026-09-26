@@ -73,9 +73,12 @@ namespace Bars {
         // but different colors, that make sense"*): the familiar three-disc
         // row, recoloured to mean what the buttons actually DO here.
         //
-        // Left to right: close is outermost, where every desktop has taught
-        // the hand to expect it. The glyphs are dark on all three — every disc
-        // is a light colour now, and one ink keeps the row reading as a set.
+        // Left to right: RED, YELLOW, GREEN — macOS's order, kept exactly
+        // (Max, 2026-09-26: *"put the buttons on the right order, R Y G"*;
+        // green had sat in the middle since the minimize button arrived).
+        // Close is outermost, where every desktop has taught the hand to
+        // expect it. The glyphs are dark on all three — every disc is a light
+        // colour, and one ink keeps the row reading as a set.
         //
         // VIVID, not pastel (Max, 2026-09-15: *"super saturated colors that
         // outstand"*) — the first cut used soft Golem-family tones and read as
@@ -90,15 +93,6 @@ namespace Bars {
             .fgcol  = CHyprColor{0xFF1A1A1AULL},
             .icon   = "×",
         });
-        // GREEN — back into the layout. Where macOS's green means "grow to
-        // fullscreen", Golem's means "grow back into the tiling": the same
-        // gesture of order, Golem's own answer.
-        g_pBarsState->buttons.push_back(SGolemButton{
-            .action = GOLEM_BAR_TILE,
-            .bgcol  = CHyprColor{0xFF21D758ULL},
-            .fgcol  = CHyprColor{0xFF1A1A1AULL},
-            .icon   = "▤",
-        });
         // ORANGE — minimize to the dock, macOS-style: the card flies into
         // the dock and lives there as its own thumbnail until clicked back.
         // The glyph arrives in the same breath as the action, as promised.
@@ -107,6 +101,15 @@ namespace Bars {
             .bgcol  = CHyprColor{0xFFFF9500ULL},
             .fgcol  = CHyprColor{0xFF1A1A1AULL},
             .icon   = "–",
+        });
+        // GREEN — back into the layout. Where macOS's green means "grow to
+        // fullscreen", Golem's means "grow back into the tiling": the same
+        // gesture of order, Golem's own answer.
+        g_pBarsState->buttons.push_back(SGolemButton{
+            .action = GOLEM_BAR_TILE,
+            .bgcol  = CHyprColor{0xFF21D758ULL},
+            .fgcol  = CHyprColor{0xFF1A1A1AULL},
+            .icon   = "▤",
         });
 
         for (auto& w : g_pCompositor->m_windows) {

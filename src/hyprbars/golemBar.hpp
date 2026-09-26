@@ -45,10 +45,15 @@ namespace Event {
 /// the bar thinner"* down to 22, then the banner match.)
 ///
 /// ⚠️ The buttons are centred in the bar PLUS the window's top border
-/// (`golemButtonY`), so 26 + 3 leaves 6px of air above and below a 17px
+/// (`golemButtonY`), so 25 + 3 leaves 6px of air above and below a 16px
 /// disc. Shrinking the bar means shrinking [`GOLEM_BUTTON_SIZE`] with it, or
 /// the discs start touching the window.
-inline constexpr int GOLEM_BAR_HEIGHT = 26;
+///
+/// ✗ Tried and rolled back the same day (2026-09-26): an 18px strip = button + one
+/// pixel of air above and below, centred in the strip alone — Max: *"i dont like
+/// it"*, then *"smaller buttons but the bar not as small as it was."* Then one
+/// step down by eye: 26 → **25** (*"make the bar slightly smaller"*), 16px discs.
+inline constexpr int GOLEM_BAR_HEIGHT = 25;
 /// Air at each end of the bar.
 inline constexpr int GOLEM_BAR_PADDING = 10;
 /// Air between the buttons.
@@ -60,7 +65,10 @@ inline constexpr int GOLEM_BUTTON_PADDING = 7;
 /// eye: 23 read too big on the strip (*"that is too big, make them little
 /// smaller"*) → 21 → 20 → 19 → 16 → **17** (*"bar 25 buttons 17"*, settling
 /// back up half a step). Earlier history: 14 → 16 → 18 → 15 → 17.
-inline constexpr float GOLEM_BUTTON_SIZE = 17;
+/// → **16** (2026-09-26: *"make the buttons slightly smaller"*, then after a
+/// round trip through 17: *"i like it as it was, smaller buttons but the bar not
+/// as small"*).
+inline constexpr float GOLEM_BUTTON_SIZE = 16;
 /// How far the button row starts from the bar's left edge — its OWN inset, not
 /// the bar's end padding, so the buttons can sit in from the corner without
 /// moving the air at the bar's ends (Max, 2026-09-13: *"move them a little to
@@ -216,6 +224,10 @@ class CGolemBar : public IHyprWindowDecoration {
     /// the answer changes — a bar that appears or disappears changes how much
     /// space the window has.
     void     syncHidden();
+
+    /// Keep the compositor's `square-top` tag in step with the bar: on while
+    /// the bar shows, off the moment it hides (see `windowSquareTop`).
+    void     syncSquareTop();
 
     Vector2D cursorRelativeToBar();
 

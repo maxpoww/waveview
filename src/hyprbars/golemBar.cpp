@@ -96,6 +96,23 @@ static bool windowIsFirefox(PHLWINDOW w) {
     return w && (w->m_class == "firefox" || w->m_initialClass == "firefox");
 }
 
+// THE STRAIGHT SEAM (Max, 2026-09-26: *"make the bottom of the bar straight…
+// i want the top of the window to be square only when there is a bar. but not
+// on floating with no bars, or non floating windows, etc."*).
+//
+// Hyprland rounds all four corners of a window from one radius, so under the
+// bar the content curved away at each end and the strip's bottom edge read as
+// two arcs. Golem's compositor patch (`hyprland-window-square-top.patch`)
+// renders a window tagged `square-top` with its top two corners square —
+// surface, border and blur — while the bottom two keep their rounding. The bar
+// owns that tag: it is applied for exactly as long as the bar is showing and
+// removed the moment it hides, so a tiled window, a staged one and the
+// browser (none of which wear a bar) keep Hyprland's corners untouched.
+static constexpr const char* GOLEM_SQUARE_TOP_TAG = "square-top";
+static bool                  windowSquareTop(PHLWINDOW w) {
+    return w && w->m_ruleApplicator && w->m_ruleApplicator->m_tagKeeper.isTagged(GOLEM_SQUARE_TOP_TAG, true);
+}
+
 // The browser's traffic lights show ONLY while it is a FLOATING window (not
 // staged, not tiled) — the same condition that would raise a bar on any other
 // window. The browser's own chrome can't see Hyprland's float state, so hand it
@@ -124,6 +141,7 @@ CGolemBar::CGolemBar(PHLWINDOW pWindow) : IHyprWindowDecoration(pWindow) {
         PMONITOR->m_scheduledRecalc = true;
 
     m_hidden = !pWindow->m_isFloating || windowStaged(pWindow) || windowIsFirefox(pWindow);
+    syncSquareTop();
     if (windowIsFirefox(pWindow)) {
         writeFirefoxFloatSignal(m_ffFloatSignal, pWindow->m_isFloating && !windowStaged(pWindow));
         syncFirefoxBorder(); // mute the browser's 1px border to a faint hairline
@@ -156,6 +174,12 @@ CGolemBar::~CGolemBar() {
         PWINDOW->m_ruleApplicator->borderSize().unset(Desktop::Types::PRIORITY_SET_PROP);
         m_tinted = false;
     }
+
+    // Hand the window its rounded top corners back: the tag is the bar's, and
+    // a window outliving this plugin must not keep it. A set erase, nothing
+    // more — see the teardown rule above.
+    if (validMapped(m_pWindow))
+        m_pWindow.lock()->m_ruleApplicator->m_tagKeeper.applyTag(std::string("-") + GOLEM_SQUARE_TOP_TAG);
 
     // If this bar was holding the grab hand, the pointer has to get its arrow
     // back from somewhere — nothing else knows to.
@@ -336,6 +360,18 @@ void CGolemBar::refreshDecorationsLater() {
     });
 }
 
+// The compositor's `square-top` tag, kept in step with the bar (see
+// `windowSquareTop`): on while the bar shows, off the moment it hides. A tag
+// flip is a set insert or erase — no rule or decoration machinery — so it is
+// safe from the render pass, where `syncHidden` runs, and from the destructor.
+// No damage is needed: a bar arriving or leaving reserves or frees the strip,
+// which resizes the window and repaints the corners with it.
+void CGolemBar::syncSquareTop() {
+    if (!validMapped(m_pWindow))
+        return;
+    m_pWindow.lock()->m_ruleApplicator->m_tagKeeper.applyTag(std::string(m_hidden ? "-" : "+") + GOLEM_SQUARE_TOP_TAG);
+}
+
 // The bar belongs to windows that have LEFT the layout — and NOT to a window on
 // the stage (see `windowStaged`). Upstream drove this from a window rule; asking
 // the window is the same mechanism with the conditions Golem actually wants, and
@@ -357,6 +393,7 @@ void CGolemBar::syncHidden() {
         return;
 
     m_hidden = WANT;
+    syncSquareTop();
     // A bar arriving or leaving changes how much room the window has, so the
     // layout has to hear about it — without this the window keeps the reserved
     // strip it no longer has (or loses one it just gained).
@@ -1088,7 +1125,13 @@ void CGolemBar::renderPass(PHLMONITOR pMonitor, const float& a) {
     // `roundingPower()`. It falls away fast (~35 rows at Golem's radius), so
     // the loop ends itself once the wedge is thinner than a pixel — no bottom
     // cut, and nothing painted down at a short window's own corners.
-    {
+    //
+    // ⭐ SINCE THE STRAIGHT SEAM (2026-09-26) there is normally no wedge at all:
+    // the compositor squares the window's top corners while the bar shows
+    // (`windowSquareTop`), so the border and the content meet the strip flat
+    // and this fill would only be ~70 rects of damage a frame for nothing. It
+    // stays as the fallback for a window whose corners are still round.
+    if (!windowSquareTop(PWINDOW)) {
         const double P    = std::max(2.0, static_cast<double>(PWINDOW->roundingPower()));
         const double R    = ROUNDING * pMonitor->m_scale;
         const double seam = clipBox.y + clipBox.h;
@@ -1185,9 +1228,11 @@ void CGolemBar::damageEntire() {
 
 // How far below the seam the notch fill reaches: the corner's full span, where
 // the window's outer curve meets its side. In logical px, like the boxes here.
+// Zero while the compositor squares the corner (`windowSquareTop`): the fill
+// is not drawn, so damage and occlusion stop at the strip.
 double CGolemBar::notchDepth() {
     const auto PWINDOW = m_pWindow.lock();
-    return PWINDOW ? PWINDOW->rounding() + PWINDOW->getRealBorderSize() : 0.0;
+    return PWINDOW && !windowSquareTop(PWINDOW) ? PWINDOW->rounding() + PWINDOW->getRealBorderSize() : 0.0;
 }
 
 Vector2D CGolemBar::cursorRelativeToBar() {
