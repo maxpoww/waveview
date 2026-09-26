@@ -50,6 +50,7 @@
 #include <hyprland/src/layout/target/Target.hpp>
 #include <hyprland/src/managers/CursorManager.hpp>
 #include <hyprland/src/managers/KeybindManager.hpp>
+#include <hyprland/src/managers/SeatManager.hpp>
 #include <hyprland/src/managers/input/InputManager.hpp>
 #include <hyprland/src/devices/IKeyboard.hpp>
 #include <hyprland/src/devices/IPointer.hpp>
@@ -6064,6 +6065,75 @@ static int luaSpread(lua_State*) {
     return 0;
 }
 
+// Who holds the keyboard right now — a window's address, a layer's namespace,
+// or "none" (the stranded state `kb_focus` exists to repair).
+static std::string keyboardHolder() {
+    const auto kb = g_pSeatManager->m_state.keyboardFocus.lock();
+    if (!kb)
+        return "none";
+    for (auto& w : g_pCompositor->m_windows)
+        if (w && w->wlSurface() && w->wlSurface()->resource() == kb)
+            return windowAddr(w);
+    for (auto& m : g_pCompositor->m_monitors)
+        for (auto& lvl : m->m_layerSurfaceLayers)
+            for (auto& ref : lvl)
+                if (const auto ls = ref.lock(); ls && ls->wlSurface() && ls->wlSurface()->resource() == kb)
+                    return "layer:" + ls->m_namespace;
+    return "surface?";
+}
+
+// `hl.plugin.waveview.kb_focus("0x…")` — give the KEYBOARD to a window: the
+// dock's launcher and the OPTIONS boxes handing it back when their layer lets
+// go of it (Max, 2026-09-26: *"when i leave options or menubox the focus has to
+// go, with KB focus, to the last focused window on the current workspace"*).
+//
+// The daemon cannot do this with the `focus` dispatcher. Hyprland 0.55.4 keeps
+// remembering the window it had focused while a layer holds the keyboard, and
+// when the layer lets go the keyboard lands on NOTHING — and a focus of that
+// remembered window is thrown away by `rawWindowFocus`'s first line
+// (`pWindow == m_focusWindow && surface == m_focusSurface`: both surfaces are
+// null — FocusState.cpp:98; fixed upstream in 0.56, 271b0d1eb4). Naming the
+// window's SURFACE makes that comparison false, so the focus goes through —
+// the upstream fix's effect, from here, without patching the compositor. No
+// pointer warp (the dispatcher's), no bounce through a neighbour (which only
+// worked when a second window shared the workspace, and raised it).
+//
+// The DAEMON chooses the window — the last focused one of the workspace the
+// user is on at close time — so a box closed after travelling never yanks back.
+// While the map or the spread is up it owns focus; nothing is done.
+//
+// No window (`kb_focus("")`, a box closed on an empty workspace): forget the
+// remembered one instead. Left in place it swallows the NEXT plain focus of it
+// too — going back to its workspace would leave the keyboard on nothing again.
+static int luaKbFocus(lua_State* L) {
+    const char* a = lua_tostring(L, 1);
+    if (!a)
+        a = "";
+    if (g_active || g_spreadActive) {
+        trace("kb_focus %s: skipped (the map owns focus)", a);
+        return 0;
+    }
+    if (!*a) {
+        Desktop::focusState()->fullWindowFocus(nullptr, Desktop::FOCUS_REASON_OTHER);
+        trace("kb_focus: none (stale focus cleared)");
+        return 0;
+    }
+    const auto w = windowByAddr(a);
+    if (!w || !w->m_isMapped || w->isHidden() || !w->m_workspace || !w->wlSurface() || !w->wlSurface()->resource()) {
+        trace("kb_focus %s: no such window", a);
+        return 0;
+    }
+    const auto surf = w->wlSurface()->resource();
+    Desktop::focusState()->fullWindowFocus(w, Desktop::FOCUS_REASON_OTHER, surf);
+    // A window on a hidden workspace: that call only switched to it, and the
+    // switch's own focus of the window can be swallowed the same way — once
+    // it is visible, name the surface again.
+    if (g_pSeatManager->m_state.keyboardFocus.lock() != surf)
+        Desktop::focusState()->fullWindowFocus(w, Desktop::FOCUS_REASON_OTHER, surf);
+    trace("kb_focus %s -> keyboard on %s", a, keyboardHolder().c_str());
+    return 0;
+}
+
 // `hl.plugin.waveview.debug_state()` — every sticky flag, to the trace. For the
 // moment something feels stuck (a swipe that bounces back, a pointer that stays
 // hidden): dump it BEFORE reloading — a reload throws the evidence away (the
@@ -6084,6 +6154,8 @@ static int luaDebugState(lua_State*) {
           (int)(bool)g_captureMon.lock(), (int)(bool)dc->target(), (int)dc->mode(), foc ? windowAddr(foc).c_str() : "none",
           foc ? (int)foc->workspaceID() : 0);
     trace("STATE bars: %s", Bars::debugState().c_str());
+    trace("STATE keyboard: %s (focused window %s)", keyboardHolder().c_str(),
+          Desktop::focusState()->window() ? windowAddr(Desktop::focusState()->window()).c_str() : "none");
     return 0;
 }
 
@@ -6121,6 +6193,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     HyprlandAPI::addLuaFunction(handle, "waveview", "stage_ready", luaStageReady);
     HyprlandAPI::addLuaFunction(handle, "waveview", "recapture", luaRecapture);
     HyprlandAPI::addLuaFunction(handle, "waveview", "debug_state", luaDebugState);
+    HyprlandAPI::addLuaFunction(handle, "waveview", "kb_focus", luaKbFocus);
     HyprlandAPI::addLuaFunction(handle, "waveview", "spread", luaSpread);
     HyprlandAPI::addLuaFunction(handle, "waveview", "minimize", luaMinimize);
     HyprlandAPI::addLuaFunction(handle, "waveview", "restore_min", luaRestoreMin);
@@ -6183,7 +6256,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "1.47"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "1.48"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
