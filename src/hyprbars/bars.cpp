@@ -19,6 +19,22 @@
 #include <algorithm>
 
 namespace Bars {
+    std::string debugState() {
+        std::string out;
+        size_t      bars = 0;
+        for (auto& w : g_pCompositor->m_windows) {
+            if (!w)
+                continue;
+            for (auto& d : w->m_windowDecorations)
+                if (auto* bar = dynamic_cast<CGolemBar*>(d.get())) {
+                    ++bars;
+                    if (const auto line = bar->debugLine(); !line.empty())
+                        out += line + " ";
+                }
+        }
+        return std::to_string(bars) + " bars" + (out.empty() ? ", none sticky" : ": " + out);
+    }
+
     void settleFocus(PHLWINDOW window) {
         if (!window)
             return;

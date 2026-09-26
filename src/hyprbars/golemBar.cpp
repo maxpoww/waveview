@@ -40,6 +40,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <format>
 
 using namespace Render::GL;
 
@@ -101,12 +102,14 @@ static bool windowIsFirefox(PHLWINDOW w) {
 // across a 1-byte file it polls (golem-chrome.js `trafficLights`). Written only
 // on CHANGE — this is reached from the per-window update path, and a compare is
 // all an unchanged frame costs.
-static int g_ffFloatSignal = -1;  // last written: -1 unknown, 0 not-floating, 1 floating
-static void writeFirefoxFloatSignal(bool floating) {
+// `last` is THIS bar's memory: with one global, two browser windows in different
+// states (a floating PiP over a tiled main window) rewrote the file on alternate
+// frames and flickered the traffic lights.
+static void writeFirefoxFloatSignal(int& last, bool floating) {
     const int v = floating ? 1 : 0;
-    if (v == g_ffFloatSignal)
+    if (v == last)
         return;
-    g_ffFloatSignal = v;
+    last = v;
     if (FILE* f = fopen("/tmp/golem-ff-float", "w")) {
         fputc(floating ? '1' : '0', f);
         fclose(f);
@@ -122,7 +125,7 @@ CGolemBar::CGolemBar(PHLWINDOW pWindow) : IHyprWindowDecoration(pWindow) {
 
     m_hidden = !pWindow->m_isFloating || windowStaged(pWindow) || windowIsFirefox(pWindow);
     if (windowIsFirefox(pWindow)) {
-        writeFirefoxFloatSignal(pWindow->m_isFloating && !windowStaged(pWindow));
+        writeFirefoxFloatSignal(m_ffFloatSignal, pWindow->m_isFloating && !windowStaged(pWindow));
         syncFirefoxBorder(); // mute the browser's 1px border to a faint hairline
     }
 
@@ -347,7 +350,7 @@ void CGolemBar::syncHidden() {
     // BEFORE the early-return below: the browser's bar is always hidden, so WANT
     // never changes for it and the return would otherwise skip this.
     if (windowIsFirefox(PWINDOW))
-        writeFirefoxFloatSignal(PWINDOW->m_isFloating && !windowStaged(PWINDOW));
+        writeFirefoxFloatSignal(m_ffFloatSignal, PWINDOW->m_isFloating && !windowStaged(PWINDOW));
 
     const bool WANT = !PWINDOW->m_isFloating || windowStaged(PWINDOW) || windowIsFirefox(PWINDOW);
     if (WANT == m_hidden)
@@ -449,15 +452,24 @@ void CGolemBar::onMouseButton(Event::SCallbackInfo& info, IPointer::SButtonEvent
         standDown();
         return;
     }
-    if (!inputIsValid())
-        return;
-
+    // ⭐ A RELEASE is handled whether or not the bar is still "valid". The press
+    // itself can make it invalid before the fingers lift: the orange button
+    // parks the window on the invisible minimized workspace, a strip drag can
+    // end over the dock. Gated on validity, the release never reached
+    // `handleUpEvent` and `m_bCancelledDown` stayed set — so the NEXT release
+    // this bar saw, the real one closing a click INSIDE the restored window,
+    // was swallowed; the compositor had recorded that press and now held a
+    // PHANTOM BUTTON forever: pointer focus pinned to the window, and every
+    // workspace swipe refocusing it and bouncing straight back (Max,
+    // 2026-09-26, twice, always the window he had minimized and restored;
+    // a scripted workspace switch — which releases all buttons — "fixed" it).
     if (e.state != WL_POINTER_BUTTON_STATE_PRESSED) {
-        handleUpEvent(info);
+        handleUpEvent(info, e.button, inputIsValid());
         return;
     }
-
-    handleDownEvent(info);
+    if (!inputIsValid())
+        return;
+    handleDownEvent(info, e.button);
 }
 
 /// The shape the BARS currently have on the pointer, "" when they have given it
@@ -711,7 +723,7 @@ void CGolemBar::onMouseMove(Vector2D coords) {
     handleMovement();
 }
 
-void CGolemBar::handleDownEvent(Event::SCallbackInfo& info) {
+void CGolemBar::handleDownEvent(Event::SCallbackInfo& info, uint32_t button) {
     const auto PWINDOW = m_pWindow.lock();
     const auto COORDS  = cursorRelativeToBar();
 
@@ -725,6 +737,14 @@ void CGolemBar::handleDownEvent(Event::SCallbackInfo& info) {
         m_bDragPending  = false;
         return;
     }
+    // Only the bar UNDER the pointer takes a press. `inputIsValid` also lets
+    // the FOCUSED window's bar through — a drag must keep its motion and its
+    // release after the pointer outran the window — but a press that landed
+    // on another window covering this bar's strip is that window's, not a
+    // reason to raise this one (or hit its orange button).
+    if (g_pCompositor->vectorToWindowUnified(g_pInputManager->getMouseCoordsInternal(),
+                                             Desktop::View::RESERVED_EXTENTS | Desktop::View::INPUT_EXTENTS | Desktop::View::ALLOW_FLOATING) != PWINDOW)
+        return;
 
     if (Desktop::focusState()->window() != PWINDOW)
         Desktop::focusState()->fullWindowFocus(PWINDOW, Desktop::FOCUS_REASON_CLICK);
@@ -734,6 +754,7 @@ void CGolemBar::handleDownEvent(Event::SCallbackInfo& info) {
 
     info.cancelled   = true;
     m_bCancelledDown = true;
+    m_pressedButton  = button;
 
     if (doButtonPress(COORDS))
         return;
@@ -745,17 +766,17 @@ void CGolemBar::handleDownEvent(Event::SCallbackInfo& info) {
     setBarCursor("grabbing");
 }
 
-void CGolemBar::handleUpEvent(Event::SCallbackInfo& info) {
-    // ⚠️ The focus check guards ONLY the event-swallowing. It used to guard the
-    // whole function — and when focus had shifted between press and release
-    // (the daemon rearranges focus; a drag can land it elsewhere), the early
-    // return skipped ALL cleanup: `m_bDragPending`/`m_bDraggingThis` stayed
-    // true forever, and every later motion re-asserted the hand. That is the
-    // "open hand gets stuck" (Max, 2026-09-15). State cleanup on button-up is
-    // unconditional; a release ends the press NO MATTER where focus went.
-    if (m_bCancelledDown && m_pWindow.lock() == Desktop::focusState()->window())
-        info.cancelled = true;
-
+void CGolemBar::handleUpEvent(Event::SCallbackInfo& info, uint32_t button, bool valid) {
+    // Only the release of the press WE OWN — same button, swallowed by this bar
+    // — is ours: swallowed too (the compositor never saw its press; it would
+    // drop the release anyway) and it ends the press whatever happened to
+    // focus or validity in between (a drag can land focus elsewhere, the
+    // press can park the window; cleanup is unconditional — the "open hand
+    // gets stuck" of 2026-09-15, and the phantom button of 2026-09-26). Any
+    // other release passes through whole: the compositor is pairing it.
+    if (!m_bCancelledDown || button != m_pressedButton)
+        return;
+    info.cancelled   = true;
     m_bCancelledDown = false;
 
     if (m_bDraggingThis) {
@@ -767,16 +788,21 @@ void CGolemBar::handleUpEvent(Event::SCallbackInfo& info) {
     m_bDragPending = false;
 
     // Let go: the hand reopens over the strip, points over a button, or goes
-    // back to the arrow if the release landed elsewhere.
-    if (g_barCursorOwner == this) {
-        switch (hoverZone()) {
-            case HOVER_STRIP: setBarCursor("grab"); break;
-            case HOVER_BUTTON: setBarCursor("pointer"); break;
-            case HOVER_NONE:
-                g_barCursorOwner = nullptr;
-                setBarCursor(nullptr);
-                break;
-        }
+    // back to the arrow if the release landed elsewhere (or off this bar's
+    // world entirely).
+    if (g_barCursorOwner != this)
+        return;
+    if (!valid) {
+        releaseCursorIfOwner();
+        return;
+    }
+    switch (hoverZone()) {
+        case HOVER_STRIP: setBarCursor("grab"); break;
+        case HOVER_BUTTON: setBarCursor("pointer"); break;
+        case HOVER_NONE:
+            g_barCursorOwner = nullptr;
+            setBarCursor(nullptr);
+            break;
     }
 }
 
@@ -968,8 +994,6 @@ void CGolemBar::renderPass(PHLMONITOR pMonitor, const float& a) {
     // The -2 is upstream's: without it the corners read badly against the gaps.
     const int  scaledRounding = ROUNDING > 0 ? static_cast<int>(std::round(ROUNDING * pMonitor->m_scale - 2)) : 0;
 
-    m_seExtents = {{0, GOLEM_BAR_HEIGHT}, {}};
-
     const auto DECOBOX = assignedBoxGlobal();
     const auto BARBUF  = DECOBOX.size() * pMonitor->m_scale;
 
@@ -1119,9 +1143,16 @@ void CGolemBar::renderPass(PHLMONITOR pMonitor, const float& a) {
     }
 
     renderBarButtons(&barBox, pMonitor->m_scale, a);
-    m_bButtonsDirty = false;
 
     renderBarButtonsText(&barBox, pMonitor->m_scale, a);
+}
+
+std::string CGolemBar::debugLine() const {
+    if (!m_bDragPending && !m_bDraggingThis && !m_bCancelledDown)
+        return {};
+    const auto w = m_pWindow.lock();
+    return std::format("[{:#x} hidden={} dragPending={} dragging={} cancelledDown={}]", (uintptr_t)w.get(), m_hidden,
+                       m_bDragPending, m_bDraggingThis, m_bCancelledDown);
 }
 
 void CGolemBar::settleColor() {
@@ -1182,10 +1213,6 @@ CBox CGolemBar::assignedBoxGlobal() {
     const auto WORKSPACEOFFSET = PWORKSPACE && !m_pWindow->m_pinned ? PWORKSPACE->m_renderOffset->value() : Vector2D();
 
     return box.translate(WORKSPACEOFFSET);
-}
-
-PHLWINDOW CGolemBar::getOwner() {
-    return m_pWindow.lock();
 }
 
 /// The window's top border, in logical px — the strip painted the bar's own

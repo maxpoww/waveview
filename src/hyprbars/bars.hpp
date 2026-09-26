@@ -30,4 +30,8 @@ namespace Bars {
 
     /// Snap `window`'s bar colour to its focus state, skipping the fade.
     void settleFocus(PHLWINDOW window);
+
+    /// One entry per bar holding a sticky input flag (drag pending/active, a
+    /// cancelled press), for waveview's `debug_state` dump.
+    std::string debugState();
 }

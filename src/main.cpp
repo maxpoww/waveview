@@ -16,8 +16,13 @@
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <deque>
 #include <unistd.h>
 #include <vector>
+#include <unordered_map>
+#include <unordered_set>
 
 // beginRender()/renderWorkspace() are protected on IHyprRenderer; capturing
 // workspace thumbnails needs them. Same hack the official hyprexpo plugin uses —
@@ -34,6 +39,7 @@
 #include <hyprland/src/render/pass/RectPassElement.hpp>
 #include <hyprland/src/render/pass/TexPassElement.hpp>
 #include <hyprland/src/render/pass/BorderPassElement.hpp>
+#include <hyprland/src/protocols/core/Compositor.hpp>
 #include <hyprland/src/config/ConfigValue.hpp>
 #include <hyprland/src/managers/XWaylandManager.hpp>
 #include <hyprland/src/desktop/state/FocusState.hpp>
@@ -101,7 +107,7 @@ static constexpr double DSN_WIN_GAP    = 0.028; // in-tile gap, fraction of tile
 // every window regardless of its size, per Max. The desktop's border is no
 // longer a fixed amber: waverunner pushes `general:col.active_border` as a
 // live gradient of the screen's own sampled colours, so the overview reads
-// THAT (see activeBorderGradient) rather than a baked constant, and the two
+// THAT (see borderGradient(true)) rather than a baked constant, and the two
 // can never drift (Max, 2026-09-11: "the overview tiles border ... match
 // dynamically too"). The constant stays as the fallback for a compositor
 // whose config read fails.
@@ -134,9 +140,6 @@ Config::CGradientValueData* borderGradient(bool active) {
     return grad->m_colors.empty() ? nullptr : grad;
 }
 
-static Config::CGradientValueData* activeBorderGradient() {
-    return borderGradient(true);
-}
 
 inline HANDLE              PHANDLE = nullptr;
 static bool                g_active = false;
@@ -151,6 +154,7 @@ static CHyprSignalListener g_swipeEndListener;
 static CHyprSignalListener g_axisListener; // wheel while open scrolls the 3x6 grid (see onMouseAxis)
 static CHyprSignalListener g_windowOpenListener; // gives each new window its (floating-only) titlebar — see src/hyprbars/
 static CHyprSignalListener g_windowDestroyListener; // a window dying while MINIMIZED must leave the dock (see PLUGIN_INIT)
+static CHyprSignalListener g_windowTitleListener;   // a title change repaints the bar in the tile (dirty-driven capture)
 // 🔬 THE SWIPE-BOUNCE HUNT (Max, 2026-09-26: *"i swipe, it shows the content of
 // the next WS but lands on this one"* — twice in one night, both right after
 // minimize/restore round trips; unloading this plugin made it stop, and the
@@ -190,6 +194,9 @@ static constexpr auto REFRESH_MS = std::chrono::milliseconds(150);
 // workspace snapshots are no longer drawn directly; they're the SOURCE pixels we
 // crop individual windows out of (see captureWindows).
 static SP<Render::IFramebuffer> g_fbs[N_TILES];
+/// Whether a tile has been photographed since it became occupied — a collage
+/// tile has no snapshot (only solos), so `g_fbs[i]` alone cannot say.
+static bool                     g_tileCaptured[N_TILES] = {};
 static PHLMONITORREF            g_captureMon;
 
 // The single wallpaper-only backdrop (no windows, no bars) drawn behind
@@ -217,10 +224,16 @@ struct CapWin {
     Rect                     from{};
     bool                     hasFrom = false;
     bool                     fresh   = false;
-    // The window's CARD (bar + border) cropped from its tile's snapshot — the
-    // landing's chrome fade for windows on tiles WITHOUT a collage (those have
-    // no solo). Only for a floating window wholly on screen.
-    SP<Render::IFramebuffer> cardFb;
+    // What `fb` holds, and where the CONTENT sits in it. A bordered window
+    // wholly on screen is cropped as its CARD (bar + border + content), so the
+    // landing fades its chrome in from the very texture the mini samples — one
+    // texture and one crop per window (the separate card texture this replaced
+    // doubled both; ccca877). The mini draws the `uv` sub-rect, the chrome pass
+    // draws it whole. A collage window has NO `fb`: it samples its solo (also a
+    // card) the same way. A bare window (no border, or cut by the screen edge)
+    // is cropped as content, uv = whole.
+    bool                     cardTex = false;
+    Vector2D                 uvTL{0.0, 0.0}, uvBR{1.0, 1.0};
     CBox                     blurPrev; // last frame's drawn box — the 60 Hz motion blur's other end
     CBox                     screen;  // last-drawn box in draw space (for hit-testing)
     CBox                     drawCur; // eased chase of the mapped slot — re-tiles glide at frame rate
@@ -270,14 +283,31 @@ static SoloCap* soloFor(PHLWINDOW w, bool create) {
 }
 
 // Windows die; their solo textures must not linger in VRAM.
+// Drop solos no collage uses any more: a dead window's, and — the map stays
+// up for minutes — those of windows whose tile stopped hiding, or that moved
+// tiles (a card-sized texture each, idle otherwise). Off-mask tiles keep their
+// slots (computeTileSpreads), so their solos stay. Call AFTER computeTileSpreads.
 static void sweepSolos() {
     std::erase_if(g_solo, [](SoloCap& sc) {
-        if (sc.win.lock())
-            return false;
+        if (const auto w = sc.win.lock())
+            for (const auto& ts : g_tileSpread)
+                if (ts.on)
+                    for (const auto& [ref, slot] : ts.slots)
+                        if (ref.lock() == w)
+                            return false;
         if (sc.fb)
             sc.fb->release();
         return true;
     });
+}
+// The texture a window's mini draws with: its solo (a collage window) or its
+// own crop. `CapWin::uv` says where the content sits in it.
+static SP<Render::ITexture> capTex(const CapWin& cw) {
+    if (cw.spread)
+        if (const auto w = cw.win.lock())
+            if (auto* sc = soloFor(w, false); sc && sc->fb)
+                return sc->fb->getTexture();
+    return cw.fb ? cw.fb->getTexture() : nullptr;
 }
 
 static void computeTileSpreads(PHLMONITOR m, uint32_t mask, uint32_t occupied); // defined with the spread machinery
@@ -307,7 +337,7 @@ static bool         g_warpHidCursor = false; // we are the ones hiding it
 static Vector2D     g_warpFromCursor;       // where the pointer sat at open
 // Deliberate pointer motion during the zoom cancels the warp: if the hand is
 // already driving, yanking the cursor away is worse than not helping. But the
-// whole pending window is ANIM_SECONDS (~280 ms) during which the pointer is
+// whole pending window is the open's flight, during which the pointer is
 // HIDDEN — nobody is aiming a pointer they cannot see. At 8 px, touchpad noise
 // (finger-lift, a resting palm, the pad's own settling) cancelled gesture
 // opens at random and the feature read as unreliable (Max, 2026-09-03: "it
@@ -323,6 +353,26 @@ static constexpr double WARP_CANCEL_SLOP = 150.0;
 // the swipe is live, and for a beat after the fingers leave, such motion
 // re-baselines the cancel reference instead of cancelling.
 static bool            g_swipeLive = false;
+// Presses we swallowed while owning the pointer / keyboard, by code — only THOSE
+// releases are ours to swallow. A press the compositor saw (before we opened,
+// or on the OPTIONS strip) must reach it whole: swallowing its release leaves a
+// PHANTOM HELD BUTTON in Hyprland — pointer focus pinned to one window and
+// every workspace switch bouncing back to it. That is the swipe bounce of
+// 2026-09-26 (the titlebars had the same hole, see golemBar.cpp); a stuck key
+// is the keyboard's version.
+static std::vector<uint32_t> g_ownedButtons, g_ownedKeys;
+static bool ownInput(std::vector<uint32_t>& owned, uint32_t code, bool pressed) {
+    const auto it = std::find(owned.begin(), owned.end(), code);
+    if (pressed) {
+        if (it == owned.end())
+            owned.push_back(code);
+        return true;
+    }
+    if (it == owned.end())
+        return false;
+    owned.erase(it);
+    return true;
+}
 static Time::steady_tp g_swipeEndAt{};
 static constexpr auto  SWIPE_SETTLE = std::chrono::milliseconds(300);
 
@@ -358,7 +408,6 @@ static double          g_scrollFrom   = 0.0; // flip start position
 static float           g_scrollProg   = 1.0; // 0..1 through the flip (1 = settled)
 static int             g_page         = 0; // 0 = workspaces 1-9, 1 = 10-18
 static Time::steady_tp g_pageFlipAt{};     // cooldown: one notch = one flip
-static constexpr float SCROLL_SECONDS = 0.42f; // page-flip duration
 // True once the user has seen the other page this open (wheel or Super+R
 // tour) — the next toggle press then closes (see toggle()).
 static bool            g_tourDone     = false;
@@ -426,6 +475,95 @@ static void boostCaptures() {
     if (g_liveTimer)
         g_liveTimer->updateTimeout(std::chrono::milliseconds(50));
 }
+
+// ---- DIRTY-DRIVEN LIVE CAPTURE ---------------------------------------------
+//
+// The live timer used to re-photograph EVERY occupied workspace every
+// REFRESH_MS while the map was up. Measured 2026-09-26 over 2000 passes: p50
+// 6 ms, p90 16 ms (a whole 60 Hz frame), p99 157 ms, growing ~1 ms per window
+// — each pass a stall inside the compositor's loop, 6–7 times a second, for a
+// desktop that is mostly NOT changing. Now a tile is re-photographed only when
+// one of its windows changed since the last photograph:
+//   · its surface COMMITTED (a per-surface listener, `watchWindowCommits`);
+//   · its geometry or look changed — position, size, float/fullscreen state,
+//     alpha, the dim, the border fade (`scanWindowChanges`: a small signature
+//     per window compared once a tick, microseconds);
+//   · it appeared, vanished, changed tile or title (bus events);
+//   · the drag machinery said so (`markDirty`, as before).
+// A FULL pass every `FULL_PASS_EVERY` ticks (~1 s) is the net for what none of
+// those can see (the daemon's colour pass rewriting border gradients, a
+// desynced subsurface). At rest nothing is captured and nothing is damaged, so
+// the compositor idles; a video keeps its own tile live at the same cadence as
+// before. What the thumbnails show is unchanged; only the wasted work is gone.
+struct SWinSig {
+    int    tile;
+    double x, y, w, h;
+    float  dim, border, alpha;
+    bool   floating, fullscreen;
+    bool   operator==(const SWinSig&) const = default;
+};
+static std::unordered_map<const void*, SWinSig>             g_winSigs;
+static std::unordered_map<const void*, CHyprSignalListener> g_commitListeners;
+static int                                                  g_ticksSinceFullPass = 0;
+static constexpr int                                        FULL_PASS_EVERY      = 7;
+
+static void watchWindowCommits(PHLWINDOW w) {
+    if (!w || !w->wlSurface() || !w->wlSurface()->resource())
+        return;
+    PHLWINDOWREF ref = w;
+    g_commitListeners[w.get()] = w->wlSurface()->resource()->m_events.commit.listen([ref] {
+        if (const auto ww = ref.lock())
+            markDirty(ww->workspaceID());
+    });
+}
+static void unwatchWindow(PHLWINDOW w) {
+    if (!w)
+        return;
+    g_commitListeners.erase(w.get());
+    g_winSigs.erase(w.get());
+}
+// Compare every window on `m` against its last signature, refreshing the
+// signatures as it goes; returns the tiles that changed (a window that moved
+// tiles dirties both). Windows gone since the last scan dirty their tile.
+static uint32_t scanWindowChanges(PHLMONITOR m) {
+    uint32_t dirty = 0;
+    auto     bit   = [](int t) { return t >= 0 ? (1u << t) : 0u; };
+    std::unordered_set<const void*> seen;
+    for (auto& w : g_pCompositor->m_windows) {
+        if (!w || !w->m_isMapped || w->isHidden() || w->monitorID() != m->m_id)
+            continue;
+        const CBox    b = w->getWindowMainSurfaceBox();
+        const SWinSig sig{waveview_tile_for_workspace(w->workspaceID()), b.x, b.y, b.w, b.h, w->m_dimPercent->value(),
+                          w->m_borderFadeAnimationProgress->value(), w->effectiveAlpha(), w->m_isFloating, w->isFullscreen()};
+        seen.insert(w.get());
+        const auto it = g_winSigs.find(w.get());
+        if (it == g_winSigs.end()) {
+            dirty |= bit(sig.tile);
+            g_winSigs.emplace(w.get(), sig);
+        } else if (!(it->second == sig)) {
+            dirty |= bit(it->second.tile) | bit(sig.tile);
+            it->second = sig;
+        }
+    }
+    for (auto it = g_winSigs.begin(); it != g_winSigs.end();) {
+        if (seen.contains(it->first)) {
+            ++it;
+            continue;
+        }
+        dirty |= bit(it->second.tile);
+        it = g_winSigs.erase(it);
+    }
+    return dirty;
+}
+// Frame events to every workspace's clients so backgrounded apps keep producing
+// frames — otherwise their thumbnails would freeze (Wayland only renders
+// visible surfaces). What makes all tiles live, at the cost of keeping
+// background apps awake while the overview is open. Every tick, captured or not.
+static void keepClientsPainting(PHLMONITOR m) {
+    for (int i = 0; i < N_TILES; ++i)
+        if (const auto ws = g_pCompositor->getWorkspaceByID(i + 1))
+            g_pHyprRenderer->sendFrameEventsToWorkspace(m, ws, Time::steadyNow());
+}
 // Float-leak watch (diagnosis, v0.21): every gesture end arms this; the live
 // timer then compares the window's float state against what the gesture
 // promised, for 3s — catching a leak that happens AFTER the synchronous
@@ -477,39 +615,18 @@ static bool            g_stageDimAsk       = false;
 static constexpr float GOLEM_STAGE_DIM     = 0.8f;
 static Time::steady_tp g_stageCloseAt;
 static constexpr auto  STAGE_CLOSE_WAIT    = std::chrono::milliseconds(400);
-/// Per-close override for the zoom clock (0 = use `ANIM_SECONDS`). Cleared at
-/// the disengage and on every open, so it can never leak into another close.
-static float           g_zoomSeconds       = 0.0f;
-static constexpr float ANIM_SECONDS = 0.28f;
-
-/// TWO MOTION SETS for the overview (Max, 2026-09-25: *"tweaked to feel good
-/// from stage but on plain desktop all feels too slow… two different sets"*).
-/// The stage's in/out was tuned by hand over many rounds and is FROZEN in
-/// `STAGE_MOTION` (except the OPEN, sped up 2026-09-25 on Max's ask: 0.14/0.19 → 0.10/0.14); the plain desktop gets its own, quicker `DESK_MOTION`.
-/// Chosen once, at the OPEN (`g_stageMode` then), and held through the close,
-/// so one trip never mixes the two. Every field is a dial.
-struct OverviewMotion {
-    float openZoom;   // the map opening
-    float openSpread; // the tile's windows easing apart on the way in
-    float closeZoom;  // the zoom home (desk: act 1; stage: the whole way back)
-    float land;       // act 2, the flat glide home (the stage has none)
-    float landEarly;  // how far into the zoom's tail act 2 takes over
-};
-// The open's two acts share ONE duration and ONE curve (easeInOutCubic) and
-// overlap by half (OPEN_ZOOM_AT) — the spread's deceleration and the zoom's
-// acceleration sum into one continuous movement (Max, 2026-09-25: *"the same
-// speed, acceleration… the same movement"*). Total ≈ openSpread·1.5.
-static constexpr OverviewMotion STAGE_MOTION = {0.33f, 0.33f, 0.34f, 0.35f, 0.25f};
-static constexpr OverviewMotion DESK_MOTION  = {0.31f, 0.31f, 0.20f, 0.16f, 0.25f};
 /// THE OPEN IS TWO ACTS — the close's, played forward (Max, 2026-09-25: *"i want
 /// to see the windows spreading (if there is overlapped windows) and then i want
 /// to see them get small until their resting place"*). Act 1: the tile's windows
 /// spread apart at FULL SIZE (zoom held at the desktop). Act 2: the zoom shrinks
 /// the arrangement into its tile. Run together (as before), the reveal happened
-/// inside a shrinking picture and read as one instant blur. Act 2 starts when
-/// act 1 is this far along, so they hand over in one breath (the close's
-/// `landEarly`, mirrored). No overlap on the tile → no act 1, straight to the zoom.
-static constexpr float OPEN_ZOOM_AT = 0.5f;
+/// inside a shrinking picture and read as one instant blur. Act 2 joins once
+/// act 1 has SHOWN a quarter of its travel (see onRender), so they hand over in
+/// one breath. No overlap on the tile → no act 1, straight to the zoom.
+/// Whether this open was called from the STAGE — decided at the open and held
+/// through the close: the stage flips the act order (no reveal at all, the
+/// tile is already at its arrangement once the real picture is in).
+static bool            g_openedFromStage   = false;
 /// From the stage, the map opens on a picture of the STAGE (one maximized
 /// window); the real workspace only exists once waverunner has suspended the
 /// stage and asked us to `recapture` (~60ms). Act 1 waits for that picture —
@@ -526,40 +643,17 @@ static bool                  g_openFromSpread = false;
 /// LAST and wearing the active ring — the landing ends on the real, focused,
 /// on-top window instead of sliding home under a sibling and popping up.
 static PHLWINDOWREF          g_ovPick;
-static const OverviewMotion*    g_motion     = &DESK_MOTION;
-/// How fast the map OPENS — its own dial, so it can be quicker than the way
-/// back without touching the ordinary overview close (Max, 2026-09-17: *"in to
-/// overview faster"*).
-// (now `STAGE_MOTION.openZoom`; history 0.28 -> 0.20 -> 0.14)
-/// How long the tile's windows take to spread apart when the map opens — the
-/// reveal, on its OWN clock so it can outlast the (much shorter) opening zoom.
-// (now `STAGE_MOTION.openSpread`; history 0.30 -> 0.24 -> 0.19)
-/// Its progress, 0..1. Reset on every open; advanced per frame in `onRender`.
+/// Arrival detection for the settled chase (see drawOverview): the frame an
+/// animation lands takes its final box outright. Reset at every open.
+static bool                  g_ovWasSettled = false, g_ovChasing = false;
+/// The open's reveal (act 1), 0..1. Reset on every open; advanced per frame in
+/// `onRender` on the open's own clock (`OPEN_SECONDS`).
 static float           g_openBlend         = 0.0f;
-/// How long the stage's way back takes — **the dial**.
-///
-/// Deliberately `ANIM_SECONDS`, the OPEN's own clock: the open is the one Max
-/// likes, and this is that same movement played the other way. The instant cut
-/// was right in substance and wrong in manner (*"it jumps in front… is good, but
-/// too fast"*, 2026-09-17); 0 here would be that cut again, larger reads calmer.
-// (now `STAGE_MOTION.closeZoom`; history 0.28 -> 0.36 -> 0.46 -> 0.40 -> 0.34)
-// Closing gets its own, longer clock (the spread's glide home): a return is
-// a landing, not an invocation — it doesn't answer a keypress, so it may
-// take the time it needs to read as calm. Same family as the page flip's
-// 0.42s ease-in-out (chosen there for the same reason: max velocity on
-// frame one reads as a jerk).
-static constexpr float CLOSE_SECONDS = 0.28f; // 0.40 -> 0.28 (Max, 2026-09-25: "the spread closing should be faster")
-// The overview close's SECOND ACT (Max, 2026-09-16: "use the animation of
-// closing the spread… selecting a window should call that workspace, and
-// then do the normal close animation we have for closing the overview 1"):
-// the zoom carries the tile to fullscreen with its arrangement INTACT, and
-// only then this glide walks every window home — 1:1 screen space, no
-// magnification amplifying the motion. Three rounds of curve tuning could
-// not fix what was structural: a reorganization riding a zoom is amplified
-// by it; a reorganization at flat scale is the spread's close, the one Max
-// called smooth.
+// The close's layout blend: the windows glide home from their collage seats
+// WHILE the zoom carries the tile to full screen — one clock, landing together
+// (Max, 2026-09-25: *"make the overview closing and the spread closing happen
+// at the same time"*; the two-act close it replaced is in the history, ccca877).
 static float           g_landAnim    = 0.0f; // 1 → 0 through the close's landing act
-// act 2's length: `OverviewMotion::land`
 static int             g_closeLinger = 0;    // desktop-identical overlay frames held over the hand-off
 // VRAM is freed on a timer tick ~450ms AFTER a close, never at the hand-off:
 // releasing ~0.5GB in one synchronous burst inside the render callback could
@@ -567,10 +661,6 @@ static int             g_closeLinger = 0;    // desktop-identical overlay frames
 // background rendered black once (THE BLINK, caught on video 2026-09-16;
 // invisible on the old dark wallpaper, a flash on the new light one).
 static bool g_freePending = false;
-// The landing act starts in the zoom's final quarter (tile ≈ 90% of full
-// size — magnification negligible) so the two acts hand over in one breath:
-// a full stop between them read as move…stop…move (Max, 2026-09-16 round 6).
-// (`OverviewMotion::landEarly`)
 
 // Trackpad gesture: a 3-finger vertical swipe toggles the overview (up = open,
 // down = close). Deltas accumulate over the gesture; once the dominant axis is
@@ -595,23 +685,6 @@ static constexpr double STAGE_SWIPE_GRAIN = 25.0;
 static double mix(double a, double b, double t) {
     return a + (b - a) * t;
 }
-static float easeOutCubic(float t) {
-    const float u = 1.0f - t;
-    return 1.0f - u * u * u;
-}
-// Ease-in-out cubic: gentle start, gentle landing — the page-flip curve,
-// and now the curve of every CLOSE (overview zoom, spread): a zoom-out
-// concentrates its perceived scale-change at the small end, so a fast-start
-// curve kicks twice on frame one. Gentle both ends reads as a landing.
-static double easeInOutCubic(double t) {
-    return t < 0.5 ? 4.0 * t * t * t : 1.0 - std::pow(-2.0 * t + 2.0, 3.0) / 2.0;
-}
-// Its inverse — retargets remap the anim position onto the new curve so a
-// direction change turns around exactly where it is.
-static float invEaseInOutCubic(float p) {
-    p = std::clamp(p, 0.0f, 1.0f);
-    return p < 0.5f ? std::cbrt(p / 4.0f) : 1.0f - std::cbrt(2.0f * (1.0f - p)) / 2.0f;
-}
 
 // ---- GOLEM MOTION: one spring for every movement --------------------------
 //
@@ -621,25 +694,22 @@ static float invEaseInOutCubic(float p) {
 // eight speeds, none of them matching how the compositor itself moves windows.
 //
 // Now every movement here — overview open/close (both acts), the stage's way in
-// and out, the spread, the page flip, the minimize fly — follows ONE shape: the
-// step response of the SAME spring Golem's windows move with (hyprland.lua
-// `hl.curve("easy")`: mass 1, stiffness 71.2633, damping 15.8273644; ζ≈0.94),
-// integrated exactly as hyprutils does (semi-implicit Euler, 240 Hz substeps).
-// Fast off the mark (peak velocity at ~0.12s), a long soft settle — the premium
-// feel — and the windows, the spread and the map finally share one physics.
+// and out, the spread, the page flip, the minimize and restore flies — follows
+// ONE shape: the step response of the SAME spring Golem's windows move with
+// (hyprland.lua `hl.curve("easy")`, ζ≈0.94), integrated exactly as hyprutils
+// does (semi-implicit Euler, 240 Hz substeps): fast off the mark, then a settle.
 //
-// Used as a FINITE curve: the response truncated where it reaches 99%
-// (`MOTION_SECONDS`, ≈0.69s) and normalized so it lands EXACTLY — the overlay
-// hands off to the real desktop and needs a true end. Every motion takes that
-// same time; staggered acts overlap on it instead of running their own clocks.
+// Used as a FINITE curve: the response truncated at `LAND_REACH` and normalized
+// so it lands EXACTLY — the overlay hands off to the real desktop and needs a
+// true end. Each motion has a TIME SCALE (the same spring, faster) — the dials
+// the tuning session settled on, LOCKED at the graduation. The classic
+// hand-tuned curves that preceded the spring, and the A/B switch between them,
+// were removed at the graduation (the last commit carrying them: ccca877).
 //
-// `hl.plugin.waveview.set_motion(false)` flips everything back to the classic
-// hand-tuned curves (kept intact below) for an A/B feel test.
-static bool g_spring = true;
-// 15% faster than the original `easy` (71.2633 / 15.8273644), same shape:
-// time scale 0.85 → k/0.85², c/0.85 (Max, 2026-09-25: *"make ALL a little
-// faster"*). hyprland.lua's `easy` carries the same numbers — keep them equal.
-static constexpr float SPRING_K = 322.8714f, SPRING_C = 33.6891f; // then ×0.85 ×3 more, then ×0.9 ("a little faster")
+// The windows' `easy` spring, time-scaled 0.85⁴·0.9 from the original
+// 71.2633/15.8273644 (same shape, faster). hyprland.lua carries the SAME
+// numbers — keep them equal, or the map and the windows stop sharing physics.
+static constexpr float SPRING_K = 322.8714f, SPRING_C = 33.6891f;
 static constexpr int   SPRING_N = 512;
 struct SSpringTable {
     float  v[SPRING_N + 1];
@@ -740,10 +810,6 @@ static float springToward0(float a) {
 static float springOpen(float a) {
     return springCurve(a, g_springTableOpen);
 }
-// The duration every motion takes (spring) or its classic hand-tuned one.
-static float motionSeconds(float classic) {
-    return g_spring ? MOTION_SECONDS : classic;
-}
 
 // ---- FRAME PACING + 60 Hz MOTION BLUR -------------------------------------
 //
@@ -783,7 +849,7 @@ static constexpr int   BLUR_GHOSTS     = 3;     // in-between samples per frame
 static constexpr float BLUR_ALPHA      = 0.42f; // the nearest ghost; farther ones fade
 static constexpr double BLUR_MIN_TRAVEL = 6.0;  // px/frame (physical) below which nothing is smeared
 static bool blurOn(PHLMONITOR m) {
-    return g_spring && m && m->m_refreshRate < BLUR_BELOW_HZ;
+    return m && m->m_refreshRate < BLUR_BELOW_HZ;
 }
 // Draw the ghosts of a texture that moved from `prev` to `cur` this frame
 // (call BEFORE drawing the real one, so the ghosts sit under it). `draw` puts
@@ -832,6 +898,7 @@ struct SpreadWin {
 };
 static std::vector<SpreadWin>   g_spreadWins;
 static bool                     g_spreadActive = false;
+static bool                     g_spreadWasSettled = false; // arrival detection (see drawSpread); reset at open
 static float                    g_spreadAnim = 0.0f, g_spreadTarget = 0.0f;
 static Time::steady_tp          g_spreadLastT;
 static int64_t                  g_spreadWs = -1; // the workspace the spread belongs to
@@ -870,7 +937,8 @@ struct MinFly {
     float                    t = 0.0f;
     PHLMONITORREF            mon;
     std::string              landMsg; // sent to the daemon when the card lands ("" = nothing)
-    CBox                     blurPrev = {}; // last frame's box (60 Hz motion blur) — last: MinFly is brace-built
+    CBox                     blurPrev = {}; // last frame's box (60 Hz motion blur) — after here: MinFly is brace-built
+    Time::steady_tp          lastT{};       // its OWN clock: a shared one was drained by every other monitor's pass
     // A RESTORE fly: the real window, held invisible while its card flies home
     // and revealed on the landing frame (see `luaRestoreMin`).
     PHLWINDOWREF             reveal = {};
@@ -886,7 +954,6 @@ static void setArrivalAlpha(const PHLWINDOW& w, float a) {
         w->alpha(Desktop::View::WINDOW_ALPHA_MOVE_FROM_WORKSPACE)->setValueAndWarp(a);
 }
 static std::vector<MinFly> g_minFlies;
-static Time::steady_tp     g_minFlyLastT;
 // A finished fly's texture (window-sized, ~25MB) must NOT be released inside
 // the render callback: a big synchronous GL free there dropped the wallpaper
 // for one frame — the same blink freeCaptures had, and Max saw it on both the
@@ -900,7 +967,6 @@ struct MinRec {
     PHLWINDOWREF win;
 };
 static std::vector<MinRec> g_minimized;
-static constexpr float     MINFLY_SECONDS = 0.34f;
 static constexpr int       MIN_THUMB_SIZE = 256; // == waverunner's ICON_SIZE: the .rgba drops straight into a texture layer
 
 static std::string minThumbDir() {
@@ -911,7 +977,6 @@ static std::string windowAddr(PHLWINDOW w) {
     return std::format("0x{:x}", (uintptr_t)w.get());
 }
 void golemMinimize(PHLWINDOW w); // defined with the deck-capture plumbing it reuses; the bars call it
-static void sendWaverunnerSeq(std::vector<std::string> msgs); // ordered sends (defined with sendWaverunner)
 
 // Whether Golem's STAGE owns the screen. Defined up here because the spread
 // refuses to open over it; the full story lives at its old site above
@@ -921,7 +986,6 @@ static bool g_stageMode = false;
 // Defined further down; used by the pointer handlers above their definitions.
 static void jumpTo(int wsId, bool startTheClose = true);
 static void beginCloseZoom(); // put the close on its curve (see `startClose`)
-static void snapCloseNow();          // end the map instantly (fallback)
 static void beginStageCloseZoom();   // the stage's way back: a short zoom
 static void jumpToWindow(PHLWINDOW w);
 static void updateHoverAt(PHLMONITOR m, const Vector2D& c);
@@ -1098,7 +1162,6 @@ static void captureWindows(PHLMONITOR m, uint32_t mask = ALL_TILES) {
         CBox                     screen;
         CBox                     drawCur;
         SP<Render::IFramebuffer> fb; // reused next cycle — see below
-        SP<Render::IFramebuffer> cardFb;
     };
     std::vector<std::pair<PHLWINDOWREF, Carry>> prevBoxes;
     prevBoxes.reserve(g_wins.size());
@@ -1111,7 +1174,7 @@ static void captureWindows(PHLMONITOR m, uint32_t mask = ALL_TILES) {
         // framebuffer per window on EVERY capture (up to 20/s each during
         // the boost) churned the driver into a progressive mid-drag
         // slowdown ("after a few movements all gets slowed down").
-        prevBoxes.emplace_back(cw.win, Carry{cw.screen, cw.drawCur, isDragged ? nullptr : cw.fb, isDragged ? nullptr : cw.cardFb});
+        prevBoxes.emplace_back(cw.win, Carry{cw.screen, cw.drawCur, isDragged ? nullptr : cw.fb});
         if (isDragged)
             stashDragged = cw; // keep its fb alive
     }
@@ -1126,12 +1189,8 @@ static void captureWindows(PHLMONITOR m, uint32_t mask = ALL_TILES) {
             continue;
         }
         const int tile = waveview_tile_for_workspace(w->workspaceID());
-        if (tile < 0 || !g_fbs[tile])
+        if (tile < 0)
             continue;
-        const auto srcTex = g_fbs[tile]->getTexture();
-        if (!srcTex)
-            continue;
-
         const CBox wb = w->getWindowMainSurfaceBox(); // logical coords, CURRENT (pixels live here)
         if (wb.w <= 1.0 || wb.h <= 1.0)
             continue;
@@ -1144,66 +1203,85 @@ static void captureWindows(PHLMONITOR m, uint32_t mask = ALL_TILES) {
         const Vector2D gdp = w->m_realPosition->goal() - w->m_realPosition->value();
         const Vector2D gds = w->m_realSize->goal() - w->m_realSize->value();
 
-        // The window's rect as normalized UV within the full-workspace snapshot.
-        const double u0 = std::clamp((wb.x - m->m_position.x) / m->m_size.x, 0.0, 1.0);
-        const double v0 = std::clamp((wb.y - m->m_position.y) / m->m_size.y, 0.0, 1.0);
-        const double u1 = std::clamp((wb.x + wb.w - m->m_position.x) / m->m_size.x, 0.0, 1.0);
-        const double v1 = std::clamp((wb.y + wb.h - m->m_position.y) / m->m_size.y, 0.0, 1.0);
-        if (u1 - u0 <= 0.0 || v1 - v0 <= 0.0)
-            continue; // fully offscreen
-
         CapWin cw;
         cw.win     = w;
         cw.logical = Rect{wb.x + gdp.x, wb.y + gdp.y, wb.w + gds.x, wb.h + gds.y};
         cw.tile    = tile;
         cw.active  = g_pCompositor->isWindowActive(w);
 
-        // STAGE 2: a tile that hides windows shows its COLLAGE — the mini
-        // sits at its spread slot, and its pixels come from its SOLO capture
-        // (the snapshot holds the occluder's pixels at a buried rect).
-        SP<Render::ITexture> src = srcTex;
-        Vector2D             uvTL{u0, v0}, uvBR{u1, v1};
+        // The window as a CARD (bar + border around the content), and where the
+        // content sits in that card — the sub-rect a mini draws when its
+        // texture is a card (a solo, or the crop below).
+        double top = 0.0, side = 0.0;
+        cardExtents(w, top, side);
+        const double   cbw = wb.w + 2.0 * side, cbh = wb.h + top + side;
+        const Vector2D contentTL{side / cbw, top / cbh}, contentBR{(side + wb.w) / cbw, (top + wb.h) / cbh};
+
+        // STAGE 2: a tile that hides windows shows its COLLAGE — the mini sits
+        // at its spread slot, and its pixels come from its SOLO capture (the
+        // snapshot holds the occluder's pixels at a buried rect; a collage tile
+        // has no snapshot at all). No crop of our own: the solo is drawn
+        // directly, content sub-rect for the mini, whole for the chrome fade.
         if (const Rect* slot = tileSpreadSlot(tile, w)) {
-            cw.spread = true;
-            cw.slot   = *slot; // `logical` keeps the TRUE box — see the field's warning
-            if (auto* sc = soloFor(w, false); sc && sc->fb)
-                if (const auto st = sc->fb->getTexture()) {
-                    // The solo is CARD-sized (bar + border baked, for the
-                    // landing act's chrome fade); the mini takes only the
-                    // content region, so level 2 stays bare.
-                    src = st;
-                    double top = 0.0, side = 0.0;
-                    cardExtents(w, top, side);
-                    const double cbw = wb.w + 2.0 * side, cbh = wb.h + top + side;
-                    uvTL = {side / cbw, top / cbh};
-                    uvBR = {(side + wb.w) / cbw, (top + wb.h) / cbh};
+            cw.spread  = true;
+            cw.slot    = *slot; // `logical` keeps the TRUE box — see the field's warning
+            cw.cardTex = true;
+            cw.uvTL    = contentTL;
+            cw.uvBR    = contentBR;
+            for (auto& pb : prevBoxes) // carry hit-box + slot glide forward across the rebuild
+                if (pb.first.lock() == w) {
+                    cw.screen  = pb.second.screen;
+                    cw.drawCur = pb.second.drawCur;
+                    if (pb.second.fb) { // last cycle's crop: a collage window needs none
+                        pb.second.fb->release();
+                        pb.second.fb.reset();
+                    }
+                    break;
                 }
+            g_wins.push_back(std::move(cw));
+            continue;
         }
 
-        // A window hanging off the screen edge (put away, 2026-09-25): an
-        // ordinary tile shows it the way the DESKTOP does — only the part on
-        // screen, at its place, cut by the tile edge. The crop above is
-        // already clamped to that part; the mini must be too, or the on-screen
-        // sliver is stretched across the whole window's box (the garbage).
-        // (A collage tile gets the WHOLE window instead — its solo is rendered
-        // shifted on-screen, see renderWindowForCrop.)
-        double capW = wb.w, capH = wb.h;
-        if (!cw.spread) {
+        const auto srcTex = g_fbs[tile] ? g_fbs[tile]->getTexture() : nullptr;
+        if (!srcTex)
+            continue;
+        // THE CROP. A bordered window wholly on screen is cropped as its CARD:
+        // the landing fades the chrome in from this very texture (Max,
+        // 2026-09-25: *"some windows land with no title bar, the title bar
+        // shows up after landing"* — before, only collage windows had a card).
+        // Otherwise the VISIBLE part of the content: a window hanging off the
+        // screen edge (put away, 2026-09-25) shows the way the DESKTOP shows it
+        // — only the part on screen, at its place, cut by the tile edge — and
+        // the mini's box is clipped to match, or the on-screen sliver would be
+        // stretched across the whole window's box (the garbage).
+        const CBox cardBox{wb.x - side, wb.y - top, cbw, cbh};
+        const bool card = top > 0.0 && cardBox.x >= m->m_position.x && cardBox.y >= m->m_position.y &&
+            cardBox.x + cardBox.w <= m->m_position.x + m->m_size.x && cardBox.y + cardBox.h <= m->m_position.y + m->m_size.y;
+        CBox crop = cardBox;
+        if (card) {
+            cw.cardTex = true;
+            cw.uvTL    = contentTL;
+            cw.uvBR    = contentBR;
+        } else {
             const double vx0 = std::max(wb.x, m->m_position.x), vy0 = std::max(wb.y, m->m_position.y);
             const double vx1 = std::min(wb.x + wb.w, m->m_position.x + m->m_size.x);
             const double vy1 = std::min(wb.y + wb.h, m->m_position.y + m->m_size.y);
-            if (vx0 > wb.x + 0.5 || vy0 > wb.y + 0.5 || vx1 < wb.x + wb.w - 0.5 || vy1 < wb.y + wb.h - 0.5) {
+            if (vx1 - vx0 <= 0.0 || vy1 - vy0 <= 0.0)
+                continue; // fully offscreen
+            crop = CBox{vx0, vy0, vx1 - vx0, vy1 - vy0};
+            if (vx0 > wb.x + 0.5 || vy0 > wb.y + 0.5 || vx1 < wb.x + wb.w - 0.5 || vy1 < wb.y + wb.h - 0.5)
                 cw.logical = Rect{vx0 + gdp.x, vy0 + gdp.y, vx1 - vx0, vy1 - vy0};
-                capW = vx1 - vx0;
-                capH = vy1 - vy0;
-            }
         }
-        const int fbw = std::max(1, (int)std::lround(capW * scale));
-        const int fbh = std::max(1, (int)std::lround(capH * scale));
+        // The crop as normalized UV within the full-workspace snapshot.
+        const Vector2D uvTL{std::clamp((crop.x - m->m_position.x) / m->m_size.x, 0.0, 1.0),
+                            std::clamp((crop.y - m->m_position.y) / m->m_size.y, 0.0, 1.0)};
+        const Vector2D uvBR{std::clamp((crop.x + crop.w - m->m_position.x) / m->m_size.x, 0.0, 1.0),
+                            std::clamp((crop.y + crop.h - m->m_position.y) / m->m_size.y, 0.0, 1.0)};
+        const int fbw = std::max(1, (int)std::lround(crop.w * scale));
+        const int fbh = std::max(1, (int)std::lround(crop.h * scale));
         for (auto& pb : prevBoxes)
             if (pb.first.lock() == w && pb.second.fb) {
-                cw.fb     = std::move(pb.second.fb); // last cycle's FB, storage intact
-                cw.cardFb = std::move(pb.second.cardFb);
+                cw.fb = std::move(pb.second.fb); // last cycle's FB, storage intact
                 break;
             }
         // Mid-spring, windows genuinely OVERLAP in the workspace snapshot
@@ -1211,13 +1289,9 @@ static void captureWindows(PHLMONITOR m, uint32_t mask = ALL_TILES) {
         // cross while re-tiling) — a crop taken then contains slivers of
         // the neighbour ("the content gets mixed"). While this window
         // overlaps any sibling, hold its last clean crop; the refresh
-        // resumes the moment they separate. A SOLO-sourced window skips all
-        // of this: rendered alone, its crop is clean by construction (and a
-        // spread tile's windows overlap by definition — the hold would
-        // freeze them forever).
+        // resumes the moment they separate.
         bool overlapped = false;
-        if (!cw.spread)
-            for (auto& o : g_pCompositor->m_windows) {
+        for (auto& o : g_pCompositor->m_windows) {
             if (!o || o == w || !o->m_isMapped || o->isHidden() || o->workspaceID() != w->workspaceID())
                 continue;
             const CBox   ob = o->getWindowMainSurfaceBox();
@@ -1256,55 +1330,11 @@ static void captureWindows(PHLMONITOR m, uint32_t mask = ALL_TILES) {
             td.allowCustomUV               = true;
             td.primarySurfaceUVTopLeft     = uvTL;
             td.primarySurfaceUVBottomRight = uvBR;
-            Render::GL::g_pHyprOpenGL->renderTexture(src, CBox{0.0, 0.0, (double)fbw, (double)fbh}, td);
+            Render::GL::g_pHyprOpenGL->renderTexture(srcTex, CBox{0.0, 0.0, (double)fbw, (double)fbh}, td);
 
             g_pHyprRenderer->m_renderData.blockScreenShader = true;
             g_pHyprRenderer->endRender();
             mipmapFB(cw.fb);
-        }
-
-        // THE CARD for a non-collage float (Max, 2026-09-25: *"some windows
-        // land with no title bar, the title bar shows up after landing"*). The
-        // landing fades each window's chrome in around its content from a
-        // card-sized picture — which only collage tiles had (their solos).
-        // Everywhere else the bar popped in at the hand-off. The tile snapshot
-        // already holds the bar: crop the card out of it. No overlap here by
-        // definition, so the crop is clean.
-        double ctop = 0.0, cside = 0.0;
-        cardExtents(w, ctop, cside);
-        const CBox cbx{wb.x - cside, wb.y - ctop, wb.w + 2.0 * cside, wb.h + ctop + cside};
-        const bool wantCard = !cw.spread && ctop > 0.0 && cbx.x >= m->m_position.x && cbx.y >= m->m_position.y &&
-            cbx.x + cbx.w <= m->m_position.x + m->m_size.x && cbx.y + cbx.h <= m->m_position.y + m->m_size.y;
-        if (!wantCard) {
-            if (cw.cardFb)
-                cw.cardFb->release();
-            cw.cardFb.reset();
-        } else {
-            const int cfw   = std::max(1, (int)std::lround(cbx.w * scale));
-            const int cfh   = std::max(1, (int)std::lround(cbx.h * scale));
-            bool      cfres = fresh;
-            if (!cw.cardFb) {
-                cw.cardFb = g_pHyprRenderer->createFB("waveview-card");
-                cw.cardFb->alloc(cfw, cfh, DRM_FORMAT_ABGR8888);
-                cfres = true;
-            } else if (cw.cardFb->m_size != Vector2D(cfw, cfh)) {
-                cw.cardFb->release();
-                cw.cardFb->alloc(cfw, cfh, DRM_FORMAT_ABGR8888);
-                cfres = true;
-            }
-            if (cfres) {
-                CRegion fakeDamage{0, 0, INT16_MAX, INT16_MAX};
-                g_pHyprRenderer->beginRender(m, fakeDamage, Render::RENDER_MODE_FULL_FAKE, nullptr, cw.cardFb);
-                glClearColor(0.0F, 0.0F, 0.0F, 0.0F);
-                glClear(GL_COLOR_BUFFER_BIT);
-                Render::GL::CHyprOpenGLImpl::STextureRenderData td;
-                td.allowCustomUV               = true;
-                td.primarySurfaceUVTopLeft     = Vector2D((cbx.x - m->m_position.x) / m->m_size.x, (cbx.y - m->m_position.y) / m->m_size.y);
-                td.primarySurfaceUVBottomRight = Vector2D((cbx.x + cbx.w - m->m_position.x) / m->m_size.x, (cbx.y + cbx.h - m->m_position.y) / m->m_size.y);
-                Render::GL::g_pHyprOpenGL->renderTexture(srcTex, CBox{0.0, 0.0, (double)cfw, (double)cfh}, td);
-                g_pHyprRenderer->m_renderData.blockScreenShader = true;
-                g_pHyprRenderer->endRender();
-            }
         }
 
         for (auto& pb : prevBoxes) // carry hit-box + slot glide forward across the rebuild
@@ -1316,12 +1346,9 @@ static void captureWindows(PHLMONITOR m, uint32_t mask = ALL_TILES) {
 
         g_wins.push_back(std::move(cw));
     }
-    for (auto& pb : prevBoxes) {
+    for (auto& pb : prevBoxes)
         if (pb.second.fb)
-            pb.second.fb->release(); // window vanished: free its texture storage
-        if (pb.second.cardFb)
-            pb.second.cardFb->release();
-    }
+            pb.second.fb->release(); // window vanished (or joined a collage): free its texture storage
 }
 
 // Render each of the 9 workspaces into its own framebuffer thumbnail. This does
@@ -1454,8 +1481,8 @@ static void captureWorkspaces(PHLMONITOR m, uint32_t mask = ALL_TILES) {
     // STAGE 2: decide which tiles show their collage, and where every window
     // of those tiles sits — before any pixels move, so the snapshot loop can
     // solo-capture exactly the windows the collage needs.
-    sweepSolos();
     computeTileSpreads(m, mask, occupied);
+    sweepSolos();
 
     for (int i = 0; i < N_TILES; ++i) {
         auto& fb = g_fbs[i];
@@ -1464,41 +1491,54 @@ static void captureWorkspaces(PHLMONITOR m, uint32_t mask = ALL_TILES) {
                 fb->release();
                 fb.reset();
             }
+            g_tileCaptured[i] = false;
             continue;
         }
-        if (!(mask & (1u << i)) && fb && fb->m_size == monbox.size())
-            continue; // not dirty: last snapshot stands
-        if (!fb)
-            fb = g_pHyprRenderer->createFB("waveview");
-        if (fb->m_size != monbox.size()) {
-            fb->release();
-            fb->alloc(monbox.w, monbox.h, DRM_FORMAT_ABGR8888);
+        const bool collage = g_tileSpread[i].on;
+        if (!(mask & (1u << i)) && g_tileCaptured[i] && (collage || (fb && fb->m_size == monbox.size())))
+            continue; // not dirty: last photograph stands
+        if (collage) {
+            // A collage tile is drawn from its SOLOS alone (every window
+            // rendered ALONE — the stacked snapshot would hold the occluder's
+            // pixels at a buried rect and was never sampled): no snapshot.
+            if (fb) {
+                fb->release();
+                fb.reset();
+            }
+        } else {
+            if (!fb)
+                fb = g_pHyprRenderer->createFB("waveview");
+            if (fb->m_size != monbox.size()) {
+                fb->release();
+                fb->alloc(monbox.w, monbox.h, DRM_FORMAT_ABGR8888);
+            }
+
+            CRegion fakeDamage{0, 0, INT16_MAX, INT16_MAX};
+            g_pHyprRenderer->beginRender(m, fakeDamage, Render::RENDER_MODE_FULL_FAKE, nullptr, fb);
+            glClearColor(0.0F, 0.0F, 0.0F, 1.0F);
+            glClear(GL_COLOR_BUFFER_BIT);
+
+            if (const auto ws = g_pCompositor->getWorkspaceByID(i + 1)) {
+                m->m_activeWorkspace = ws; // renderWorkspace draws the monitor's active ws
+                // Snap this workspace's windows to their on-screen positions (non-active
+                // workspaces are parked offscreen), else renderWorkspace captures nothing
+                // of it. instant=true so the real desktop doesn't visibly animate.
+                g_pDesktopAnimationManager->startAnimation(ws, CDesktopAnimationManager::ANIMATION_TYPE_IN, true, true);
+                ws->m_visible = true;
+                g_pHyprRenderer->renderWorkspace(m, ws, Time::steadyNow(), monbox);
+                ws->m_visible = false;
+                g_pDesktopAnimationManager->startAnimation(ws, CDesktopAnimationManager::ANIMATION_TYPE_OUT, false, true);
+            }
+
+            g_pHyprRenderer->m_renderData.blockScreenShader = true;
+            g_pHyprRenderer->endRender();
         }
+        g_tileCaptured[i] = true;
 
-        CRegion fakeDamage{0, 0, INT16_MAX, INT16_MAX};
-        g_pHyprRenderer->beginRender(m, fakeDamage, Render::RENDER_MODE_FULL_FAKE, nullptr, fb);
-        glClearColor(0.0F, 0.0F, 0.0F, 1.0F);
-        glClear(GL_COLOR_BUFFER_BIT);
-
-        if (const auto ws = g_pCompositor->getWorkspaceByID(i + 1)) {
-            m->m_activeWorkspace = ws; // renderWorkspace draws the monitor's active ws
-            // Snap this workspace's windows to their on-screen positions (non-active
-            // workspaces are parked offscreen), else renderWorkspace captures nothing
-            // of it. instant=true so the real desktop doesn't visibly animate.
-            g_pDesktopAnimationManager->startAnimation(ws, CDesktopAnimationManager::ANIMATION_TYPE_IN, true, true);
-            ws->m_visible = true;
-            g_pHyprRenderer->renderWorkspace(m, ws, Time::steadyNow(), monbox);
-            ws->m_visible = false;
-            g_pDesktopAnimationManager->startAnimation(ws, CDesktopAnimationManager::ANIMATION_TYPE_OUT, false, true);
-        }
-
-        g_pHyprRenderer->m_renderData.blockScreenShader = true;
-        g_pHyprRenderer->endRender();
-
-        // A hiding tile also needs each of its windows ALONE (the snapshot
-        // above stacked them). Same on-screen juggling, but OUTSIDE the
-        // snapshot's render pass — nesting render passes corrupts GL.
-        if (g_tileSpread[i].on)
+        // A hiding tile needs each of its windows ALONE. Same on-screen
+        // juggling as a snapshot, one render pass per window — never nested
+        // (nesting render passes corrupts GL).
+        if (collage)
             if (const auto ws = g_pCompositor->getWorkspaceByID(i + 1)) {
                 m->m_activeWorkspace = ws;
                 g_pDesktopAnimationManager->startAnimation(ws, CDesktopAnimationManager::ANIMATION_TYPE_IN, true, true);
@@ -1514,7 +1554,9 @@ static void captureWorkspaces(PHLMONITOR m, uint32_t mask = ALL_TILES) {
     // wallpaper doesn't change mid-drag), and one cropped texture per window.
     if (mask == ALL_TILES || !g_bgFB)
         captureBackdrop(m, monbox);
+    const auto capT1 = Time::steadyNow();
     captureWindows(m, mask);
+    const auto capT2 = Time::steadyNow();
 
     g_capturing                              = false;
     g_pHyprRenderer->m_bBlockSurfaceFeedback = false;
@@ -1524,17 +1566,16 @@ static void captureWorkspaces(PHLMONITOR m, uint32_t mask = ALL_TILES) {
         g_pDesktopAnimationManager->startAnimation(startedOn, CDesktopAnimationManager::ANIMATION_TYPE_IN, true, true);
     }
 
-    // Send frame events to every workspace's clients so backgrounded apps keep
-    // producing frames — otherwise their thumbnails would freeze (Wayland only
-    // renders visible surfaces). This is what makes all tiles live, at the cost
-    // of keeping background apps awake while the overview is open.
-    for (int i = 0; i < N_TILES; ++i)
-        if (const auto ws = g_pCompositor->getWorkspaceByID(i + 1))
-            g_pHyprRenderer->sendFrameEventsToWorkspace(m, ws, Time::steadyNow());
-
+    keepClientsPainting(m);
     g_captureMon = m;
-    trace("capture mask=%05x wins=%zu dur=%.1fms", mask, g_wins.size(),
-          std::chrono::duration<double, std::milli>(Time::steadyNow() - capT0).count());
+    if (mask == ALL_TILES) {
+        (void)scanWindowChanges(m); // a full pass photographed everything: the signatures match it now
+        g_dirtyTiles = 0;
+    }
+    trace("capture mask=%05x wins=%zu dur=%.1fms (tiles %.1f, crops %.1f)", mask, g_wins.size(),
+          std::chrono::duration<double, std::milli>(Time::steadyNow() - capT0).count(),
+          std::chrono::duration<double, std::milli>(capT1 - capT0).count(),
+          std::chrono::duration<double, std::milli>(capT2 - capT1).count());
 }
 
 // Release every capture buffer: the workspace snapshots, the backdrop, and
@@ -1553,13 +1594,16 @@ static void freeCaptures() {
         g_bgFB->release();
         g_bgFB.reset();
     }
-    for (auto& cw : g_wins) {
+    for (auto& cw : g_wins)
         if (cw.fb)
             cw.fb->release();
-        if (cw.cardFb)
-            cw.cardFb->release();
-    }
     g_wins.clear();
+    for (auto& c : g_tileCaptured)
+        c = false;
+    for (auto& ts : g_tileSpread) {
+        ts.on = false;
+        ts.slots.clear();
+    }
     for (auto& sc : g_solo)
         if (sc.fb)
             sc.fb->release();
@@ -1641,8 +1685,8 @@ static Rect spreadCard(PHLWINDOW w) {
 // tile (its parked-offscreen box would poison the layout).
 static void computeTileSpreads(PHLMONITOR m, uint32_t mask, uint32_t occupied) {
     for (int i = 0; i < N_TILES; ++i) {
-        if (!(mask & (1u << i)) && g_fbs[i])
-            continue; // not dirty: last collage stands with the last snapshot
+        if (!(mask & (1u << i)) && g_tileCaptured[i])
+            continue; // not dirty: last collage stands with the last photograph
         auto& ts = g_tileSpread[i];
         ts.on    = false;
         ts.slots.clear();
@@ -1982,6 +2026,14 @@ static void captureSpreadTextures(PHLMONITOR m, bool alsoBackdrop) {
 
 // Release everything the spread holds. Its VRAM lifetime mirrors the
 // overview's: held only while on screen.
+// Release the level-1 cards' textures; the next layout allocates fresh ones.
+static void freeSpreadCards() {
+    for (auto& sw : g_spreadWins)
+        if (sw.fb)
+            sw.fb->release();
+    g_spreadWins.clear();
+}
+
 static void freeSpread() {
     for (auto& sw : g_spreadWins)
         if (sw.fb)
@@ -2009,6 +2061,8 @@ static void finishSpreadClose(bool tellDaemon = true) {
     g_spreadActive = false;
     g_spreadTarget = 0.0f;
     g_spreadAnim   = 0.0f;
+    g_ownedButtons.clear();
+    g_ownedKeys.clear();
     g_spreadWs     = -1;
     g_spreadHover.reset();
     g_spreadPick.reset();
@@ -2028,13 +2082,13 @@ static void openSpread(PHLMONITOR m) {
         return;
     g_spreadWs  = m->activeWorkspaceID();
     g_spreadMon = m;
-    g_spreadWins.clear();
     layoutSpread(m, pop);
     captureSpreadTextures(m, true);
     g_spreadActive = true;
     g_freePending  = false; // reopened before the deferred free: the captures are live again
-    g_spreadAnim   = 0.0f;
-    g_spreadTarget = 1.0f;
+    g_spreadAnim       = 0.0f;
+    g_spreadTarget     = 1.0f;
+    g_spreadWasSettled = false;
     g_spreadLastT  = Time::steadyNow();
     g_spreadHover.reset();
     g_spreadPick.reset();
@@ -2053,24 +2107,18 @@ static void openSpread(PHLMONITOR m) {
 // drop. That was Max's "too aggressive… I guess there is no animation at
 // all" (2026-09-16): all the motion lived in three frames before a cut.
 static float spreadProgress() {
-    // Opening stays easeOutCubic over ANIM_SECONDS — SNAPPY. Tried as act 1's
-    // easeInOutCubic (2026-09-25, "the same movement") and reverted the same
-    // day: *"the first spread… is slower, is not that snappy"*. The swipe's
-    // own rung answers the hand; only the overview's act 1 is the gentle one.
-    if (g_spring)
-        return g_spreadTarget >= 0.5f ? springCurve(g_spreadAnim, g_springTableSpread)
-                                      : 1.0f - springCurve(1.0f - g_spreadAnim, g_springTableSpread);
-    return g_spreadTarget >= 0.5f ? easeOutCubic(g_spreadAnim) : (float)easeInOutCubic(g_spreadAnim);
+    // Its own spring cut (`g_springTableSpread`), ridden forward in each
+    // direction of travel — never the curve backwards.
+    return g_spreadTarget >= 0.5f ? springCurve(g_spreadAnim, g_springTableSpread)
+                                  : 1.0f - springCurve(1.0f - g_spreadAnim, g_springTableSpread);
 }
 
 static void closeSpread() {
     if (!g_spreadActive || g_spreadTarget <= 0.0f)
         return;
-    // Mid-open retarget: the two directions ride different curves, so map
-    // the CURRENT progress onto the closing curve — the cards turn around
-    // from exactly where they are, no teleport.
-    g_spreadAnim   = g_spring ? 1.0f - invSpringCurve(1.0f - springCurve(g_spreadAnim, g_springTableSpread), g_springTableSpread)
-                              : invEaseInOutCubic(easeOutCubic(g_spreadAnim));
+    // Mid-open retarget: map the CURRENT position onto the closing direction —
+    // the cards turn around from exactly where they are, no teleport.
+    g_spreadAnim   = 1.0f - invSpringCurve(1.0f - springCurve(g_spreadAnim, g_springTableSpread), g_springTableSpread);
     g_spreadTarget = 0.0f;
     g_spreadLastT  = Time::steadyNow();
     trace("spread close (glide)");
@@ -2233,7 +2281,10 @@ static void drawOverview(PHLMONITOR m, float p, float pl, int zoomTile) {
     // zoom (p→0 = a workspace filling the whole monitor, bar strip included).
     const double clipTop = topInset(m) * p;
     const CBox   stripClip{0.0, clipTop, m->m_transformedSize.x, m->m_transformedSize.y - clipTop};
-    auto drawTex = [&](SP<Render::ITexture> tex, const CBox& b, int round, float a = 1.0f) {
+    // `uvTL/uvBR`: the content's sub-rect within the texture (a card's, or the
+    // whole thing) — see CapWin::uv.
+    auto drawTex = [&](SP<Render::ITexture> tex, const CBox& b, int round, float a = 1.0f, Vector2D uvTL = {0.0, 0.0},
+                       Vector2D uvBR = {1.0, 1.0}) {
         CTexPassElement::SRenderData td;
         td.tex           = tex;
         td.a             = a;
@@ -2246,10 +2297,14 @@ static void drawOverview(PHLMONITOR m, float p, float pl, int zoomTile) {
         // toward its destination), crop the source centrally in UV space —
         // the window's pixels keep their aspect and the box edges cut into
         // them, reading like a real resize instead of rubber-banding.
-        const double ta = tex->m_size.y > 0.0 ? tex->m_size.x / tex->m_size.y : 1.0;
-        const double ba = b.h > 0.0 ? b.w / b.h : ta;
+        const Vector2D uvSize = uvBR - uvTL;
+        const double   th     = tex->m_size.y * uvSize.y;
+        const double   ta     = th > 0.0 ? (tex->m_size.x * uvSize.x) / th : 1.0;
+        const double   ba     = b.h > 0.0 ? b.w / b.h : ta;
+        Vector2D       tl{0.0, 0.0}, br{1.0, 1.0}; // within the sub-rect
+        bool           cover = false;
         if (std::abs(ba - ta) > 0.01 * ta) {
-            Vector2D tl{0.0, 0.0}, br{1.0, 1.0};
+            cover = true;
             if (ba > ta) { // box relatively wider: crop top/bottom
                 const double f = ta / ba;
                 tl.y           = (1.0 - f) / 2.0;
@@ -2259,7 +2314,11 @@ static void drawOverview(PHLMONITOR m, float p, float pl, int zoomTile) {
                 tl.x           = (1.0 - f) / 2.0;
                 br.x           = 1.0 - tl.x;
             }
-            g_pHyprRenderer->m_renderPass.add(makeUnique<CUVTexElement>(std::move(td), tl, br));
+        }
+        if (cover || uvTL != Vector2D{0.0, 0.0} || uvBR != Vector2D{1.0, 1.0}) {
+            const Vector2D ftl{uvTL.x + tl.x * uvSize.x, uvTL.y + tl.y * uvSize.y};
+            const Vector2D fbr{uvTL.x + br.x * uvSize.x, uvTL.y + br.y * uvSize.y};
+            g_pHyprRenderer->m_renderPass.add(makeUnique<CUVTexElement>(std::move(td), ftl, fbr));
             return;
         }
         g_pHyprRenderer->m_renderPass.add(makeUnique<CTexPassElement>(td));
@@ -2529,9 +2588,8 @@ static void drawOverview(PHLMONITOR m, float p, float pl, int zoomTile) {
         // while settled; on the frame an animation ARRIVES it must take the
         // final box outright, or it swallows the curve's last step (large
         // now that the curves land firmly) and plays it as an exponential creep.
-        static bool wasSettled = false;
-        const bool  arriving   = settled && !wasSettled;
-        wasSettled             = settled;
+        const bool arriving = settled && !g_ovWasSettled;
+        g_ovWasSettled      = settled;
         double     chaseMax = 0.0; // 🔬 how far the settled glide still has to go (the "slow motion" hunt)
         for (size_t i = 0; i < g_wins.size(); ++i) {
             auto& cw = g_wins[i];
@@ -2554,12 +2612,11 @@ static void drawOverview(PHLMONITOR m, float p, float pl, int zoomTile) {
                 previewMoving = true;
             boxes[i] = cw.drawCur;
         }
-        static bool chasing = false;
-        if (chaseMax > 1.0 && !chasing)
+        if (chaseMax > 1.0 && !g_ovChasing)
             trace("ov CHASE start %.0fpx", chaseMax);
-        else if (chaseMax <= 1.0 && chasing)
+        else if (chaseMax <= 1.0 && g_ovChasing)
             trace("ov CHASE end");
-        chasing = chaseMax > 1.0;
+        g_ovChasing = chaseMax > 1.0;
     }
     if (previewMoving) {
         g_pHyprRenderer->damageMonitor(m);
@@ -2584,7 +2641,7 @@ static void drawOverview(PHLMONITOR m, float p, float pl, int zoomTile) {
         auto& cw = g_wins[i];
         if (!ok[i])
             continue;
-        const auto tex = cw.fb ? cw.fb->getTexture() : nullptr;
+        const auto tex = capTex(cw);
         if (!tex)
             continue;
         const CBox& box = boxes[i];
@@ -2615,23 +2672,17 @@ static void drawOverview(PHLMONITOR m, float p, float pl, int zoomTile) {
         const bool  opening = g_animTarget >= 0.5f;
         const float fadeIn  = (opening && cw.fresh) ? pl : 1.0f;
         const float chromeA = !opening ? 1.0f - pl : (g_openFromSpread ? 1.0f - p : 1.0f - pl) * fadeIn;
-        SP<Render::IFramebuffer> chromeFb = cw.cardFb; // non-collage float: its card from the snapshot
-        if (cw.spread && w)
-            if (auto* sc = soloFor(w, false); sc && sc->fb)
-                chromeFb = sc->fb;
-        if (chromeFb && w && chromeA > 0.001f)
-                if (const auto ct = chromeFb->getTexture()) {
-                    double top = 0.0, side = 0.0;
-                    cardExtents(w, top, side);
-                    const CBox   swb = w->getWindowMainSurfaceBox();
-                    const double sc2 = swb.w > 0.0 ? box.w / swb.w : 0.0; // the mini's current scale
-                    CTexPassElement::SRenderData cd;
-                    cd.tex = ct;
-                    cd.box = CBox{box.x - side * sc2, box.y - top * sc2, box.w + 2.0 * side * sc2,
-                                  box.h + (top + side) * sc2};
-                    cd.a   = chromeA;
-                    g_pHyprRenderer->m_renderPass.add(makeUnique<CTexPassElement>(cd));
-                }
+        if (cw.cardTex && w && chromeA > 0.001f) { // the same texture, drawn WHOLE: the card around the content
+            double top = 0.0, side = 0.0;
+            cardExtents(w, top, side);
+            const CBox   swb = w->getWindowMainSurfaceBox();
+            const double sc2 = swb.w > 0.0 ? box.w / swb.w : 0.0; // the mini's current scale
+            CTexPassElement::SRenderData cd;
+            cd.tex = tex;
+            cd.box = CBox{box.x - side * sc2, box.y - top * sc2, box.w + 2.0 * side * sc2, box.h + (top + side) * sc2};
+            cd.a   = chromeA;
+            g_pHyprRenderer->m_renderPass.add(makeUnique<CTexPassElement>(cd));
+        }
 
         // Act 1 holds the zoom at the desktop, where the overview's corner
         // (DSN_WIN_ROUND·p) is ~0 — square windows parting at full size. Wear
@@ -2642,9 +2693,9 @@ static void drawOverview(PHLMONITOR m, float p, float pl, int zoomTile) {
             const double k   = swb.w > 0.0 ? box.w / swb.w : 0.0;
             wround = (int)std::lround(mix(w->rounding() * k, DSN_WIN_ROUND * m->m_scale, p));
         }
-        drawMotionGhosts(m, cw.blurPrev, box, fadeIn, [&](const CBox& b, float a) { drawTex(tex, b, wround, a); });
+        drawMotionGhosts(m, cw.blurPrev, box, fadeIn, [&](const CBox& b, float a) { drawTex(tex, b, wround, a, cw.uvTL, cw.uvBR); });
         cw.blurPrev = box;
-        drawTex(tex, box, wround, fadeIn);
+        drawTex(tex, box, wround, fadeIn, cw.uvTL, cw.uvBR);
     }
 
     // The dragged window rides on top, following the cursor.
@@ -2652,7 +2703,7 @@ static void drawOverview(PHLMONITOR m, float p, float pl, int zoomTile) {
         for (auto& cw : g_wins) {
             if (cw.win.lock() != dragW)
                 continue;
-            const auto tex = cw.fb ? cw.fb->getTexture() : nullptr;
+            const auto tex = capTex(cw);
             if (!tex)
                 break;
             // Shapeshifting ghost: eased dims previewing the destination
@@ -2664,7 +2715,7 @@ static void drawOverview(PHLMONITOR m, float p, float pl, int zoomTile) {
             CBox b{g_dragCursor.x - g_grabFracX * g_ghostW, g_dragCursor.y - g_grabFracY * g_ghostH, g_ghostW,
                    g_ghostH};
             haloBorder(b, round);
-            drawTex(tex, b, round);
+            drawTex(tex, b, round, 1.0f, cw.uvTL, cw.uvBR);
             break;
         }
     }
@@ -2734,17 +2785,19 @@ static void onLiveTimer(SP<CEventLoopTimer> self, void*) {
         freeSpread();
     }
     if (g_spreadActive && !g_active) {
+        const auto m = g_spreadMon.lock();
+        if (!m) { // the monitor is gone: no render pass will ever move the glide, and the keyboard is ours until it lands
+            snapCloseSpread();
+            return;
+        }
         // Never recapture mid-glide — a capture stalls a frame (the
         // overview's own hitch lesson). Poll quickly until it settles.
-        if (g_spreadAnim != g_spreadTarget) {
+        if (g_spreadAnim != g_spreadTarget || !g_minFlies.empty()) {
             self->updateTimeout(std::chrono::milliseconds(50));
             return;
         }
-        if (const auto m = g_spreadMon.lock()) {
-            refreshSpread(m);
-            damageAll();
-        } else
-            snapCloseSpread();
+        refreshSpread(m);
+        damageAll();
         if (!g_spreadActive)
             return; // the refresh folded it; finishSpreadClose disarmed the timer
         self->updateTimeout(REFRESH_MS);
@@ -2761,19 +2814,31 @@ static void onLiveTimer(SP<CEventLoopTimer> self, void*) {
     // overview never captures at all — the tiles are about to be freed, and
     // a capture firing in the tick between touchdown and disengage blocked
     // the loop at the exact frame of the hand-off (the blink race).
-    if (g_scrollProg < 1.0f || g_anim != g_animTarget || g_animTarget < 0.5f || (g_openBlend < 1.0f && openHasAct1())) {
+    if (g_scrollProg < 1.0f || g_anim != g_animTarget || g_animTarget < 0.5f || g_openBlend < 1.0f || !g_minFlies.empty()) {
         self->updateTimeout(std::chrono::milliseconds(50));
         return;
     }
     if (const auto m = g_captureMon.lock()) {
-        // Boost ticks refresh only the tiles a commit touched; the regular
-        // cadence does a full pass and resets the dirty set.
+        // DIRTY-DRIVEN (see scanWindowChanges): only the tiles whose windows
+        // changed since their last photograph, plus a full pass every
+        // FULL_PASS_EVERY ticks as the net. Nothing dirty → no photograph and
+        // no damage: the compositor idles. Boost ticks keep their dirty set
+        // across ticks so a springing re-tile is tracked for the whole boost.
         const bool boosting = Time::steadyNow() < g_boostUntil;
-        captureWorkspaces(m, boosting && g_dirtyTiles ? g_dirtyTiles : ALL_TILES);
+        g_dirtyTiles |= scanWindowChanges(m);
+        const bool full = !boosting && ++g_ticksSinceFullPass >= FULL_PASS_EVERY;
+        if (full)
+            g_ticksSinceFullPass = 0;
+        const uint32_t mask = full ? ALL_TILES : g_dirtyTiles;
+        if (mask)
+            captureWorkspaces(m, mask);
+        else
+            keepClientsPainting(m); // no photograph, but the clients must keep painting or nothing ever changes
         if (!boosting)
             g_dirtyTiles = 0;
         maybeCommit(m); // the dwell can expire with the cursor at rest
-        damageAll();
+        if (mask || (g_dragWin.lock() && g_dragMoved))
+            damageAll();
     }
     // While a live commit's real re-tile is springing, capture at ~20fps so
     // the tiles show the actual animation — that's the point of committing.
@@ -3105,6 +3170,12 @@ static void endRealDrag(std::optional<Vector2D> at, PHLWINDOW splitTarget) {
     // grab already floated the window out, so undo that much.
     if (!g_layoutManager->dragController()->target()) {
         trace("end DEAD-TARGET(top)");
+        // The grab parked the window at -20000 (beginRealDrag); a float that
+        // never got its drop would stay there. Seat it back at its home.
+        if (const auto dw = g_dragWin.lock(); dw && dw->m_isFloating && inLayoutSpace(dw)) {
+            const CBox wb = dw->getWindowMainSurfaceBox();
+            g_layoutManager->setTargetGeom(CBox{g_dragHomeCenter.x - wb.w / 2.0, g_dragHomeCenter.y - wb.h / 2.0, wb.w, wb.h}, dw->layoutTarget());
+        }
         restoreFloatState(g_dragWin.lock());
         return;
     }
@@ -3461,8 +3532,12 @@ static void clearBorderResizeIcon() {
 static void reassertOverviewCursor() {
     if (!g_pInputManager || g_pInputManager->m_borderIconDirection == BORDERICON_NONE)
         return;
-    trace("reassert: compositor set borderIcon=%d, reapplying '%s'", (int)g_pInputManager->m_borderIconDirection,
-          g_edgeShape.empty() ? "left_ptr" : g_edgeShape.c_str());
+    static Time::steady_tp lastTrace{};
+    if (Time::steadyNow() - lastTrace > std::chrono::seconds(1)) { // per motion event AND per frame otherwise
+        lastTrace = Time::steadyNow();
+        trace("reassert: compositor set borderIcon=%d, reapplying '%s'", (int)g_pInputManager->m_borderIconDirection,
+              g_edgeShape.empty() ? "left_ptr" : g_edgeShape.c_str());
+    }
     g_pInputManager->m_borderIconDirection = BORDERICON_NONE;
     g_pCursorManager->setCursorFromName(g_edgeShape.empty() ? "left_ptr" : g_edgeShape);
 }
@@ -3703,17 +3778,26 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
     // Clicking INTO the focused window is use (desktop-side only).
     if (!g_active && !g_spreadActive && e.state == WL_POINTER_BUTTON_STATE_PRESSED)
         noteInteraction(true);
+    const bool pressed = e.state == WL_POINTER_BUTTON_STATE_PRESSED;
     if (g_spreadActive && !g_active) {
         if (e.button != BTN_LEFT)
             return;
         const auto m = g_spreadMon.lock();
         if (!m)
             return;
-        if (inTopbarStrip(m))
-            return; // NOT cancelled — the bar handles the click
-        info.cancelled = true;
-        if (e.state != WL_POINTER_BUTTON_STATE_RELEASED)
+        if (inTopbarStrip(m)) { // NOT cancelled — the bar handles the click
+            if (!pressed)
+                ownInput(g_ownedButtons, e.button, false); // a card press released over the strip: forgotten, not acted on
+            return;
+        }
+        if (pressed) {
+            info.cancelled = true;
+            ownInput(g_ownedButtons, e.button, true);
             return; // the release decides — there are no drags in the spread
+        }
+        if (!ownInput(g_ownedButtons, e.button, false))
+            return; // a press from before the spread: its release is the compositor's to pair, never ours to swallow
+        info.cancelled = true;
         const Vector2D c = cursorDrawSpace(m);
         PHLWINDOW      w;
         for (auto it = g_spreadWins.rbegin(); it != g_spreadWins.rend(); ++it)
@@ -3727,20 +3811,40 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
             closeSpread(); // the space itself: home, untouched
         return;
     }
-    if (!g_active || g_animTarget < 0.5f || e.button != BTN_LEFT)
+    if (!g_active || g_animTarget < 0.5f)
         return;
     const auto m = g_captureMon.lock();
     if (!m)
         return;
+    const bool gesture = g_resizing || g_dragReal || g_dragWin.lock() || g_pressTile >= 0 || g_dragMoved;
+    if (e.button != BTN_LEFT) {
+        // Other buttons are consumed while a gesture is in flight: passed to
+        // the compositor, a stray press (a two-finger tap) would end ITS drag
+        // behind our back (`ensureMouseBindState`) with the window still parked
+        // off-screen. Otherwise they pass, release included.
+        if (gesture || (!pressed && ownInput(g_ownedButtons, e.button, false))) {
+            if (pressed)
+                ownInput(g_ownedButtons, e.button, true);
+            info.cancelled = true;
+        }
+        return;
+    }
     // A press on the OPTIONS strip belongs to the bar (its X closes us); a
-    // release mid-gesture stays ours so a drag that ended up under the bar
-    // still lands.
-    if (!g_resizing && !g_dragWin.lock() && inTopbarStrip(m))
+    // release mid-gesture stays ours so a drag — or an empty-tile press —
+    // that ended up under the bar still lands.
+    if (!gesture && inTopbarStrip(m)) {
+        if (!pressed)
+            ownInput(g_ownedButtons, e.button, false);
         return; // NOT cancelled — the bar handles the click
+    }
+    if (pressed)
+        ownInput(g_ownedButtons, e.button, true);
+    else if (!ownInput(g_ownedButtons, e.button, false))
+        return; // a press from before we opened (or the bar's): its release is the compositor's to pair, never ours to swallow
     info.cancelled = true;
 
     const Vector2D c = cursorDrawSpace(m);
-    if (e.state == WL_POINTER_BUTTON_STATE_PRESSED) {
+    if (pressed) {
         if (g_resizing)
             return; // already mid-resize (stray second press)
         // Border press: the pointer sits on a resize zone — this gesture
@@ -3960,9 +4064,8 @@ static void drawSpread(PHLMONITOR m, float p) {
     const bool settled = p >= 0.999f && g_spreadTarget >= 0.5f;
     // Arrival takes the final box outright — see the overview's twin note
     // (the chase crept the curve's last 33–112px home over ~500ms).
-    static bool spreadWasSettled = false;
-    const bool  spreadArriving   = settled && !spreadWasSettled;
-    spreadWasSettled             = settled;
+    const bool spreadArriving = settled && !g_spreadWasSettled;
+    g_spreadWasSettled        = settled;
     bool       moving  = false;
 
     // Two passes: everyone, then the picked card — it ends on top of the real
@@ -4045,7 +4148,7 @@ static void onRenderSpread(PHLMONITOR m) {
     g_spreadLastT  = now;
     dt             = pacedDt(dt, m);
     g_frameDt        = dt;
-    const float step = dt / (g_spring ? SPREAD_SECONDS : (g_spreadTarget >= 0.5f ? ANIM_SECONDS : CLOSE_SECONDS));
+    const float step = dt / SPREAD_SECONDS;
     if (g_spreadAnim < g_spreadTarget) {
         g_spreadAnim = std::min(g_spreadTarget, g_spreadAnim + step);
         if (g_spreadAnim >= g_spreadTarget)
@@ -4088,13 +4191,9 @@ static bool openHasAct1() {
 }
 
 static float zoomProgress() {
-    // Open and close share easeInOutCubic: the open's zoom is act 2 of one
-    // movement now, and must pick up act 1's speed gently, not kick at 3×
-    // average velocity (easeOut). One curve also makes every turnaround a
-    // no-remap — the progress as it stands IS the position.
-    if (g_spring)
-        return g_animTarget >= 0.5f ? springOpen(g_anim) : springToward0(g_anim);
-    return (float)easeInOutCubic(g_anim);
+    // The open on its own cut (act 2 of one movement, picking up act 1's speed
+    // gently); every close on the shared one, ridden toward 0.
+    return g_animTarget >= 0.5f ? springOpen(g_anim) : springToward0(g_anim);
 }
 
 // The minimize FLY: decorated cards sailing into (or out of) the dock. Own
@@ -4104,20 +4203,39 @@ static float zoomProgress() {
 static void drawMinFlies(PHLMONITOR m) {
     if (g_minFlies.empty())
         return;
-    const auto now = Time::steadyNow();
-    float      dt  = std::chrono::duration<float>(now - g_minFlyLastT).count();
-    g_minFlyLastT  = now;
-    dt             = pacedDt(dt, m);
-    bool mine = false;
+    // A fly whose monitor is gone can never land (only its monitor's render
+    // advances it): its texture would leak, and a RESTORE's window would stay
+    // invisible for good. Settle it now — window shown, dock told, texture reaped.
+    bool orphaned = false;
+    std::erase_if(g_minFlies, [&](MinFly& f) {
+        if (const auto fm = f.mon.lock(); fm && fm->m_enabled)
+            return false;
+        setArrivalAlpha(f.reveal.lock(), 1.f);
+        if (!f.landMsg.empty())
+            sendWaverunner(f.landMsg);
+        if (f.fb)
+            g_minReap.push_back(f.fb);
+        orphaned = true;
+        return true;
+    });
+    if (orphaned && g_minReapTimer)
+        g_minReapTimer->updateTimeout(std::chrono::milliseconds(250));
+    if (g_minFlies.empty())
+        return;
+    const auto now  = Time::steadyNow();
+    bool       mine = false;
     for (auto& f : g_minFlies) {
         if (f.mon.lock() != m)
             continue;
         mine = true;
+        float dt = std::chrono::duration<float>(now - f.lastT).count();
+        f.lastT  = now;
+        dt       = pacedDt(dt, m);
         // Minimize and restore each ride their own dial (a restore fly carries
         // no land message).
         const bool restoring = f.landMsg.empty();
-        f.t = std::min(1.0f, f.t + dt / (!g_spring ? MINFLY_SECONDS : restoring ? RESTORE_SECONDS : MINIMIZE_SECONDS));
-        const float p = !g_spring ? (float)easeInOutCubic(f.t) : springCurve(f.t, restoring ? g_springTableRestore : g_springTableMin);
+        f.t = std::min(1.0f, f.t + dt / (restoring ? RESTORE_SECONDS : MINIMIZE_SECONDS));
+        const float p = springCurve(f.t, restoring ? g_springTableRestore : g_springTableMin);
         const CBox  box{mix(f.from.x, f.to.x, p), mix(f.from.y, f.to.y, p), std::max(1.0, mix(f.from.w, f.to.w, p)),
                         std::max(1.0, mix(f.from.h, f.to.h, p))};
         if (const auto tex = f.fb ? f.fb->getTexture() : nullptr) {
@@ -4143,12 +4261,7 @@ static void drawMinFlies(PHLMONITOR m) {
             setArrivalAlpha(rw, 1.f);
             g_pHyprRenderer->damageWindow(rw);
         }
-        if (f.landMsg.starts_with("min-add ")) {
-            // The dock holds a new tile hidden until `min-land` (its arriving
-            // state); the card has landed, so show it now — in order.
-            const auto a0 = f.landMsg.find(' ') + 1;
-            sendWaverunnerSeq({f.landMsg, "min-land " + f.landMsg.substr(a0, f.landMsg.find(' ', a0) - a0) + "\n"});
-        } else if (!f.landMsg.empty())
+        if (!f.landMsg.empty())
             sendWaverunner(f.landMsg);
         if (f.fb) {
             g_minReap.push_back(f.fb); // freed off-frame — never in the render callback
@@ -4201,33 +4314,27 @@ static void onRender(eRenderStage stage) {
     g_animLastT    = now;
     dt             = pacedDt(dt, m);
     g_frameDt        = dt;
-    // Both zoom legs: the close's calm comes from the landing act, not a slow
-    // zoom. The stage's way back has no landing act, so it sets its own clock
-    // here instead (`beginStageCloseZoom`).
-    const float step = dt / (g_spring && g_animTarget >= 0.5f ? OPEN_SECONDS
-                                                              : motionSeconds(g_zoomSeconds > 0.f ? g_zoomSeconds : g_motion->closeZoom));
-    // The open's acts (see OPEN_ZOOM_AT): hold everything while the stage's
-    // real picture is on its way; then act 1 (the spread, full size) leads and
-    // the zoom waits for its cue.
+    // The open runs on its own clock (`OPEN_SECONDS`), every close on the shared one.
+    const float step = dt / (g_animTarget >= 0.5f ? OPEN_SECONDS : MOTION_SECONDS);
+    // The open's acts: hold everything while the stage's real picture is on
+    // its way; then act 1 (the spread, full size) leads and the zoom waits for
+    // its cue.
     const bool opening = g_animTarget >= 0.5f;
     if (opening && g_openHold && Time::steadyNow() - g_openHoldAt > OPEN_HOLD_MAX) {
         g_openHold = false;
         trace("open: stage picture never came — revealing what we have");
     }
-    // Act 2 waits until act 1 has SHOWN half its travel (classic: easeInOut
-    // at linear 0.5 is exactly that; spring: ~0.19s in, at its fastest).
-    // Spring: the zoom joins at a QUARTER of act 1's travel (~0.06s in) — at
-    // half, the open ran ~0.42s against the close's 0.33s and read slower
-    // (Max, 2026-09-25). Classic keeps its half.
-    const bool act1Half = g_spring ? springOpen(g_openBlend) >= 0.25f : g_openBlend >= OPEN_ZOOM_AT;
+    // The zoom joins once act 1 has SHOWN a quarter of its travel — at half,
+    // the open ran ~0.42s against the close's 0.33s and read slower (Max,
+    // 2026-09-25).
+    const bool act1Quarter = springOpen(g_openBlend) >= 0.25f;
     // FROM THE STAGE the order flips (Max, 2026-09-25: *"only on stage… i want
     // the spread to happen after the overview open"*): the map opens first —
     // the stage's picture (its one window, the parked ones still invisible)
     // shrinking into its tile — and only once it has arrived do the windows
     // walk aside / fade in / spread inside the tile. The desktop keeps
     // spread-then-zoom.
-    const bool stageOpen = g_motion == &STAGE_MOTION;
-    const bool zoomHeld  = opening && (g_openHold || (!stageOpen && openHasAct1() && !act1Half));
+    const bool zoomHeld = opening && (g_openHold || (!g_openedFromStage && openHasAct1() && !act1Quarter));
     if (g_anim < g_animTarget && !zoomHeld) {
         g_anim = std::min(g_animTarget, g_anim + step);
         if (g_anim >= g_animTarget)
@@ -4236,25 +4343,16 @@ static void onRender(eRenderStage stage) {
     else if (g_anim > g_animTarget)
         g_anim = std::max(g_animTarget, g_anim - step);
 
-    // The close's SECOND ACT: the zoom is (nearly) landed with the tile's
-    // arrangement intact; the spread-style glide walks the windows home.
-    // The close's second act takes over once the zoom has nearly arrived
-    // (classic: its last quarter of time; spring: its last 12% of travel).
-    // Spring: NO second act any more — the windows glide home WHILE the zoom
-    // carries the tile to full screen, one clock, landing together (Max,
-    // 2026-09-25: *"make the overview closing and the spread closing happen
-    // at the same time"*). Classic keeps its two acts.
-    const bool landing = g_spring ? true : g_anim <= g_motion->landEarly;
-    if (g_animTarget < 0.5f && landing && g_landAnim > 0.f)
-        g_landAnim = std::max(0.0f, g_landAnim - dt / motionSeconds(g_motion->land));
+    // The close's layout blend runs WITH the zoom (see `g_landAnim`).
+    if (g_animTarget < 0.5f && g_landAnim > 0.f)
+        g_landAnim = std::max(0.0f, g_landAnim - dt / MOTION_SECONDS);
 
-    // Page-flip scroll: a fixed-duration ease-in-out glide (dt-based) —
-    // gentle start, gentle landing (the old exponential chase hit max
-    // velocity on frame one and read as a jerk). While it moves, hover
-    // retargets under the stationary cursor and frames keep coming.
+    // Page-flip scroll: the spring's glide (dt-based) — gentle landing, no
+    // max-velocity kick on frame one. While it moves, hover retargets under
+    // the stationary cursor and frames keep coming.
     if (g_scrollProg < 1.0f) {
-        g_scrollProg = std::min(1.0f, g_scrollProg + dt / motionSeconds(SCROLL_SECONDS));
-        g_scroll     = mix(g_scrollFrom, g_scrollTarget, g_spring ? springToward1(g_scrollProg) : easeInOutCubic(g_scrollProg));
+        g_scrollProg = std::min(1.0f, g_scrollProg + dt / MOTION_SECONDS);
+        g_scroll     = mix(g_scrollFrom, g_scrollTarget, springToward1(g_scrollProg));
         updateHoverAt(m, cursorDrawSpace(m));
         g_pHyprRenderer->damageMonitor(m);
         g_pCompositor->scheduleFrameForMonitor(m);
@@ -4290,9 +4388,10 @@ static void onRender(eRenderStage stage) {
         }
         trace("close DISENGAGE");
         g_ovPick.reset();
+        g_ownedButtons.clear(); // a release still to come pairs with a press the compositor never saw: it drops it itself
+        g_ownedKeys.clear();
         notifyWaverunner(false);
         g_active            = false;
-        g_zoomSeconds       = 0.0f;  // the stage's clock dies with its close
         g_stageClosePending = false; // and a late answer must not fire into the next one
         g_stageDimPaint     = false;
         g_freePending = true; // captures outlive the hand-off; the timer frees them once the desktop has settled
@@ -4328,15 +4427,13 @@ static void onRender(eRenderStage stage) {
         // already spreaded"* — the reveal after the zoom was tried first and
         // disliked). Once the real picture is in, the tile is AT its
         // arrangement and only the zoom moves.
-        if (stageOpen && !g_openHold)
+        if (g_openedFromStage && !g_openHold)
             g_openBlend = 1.0f;
         else if (!g_openHold)
-            g_openBlend = std::min(1.0f, g_openBlend + dt / (g_spring ? OPEN_SECONDS : g_motion->openSpread));
-        pl          = g_spring ? springOpen(g_openBlend) : (float)easeInOutCubic(g_openBlend);
-    } else if (!landing) {
-        pl = 1.0f;
+            g_openBlend = std::min(1.0f, g_openBlend + dt / OPEN_SECONDS);
+        pl = springOpen(g_openBlend);
     } else {
-        pl = g_spring ? springToward0(g_landAnim) : (float)easeInOutCubic(g_landAnim);
+        pl = springToward0(g_landAnim);
     }
     drawOverview(m, zoomProgress(), pl, g_zoomTile);
 
@@ -4350,8 +4447,7 @@ static void onRender(eRenderStage stage) {
 
     // Keep frames coming while the zoom — or the landing glide, or the open's
     // reveal (which outlives the zoom from the stage) — still moves.
-    if (g_anim != g_animTarget || (g_animTarget < 0.5f && g_landAnim > 0.f) ||
-        (g_animTarget >= 0.5f && g_openBlend < 1.0f && openHasAct1())) {
+    if (g_anim != g_animTarget || (g_animTarget < 0.5f && g_landAnim > 0.f) || (g_animTarget >= 0.5f && g_openBlend < 1.0f)) {
         g_pHyprRenderer->damageMonitor(m);
         g_pCompositor->scheduleFrameForMonitor(m);
     }
@@ -4365,49 +4461,56 @@ static void onRender(eRenderStage stage) {
 // Not static: Golem's titlebars (src/hyprbars/) send through it too — a button
 // there is a Golem action, so it goes to the daemon rather than to the
 // compositor.
-void sendWaverunner(std::string msg) {
-    std::thread([msg = std::move(msg)] {
-        const char* rt = getenv("XDG_RUNTIME_DIR");
-        if (!rt)
-            return;
-        const int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-        if (fd < 0)
-            return;
-        sockaddr_un addr{};
-        addr.sun_family = AF_UNIX;
-        snprintf(addr.sun_path, sizeof(addr.sun_path), "%s/waverunner.sock", rt);
-        if (connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0)
-            (void)!write(fd, msg.data(), msg.size());
-        close(fd);
-    }).detach();
+//
+// ONE sender thread with a queue (it was a detached thread per message). Two
+// things that design could not promise: ORDER — an off/on pair on two threads
+// could land swapped, which several hand-offs below were built to survive —
+// and a clean unload: a thread still inside this .so when PLUGIN_EXIT returned
+// would run unmapped code. The queue keeps every message in order, and is
+// drained and joined at exit.
+static std::mutex              g_sendMx;
+static std::condition_variable g_sendCv;
+static std::deque<std::string> g_sendQ;
+static std::thread             g_sender;
+static bool                    g_sendQuit = false;
+static void deliverWaverunner(const std::string& msg) {
+    const char* rt = getenv("XDG_RUNTIME_DIR");
+    if (!rt)
+        return;
+    const int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0)
+        return;
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s/waverunner.sock", rt);
+    const timeval tv{0, 200000}; // a wedged daemon must not wedge the queue
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    if (connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0)
+        (void)!write(fd, msg.data(), msg.size());
+    close(fd);
 }
-
-// Several verbs IN ORDER on one detached thread: each connection waits for the
-// daemon's reply before the next opens (the daemon handles one client at a
-// time, so this orders them). `sendWaverunner`'s one-thread-per-message could
-// land a `min-land` before its `min-add`.
-static void sendWaverunnerSeq(std::vector<std::string> msgs) {
-    std::thread([msgs = std::move(msgs)] {
-        const char* rt = getenv("XDG_RUNTIME_DIR");
-        if (!rt)
-            return;
-        for (const auto& msg : msgs) {
-            const int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-            if (fd < 0)
-                return;
-            sockaddr_un addr{};
-            addr.sun_family = AF_UNIX;
-            snprintf(addr.sun_path, sizeof(addr.sun_path), "%s/waverunner.sock", rt);
-            if (connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0) {
-                (void)!write(fd, msg.data(), msg.size());
-                timeval tv{0, 500000};
-                setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-                char buf[64];
-                (void)!read(fd, buf, sizeof(buf)); // the reply = handled
-            }
-            close(fd);
+static void senderLoop() {
+    for (;;) {
+        std::string msg;
+        {
+            std::unique_lock lk(g_sendMx);
+            g_sendCv.wait(lk, [] { return g_sendQuit || !g_sendQ.empty(); });
+            if (g_sendQ.empty())
+                return; // told to quit, and drained
+            msg = std::move(g_sendQ.front());
+            g_sendQ.pop_front();
         }
-    }).detach();
+        deliverWaverunner(msg);
+    }
+}
+void sendWaverunner(std::string msg) {
+    {
+        std::lock_guard lk(g_sendMx);
+        if (g_sendQuit)
+            return;
+        g_sendQ.push_back(std::move(msg));
+    }
+    g_sendCv.notify_one();
 }
 
 // Tell waverunner the overview state, so it conceals its surfaces while we
@@ -4545,7 +4648,7 @@ static void resetOverviewPill() {
 // inside the focused window's box (a click on the topbar pill is the cycle
 // itself, not window use). Keyboard counts wherever the pointer rests —
 // typing with the mouse parked on the pill is still working in the window.
-static std::string g_interactEpisode; // focused window the last notify was for
+static const void* g_interactEpisode = nullptr; // focused window the last notify was for
 static bool        g_interactSent = false;
 
 static void noteInteraction(bool pointer) {
@@ -4559,9 +4662,8 @@ static void noteInteraction(bool pointer) {
         if (c.x < p.x || c.y < p.y || c.x > p.x + s.x || c.y > p.y + s.y)
             return; // aimed at a layer or another window, not this one
     }
-    auto addr = std::format("0x{:x}", reinterpret_cast<uintptr_t>(w.get()));
-    if (addr != g_interactEpisode) {
-        g_interactEpisode = addr;
+    if (w.get() != g_interactEpisode) {
+        g_interactEpisode = w.get();
         g_interactSent    = false;
     }
     if (g_interactSent)
@@ -4595,51 +4697,28 @@ static void flipToPage(int page) {
 // Put the close on its curve. The zoom flies into `g_zoomTile`, so whatever that
 // tile's snapshot holds is what the user watches grow to fill the screen.
 static void beginCloseZoom() {
-    g_zoomSeconds = 0.0f; // an ordinary close is the ordinary clock, never the open's
-    // From exactly the current progress (open and close share one curve);
-    // the landing
-    // glide (the close's second act) is armed behind the zoom. The daemon is
-    // told OFF when the close has LANDED (the disengage in onRender), never
-    // now — the dock popping back mid-animation was part of the "still
-    // aggressive" (the spread always had this right: off on touchdown).
-    if (g_spring && g_animTarget >= 0.5f) // turn around where it stands: the closing curve shows the same position
+    // From exactly the current POSITION (the open's cut and the close's differ,
+    // so the progress is remapped): a close mid-open turns around where it
+    // stands. The layout blend rides along with the zoom. The daemon is told
+    // OFF when the close has LANDED (the disengage in onRender), never now —
+    // the dock popping back mid-animation was part of the "still aggressive"
+    // (the spread always had this right: off on touchdown).
+    if (g_animTarget >= 0.5f)
         g_anim = 1.0f - invSpringCurve(1.0f - springOpen(g_anim));
-    g_landAnim    = 1.0f; // (classic: one curve both ways, no progress remap)
+    // The layout blend turns around from the position IT shows too (a close
+    // mid-open: the reveal may be half-way — jumping it to the collage first
+    // popped the minis).
+    g_landAnim    = 1.0f - invSpringCurve(1.0f - springOpen(g_openBlend));
     g_closeLinger = 2;
     g_animTarget  = 0.0f;
-    g_animLastT   = Time::steadyNow();
-    damageAll();
-}
-
-// End the map INSTANTLY — no zoom, no landing glide.
-//
-// Coming back to the stage is a task switch, and inside the stage a task switch
-// is a CUT: it is why the deck's tiles never fly, and why `stage-show` puts the
-// window there rather than animating it (Max's standing call). The way IN is a
-// movement — the open stays exactly as it is, he likes it — but the way back is
-// not a journey, it is arriving.
-//
-// A cut also has nothing left to mismatch, which is the point after four rounds
-// of trying to make a zoom land cleanly on a desktop that changes underneath it:
-// no picture to fly into, no landing glide to line up, no hand-off frame where
-// the overlay and the desktop can disagree.
-//
-// `g_closeLinger = 2` still applies, and the caller must have re-photographed the
-// zoom tile first: those two frames draw the overlay AT REST, which is fullscreen
-// `g_zoomTile`, and they must already show the stage or the cut would flash the
-// old workspace on its way out.
-static void snapCloseNow() {
-    g_anim        = 0.0f;
-    g_animTarget  = 0.0f;
-    g_landAnim    = 0.0f;
-    g_closeLinger = 2;
     g_animLastT   = Time::steadyNow();
     damageAll();
 }
 
 // The stage's way back: a SHORT zoom, and nothing else.
 //
-// The cut above was right in substance — no flicker, no mismatch, no workspace
+// The instant cut it replaced (`snapCloseNow`, dropped at the graduation; history
+// in ccca877) was right in substance — no flicker, no mismatch, no workspace
 // step — and wrong in manner: *"too aggressive… too snappy… i click a window, on
 // overview, it jumps in front… is good, but too fast"* (Max, 2026-09-17). This is
 // that same arrival, given time to be seen.
@@ -4653,12 +4732,11 @@ static void snapCloseNow() {
 // home from their collage arrangement, and the stage is one window already at
 // home, so it would add a third of a second of nothing.
 static void beginStageCloseZoom() {
-    if (g_spring && g_animTarget >= 0.5f)
+    if (g_animTarget >= 0.5f)
         g_anim = 1.0f - invSpringCurve(1.0f - springOpen(g_anim));
     g_landAnim    = 0.0f;
     g_closeLinger = 5; // must outlast one round trip: the real dim lands under these
     g_animTarget  = 0.0f;
-    g_zoomSeconds = STAGE_MOTION.closeZoom;
     g_animLastT   = Time::steadyNow();
     damageAll();
 }
@@ -4740,13 +4818,15 @@ static void toggle() {
     // Escalating from a live spread: its act 1 is already on screen — the
     // overview must pick the arrangement up where it stands, not re-pile the
     // windows and spread them a second time (the pop at the second swipe).
-    // (The spread opens on easeOut, act 1 on easeInOut: hand over the POSITION.)
-    // (Spring: both ride the same curve — the progress IS the position.)
-    const float spreadWas = !(g_spreadActive && g_spreadTarget >= 0.5f) ? 0.0f
-                          : g_spring ? invSpringCurve(springCurve(g_spreadAnim, g_springTableSpread), g_springTableOpen) // its cut → act 1's
-                                     : invEaseInOutCubic(easeOutCubic(g_spreadAnim));
-    if (g_spreadActive)
+    // (The spread and act 1 ride different cuts of the spring: hand over the
+    // POSITION, mapped onto act 1's cut.)
+    const float spreadWas = !(g_spreadActive && g_spreadTarget >= 0.5f)
+        ? 0.0f
+        : invSpringCurve(springCurve(g_spreadAnim, g_springTableSpread), g_springTableOpen);
+    if (g_spreadActive) {
         snapCloseSpread(false);
+        freeSpreadCards(); // the map allocates its own solos for these windows; the cards would idle until its close
+    }
     const bool opening = g_animTarget < 0.5f; // currently closed/closing -> open
     // The Super+R tour: pressed while open, and the other page holds
     // windows we haven't visited → flip there instead of closing. A third
@@ -4763,16 +4843,19 @@ static void toggle() {
         closeOverview(); // one close path: drag/resize/cursor cleanup included
         return;
     }
-    // From exactly the current progress — one curve both ways, so a reopen
-    // mid-close turns around in place with no remap.
-    if (g_spring && g_animTarget < 0.5f) // reopened mid-close: pick the zoom up where it shows
-        g_anim = invSpringCurve(springToward0(g_anim), g_springTableOpen);
-    g_landAnim    = 0.0f; // an open never lands; a stale glide must not hold the close condition
-    g_motion      = g_stageMode ? &STAGE_MOTION : &DESK_MOTION; // held until the next open
-    g_zoomSeconds = g_motion->openZoom; // the open runs on its own, quicker clock
-    g_openBlend      = spreadWas;          // the reveal starts from bunched — or from the spread on screen
+    // Reopened mid-close: pick the zoom up from the POSITION it shows, mapped
+    // onto the open's cut, so it turns around in place.
+    float openBlendFrom = 0.0f;
+    if (g_animTarget < 0.5f) { // …and so does the layout blend: the minis stay where they are, no pop to the pile
+        g_anim        = invSpringCurve(springToward0(g_anim), g_springTableOpen);
+        openBlendFrom = invSpringCurve(springToward0(g_landAnim), g_springTableOpen);
+    }
+    g_landAnim        = 0.0f; // an open never lands; a stale glide must not hold the close condition
+    g_openedFromStage = g_stageMode; // held until the next open
+    g_openBlend       = std::max(spreadWas, openBlendFrom); // the reveal starts from bunched — or from the spread / the blend on screen
     g_openFromSpread = spreadWas > 0.0f;
     g_ovPick.reset();
+    g_ovWasSettled = g_ovChasing = false;
     for (auto& cw : g_wins)
         cw.blurPrev = CBox{}; // no smear from a previous visit's last frame
     g_openHold       = g_stageMode;        // the stage's real picture is still to come (`luaRecapture`)
@@ -5121,14 +5204,16 @@ static void onKey(IKeyboard::SKeyEvent e, Event::SCallbackInfo& info) {
         noteInteraction(false);
     // The spread owns the keyboard exactly as the overview does — focus is
     // still on a window underneath, and typing must not leak into it.
+    const bool pressed = e.state == WL_KEYBOARD_KEY_STATE_PRESSED;
     if (g_spreadActive && !g_active) {
         // Super-chords are binds and pass through — Super+G's toggle() is the
         // keyboard's way up the ladder (it folds the spread on its way).
         // Digits are ours even with Super held, same as in the overview.
         if (g_superHeld) {
             if (e.keycode >= EVDEV_1 && e.keycode <= EVDEV_9) {
-                info.cancelled = true;
-                if (e.state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+                if (pressed) {
+                    ownInput(g_ownedKeys, e.keycode, true);
+                    info.cancelled = true;
                     const int ws = (int)(e.keycode - EVDEV_1 + 1);
                     snapCloseSpread();
                     if (g_pKeybindManager) {
@@ -5136,13 +5221,18 @@ static void onKey(IKeyboard::SKeyEvent e, Event::SCallbackInfo& info) {
                         if (it != g_pKeybindManager->m_dispatchers.end())
                             it->second(std::to_string(ws));
                     }
-                }
+                } else if (ownInput(g_ownedKeys, e.keycode, false))
+                    info.cancelled = true;
             }
             return;
         }
-        info.cancelled = true;
-        if (e.state != WL_KEYBOARD_KEY_STATE_PRESSED)
+        if (!pressed) { // a key pressed before the spread opened is released to its client, not swallowed
+            if (ownInput(g_ownedKeys, e.keycode, false))
+                info.cancelled = true;
             return;
+        }
+        ownInput(g_ownedKeys, e.keycode, true);
+        info.cancelled = true;
         if (e.keycode == EVDEV_ESC) {
             closeSpread(); // Escape is the back gesture's keyboard twin
         } else if (e.keycode >= EVDEV_1 && e.keycode <= EVDEV_9) {
@@ -5168,28 +5258,33 @@ static void onKey(IKeyboard::SKeyEvent e, Event::SCallbackInfo& info) {
     // Every other bind combo passes through (Super+R's toggle above all).
     if (g_superHeld) {
         if (e.keycode >= EVDEV_1 && e.keycode <= EVDEV_9) {
-            if (e.state == WL_KEYBOARD_KEY_STATE_PRESSED)
+            if (pressed) {
+                ownInput(g_ownedKeys, e.keycode, true);
+                info.cancelled = true;
                 jumpTo(g_page * 9 + static_cast<int>(e.keycode - EVDEV_1 + 1));
-            info.cancelled = true;
+            } else if (ownInput(g_ownedKeys, e.keycode, false))
+                info.cancelled = true;
         }
         return;
     }
+    if (!pressed) { // a key pressed before we opened is released to its client, not swallowed
+        if (ownInput(g_ownedKeys, e.keycode, false))
+            info.cancelled = true;
+        return;
+    }
+    ownInput(g_ownedKeys, e.keycode, true);
     info.cancelled = true; // plain typing never reaches the desktop while open
 
     if (e.keycode >= EVDEV_1 && e.keycode <= EVDEV_9) {
-        if (e.state == WL_KEYBOARD_KEY_STATE_PRESSED)
-            jumpTo(g_page * 9 + static_cast<int>(e.keycode - EVDEV_1 + 1));
+        jumpTo(g_page * 9 + static_cast<int>(e.keycode - EVDEV_1 + 1));
         return;
     }
-
     if (e.keycode == EVDEV_Q) {
-        if (e.state == WL_KEYBOARD_KEY_STATE_PRESSED)
-            if (const auto w = g_hoverWin.lock())
-                g_pXWaylandManager->sendCloseWindow(w); // live timer re-captures, so it vanishes from the grid
+        if (const auto w = g_hoverWin.lock())
+            g_pXWaylandManager->sendCloseWindow(w); // live timer re-captures, so it vanishes from the grid
         return;
     }
-
-    if (e.keycode == EVDEV_ESC && e.state == WL_KEYBOARD_KEY_STATE_PRESSED)
+    if (e.keycode == EVDEV_ESC)
         closeOverview(); // Escape means ESCAPE — never the tour
 }
 
@@ -5352,7 +5447,6 @@ static int captureDeckToDir(const std::string& addrsCsv, int size, double tileAs
         PHLWINDOW   win;
     };
     std::vector<Want> wants;
-    uint32_t          mask = 0;
     PHLMONITOR        m;
     for (size_t at = 0; at <= addrsCsv.size();) {
         const size_t end  = std::min(addrsCsv.find(',', at), addrsCsv.size());
@@ -5530,6 +5624,15 @@ static SP<Render::IFramebuffer> captureCardFly(PHLWINDOW w, PHLMONITOR m, CBox& 
     }
     g_capturing                              = false;
     g_pHyprRenderer->m_bBlockSurfaceFeedback = false;
+    // On a bare desktop the monitor-sized scratch has no other user: reap it
+    // off-frame (like the fly's own texture) instead of holding 25 MB until
+    // the next overview close.
+    if (!g_active && !g_spreadActive && g_spreadSrcFB) {
+        g_minReap.push_back(g_spreadSrcFB);
+        g_spreadSrcFB.reset();
+        if (g_minReapTimer)
+            g_minReapTimer->updateTimeout(std::chrono::milliseconds(250));
+    }
     cardDraw = logicalToDraw(m, Rect{cb.x, cb.y, cb.w, cb.h});
     return fb;
 }
@@ -5608,8 +5711,9 @@ void golemMinimize(PHLWINDOW w) {
     const std::string land =
         std::format("min-add {} {} {:.4f} {} {}/{}.rgba {}\n", addr, ws, aspect, cls.empty() ? "?" : cls, dir, addr, w->m_title);
     if (fb) {
-        g_minFlyLastT = Time::steadyNow();
-        g_minFlies.push_back(MinFly{fb, from, to, 0.0f, m, land});
+        MinFly f{fb, from, to, 0.0f, m, land};
+        f.lastT = Time::steadyNow();
+        g_minFlies.push_back(std::move(f));
     } else
         sendWaverunner(land); // no card, no fly — the entry just appears
     std::erase_if(g_minimized, [&](const MinRec& r) { return r.addr == addr; });
@@ -5635,6 +5739,8 @@ static int luaRestoreMin(lua_State* L) {
     const char* a = lua_tostring(L, 1);
     if (!a || !*a)
         return 0;
+    if (g_active || g_spreadActive) // the dock is concealed under an overlay; a bind's restore would fly under the map
+        return 0;
     const std::string addr = a;
     int64_t           ws   = -1;
     PHLWINDOW         w;
@@ -5646,9 +5752,9 @@ static int luaRestoreMin(lua_State* L) {
         }
     if (!w)
         w = windowByAddr(addr); // plugin reloaded since the minimize: the record is gone, the window isn't
-    std::erase_if(g_minimized, [&](const MinRec& r) { return r.addr == addr; });
     const std::string thumb = minThumbDir() + "/" + addr + ".rgba";
     if (!w) { // the window died while minimized and the destroy path missed it
+        std::erase_if(g_minimized, [&](const MinRec& r) { return r.addr == addr; });
         sendWaverunner("min-del " + addr + "\n");
         unlink(thumb.c_str());
         return 0;
@@ -5663,6 +5769,14 @@ static int luaRestoreMin(lua_State* L) {
     const auto curMon = g_pCompositor->getMonitorFromCursor();
     const auto here   = curMon ? curMon->activeWorkspaceID() : (w ? w->workspaceID() : 1);
     runDispatcher("movetoworkspacesilent", std::to_string(here) + ",address:" + addr);
+    // PARK-VERIFY, the minimize's own rule mirrored: if the move did not take,
+    // the window is still parked — keep its record AND its tile (the click is a
+    // harmless no-op to retry) rather than un-list a window that is not here.
+    if (w->workspaceID() < 0) {
+        trace("restore ABORT: %s still on ws %d after move", addr.c_str(), (int)w->workspaceID());
+        return 0;
+    }
+    std::erase_if(g_minimized, [&](const MinRec& r) { return r.addr == addr; });
     Desktop::focusState()->fullWindowFocus(w, Desktop::FOCUS_REASON_CLICK);
 
     if (const auto m = curMon ? curMon : g_pCompositor->getMonitorFromID(w->monitorID())) {
@@ -5675,8 +5789,8 @@ static int luaRestoreMin(lua_State* L) {
         const auto fb = captureCardFly(w, m, home);
         if (fb) {
             const CBox wb = w->getWindowMainSurfaceBox();
-            g_minFlyLastT = Time::steadyNow();
             MinFly f{fb, dockTargetBox(m, wb.h > 0.0 ? wb.w / wb.h : 1.6), home, 0.0f, m, ""};
+            f.lastT  = Time::steadyNow();
             f.reveal = w;
             setArrivalAlpha(w, 0.f);
             g_minFlies.push_back(std::move(f));
@@ -5919,14 +6033,12 @@ static int luaStageReady(lua_State*) {
     // tile morphs while it zooms OUT, and nobody sees a rebuild, they see one
     // movement. Doing it before the motion is what Max saw as *"the rebuilding"*.
     //
-    // EVERY tile, not just the one we fly into: the dim is back on the desktop
-    // by now and it is baked into whatever we photograph, so re-shooting only the
-    // zoom tile left ONE dark tile growing across a bright grid — darkness that
-    // arrives gradually, over the whole flight. Max, 2026-09-17: *"the dimming
-    // should happen at the same time that the windows start coming, it comes too
-    // late."* Shooting all of them lands the dim as ONE step, on the same frame
-    // the picture morphs — which is the moment he is pointing at.
-    // A full pass is 1-4ms (measured, see the trace) against a 16ms frame.
+    // ONE tile — the one we fly into. The dim is back on the desktop by now and
+    // would be baked into whatever we photograph; re-shooting every tile once
+    // landed it everywhere as one step (Max, 2026-09-17: *"the dimming should
+    // happen at the same time that the windows start coming"*), but the dim is
+    // PAINTED over the map instead (`g_stageDimPaint`, same frame, one step),
+    // so only the zoom tile needs its new picture: a single-tile pass, ~1 ms.
     if (const auto m = g_captureMon.lock(); m && g_zoomTile >= 0 && g_zoomTile < N_TILES)
         captureWorkspaces(m, 1u << g_zoomTile);
     g_stageDimPaint = true; // same frame as the morph: one step, not a growth
@@ -5952,18 +6064,32 @@ static int luaSpread(lua_State*) {
     return 0;
 }
 
-// `hl.plugin.waveview.set_stage(true|false)` — waverunner tells us when Golem's
-// STAGE mode owns the screen. Entering also shuts the overview if it happens to
-// be open, so the stage never comes up underneath it.
-// `hl.plugin.waveview.set_motion(true|false)` — Golem's one spring (default)
-// or the classic hand-tuned curves, for an A/B feel test. Takes effect on the
-// next movement.
-static int luaSetMotion(lua_State* L) {
-    g_spring = lua_toboolean(L, 1) != 0;
-    trace("motion: %s (%.3fs, spread %.3fs, open %.3fs)", g_spring ? "spring" : "classic", MOTION_SECONDS, SPREAD_SECONDS, OPEN_SECONDS);
+// `hl.plugin.waveview.debug_state()` — every sticky flag, to the trace. For the
+// moment something feels stuck (a swipe that bounces back, a pointer that stays
+// hidden): dump it BEFORE reloading — a reload throws the evidence away (the
+// 2026-09-26 swipe bounce died with an unload, twice, unexplained).
+static int luaDebugState(lua_State*) {
+    const auto& dc  = g_layoutManager->dragController();
+    const auto  foc = Desktop::focusState()->window();
+    trace("STATE ov: active=%d anim=%.2f>%.2f land=%.2f blend=%.2f hold=%d fromStage=%d fromSpread=%d linger=%d page=%d scroll=%.2f "
+          "| spread=%d %.2f>%.2f | stage=%d closePending=%d stageSwipe=%d | busy=%d resizing=%d resizeWin=%d dragWin=%d dragReal=%d "
+          "dragMoved=%d pressTile=%d hover=%d pick=%d warpPending=%d warpHid=%d watch=%d | swipeLive=%d fired=%d fingers=%d "
+          "| flies=%zu minimized=%zu freePending=%d resizeDragSent=%d captureMon=%d | hypr: dragTarget=%d mode=%d focused=%s ws=%d",
+          (int)g_active, g_anim, g_animTarget, g_landAnim, g_openBlend, (int)g_openHold, (int)g_openedFromStage,
+          (int)g_openFromSpread, g_closeLinger, g_page, g_scrollProg, (int)g_spreadActive, g_spreadAnim, g_spreadTarget,
+          (int)g_stageMode, (int)g_stageClosePending, (int)g_stageSwipe, (int)g_busy, (int)g_resizing, (int)(bool)g_resizeWin.lock(),
+          (int)(bool)g_dragWin.lock(), (int)g_dragReal, (int)g_dragMoved, g_pressTile, (int)(bool)g_hoverWin.lock(),
+          (int)(bool)g_ovPick.lock(), (int)g_warpPending, (int)g_warpHidCursor, (int)(bool)g_watchWin.lock(), (int)g_swipeLive,
+          (int)g_swipeFired, (int)g_swipeFingers, g_minFlies.size(), g_minimized.size(), (int)g_freePending, (int)g_resizeDragSent,
+          (int)(bool)g_captureMon.lock(), (int)(bool)dc->target(), (int)dc->mode(), foc ? windowAddr(foc).c_str() : "none",
+          foc ? (int)foc->workspaceID() : 0);
+    trace("STATE bars: %s", Bars::debugState().c_str());
     return 0;
 }
 
+// `hl.plugin.waveview.set_stage(true|false)` — waverunner tells us when Golem's
+// STAGE mode owns the screen. Entering also shuts the overview if it happens to
+// be open, so the stage never comes up underneath it.
 static int luaSetStage(lua_State* L) {
     g_stageMode = lua_toboolean(L, 1) != 0;
     if (g_stageMode && g_active)
@@ -5978,6 +6104,11 @@ APICALL EXPORT std::string PLUGIN_API_VERSION() {
 }
 
 APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
+    {
+        std::lock_guard lk(g_sendMx);
+        g_sendQuit = false;
+    }
+    g_sender = std::thread(senderLoop);
     PHANDLE = handle;
     // Entry point for the keybind. This Lua-config Hyprland routes `hyprctl
     // dispatch` through hl.dispatch(), which only accepts built-in hl.dsp.*
@@ -5989,10 +6120,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     HyprlandAPI::addLuaFunction(handle, "waveview", "close", luaClose);
     HyprlandAPI::addLuaFunction(handle, "waveview", "stage_ready", luaStageReady);
     HyprlandAPI::addLuaFunction(handle, "waveview", "recapture", luaRecapture);
-    HyprlandAPI::addLuaFunction(handle, "waveview", "set_motion", luaSetMotion);
-    // The dock reports each new tile's rect (`min_target`) for a fly that
-    // lands on it; this fly doesn't use it — registered so the call resolves.
-    HyprlandAPI::addLuaFunction(handle, "waveview", "min_target", [](lua_State*) -> int { return 0; });
+    HyprlandAPI::addLuaFunction(handle, "waveview", "debug_state", luaDebugState);
     HyprlandAPI::addLuaFunction(handle, "waveview", "spread", luaSpread);
     HyprlandAPI::addLuaFunction(handle, "waveview", "minimize", luaMinimize);
     HyprlandAPI::addLuaFunction(handle, "waveview", "restore_min", luaRestoreMin);
@@ -6011,7 +6139,18 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     // hyprbars — see PROVENANCE.md there). They live in this plugin rather than
     // beside it so there is ONE thing to keep in ABI lockstep with Hyprland.
     Bars::init(handle);
-    g_windowOpenListener = Event::bus()->m_events.window.open.listen([](PHLWINDOW w) { Bars::onWindowOpen(w); });
+    g_windowOpenListener = Event::bus()->m_events.window.open.listen([](PHLWINDOW w) {
+        Bars::onWindowOpen(w);
+        watchWindowCommits(w);
+        if (w)
+            markDirty(w->workspaceID());
+    });
+    for (auto& w : g_pCompositor->m_windows) // the windows that were here before us
+        watchWindowCommits(w);
+    g_windowTitleListener = Event::bus()->m_events.window.title.listen([](PHLWINDOW w) {
+        if (w)
+            markDirty(w->workspaceID());
+    });
     g_focusDiagListener = Event::bus()->m_events.window.active.listen([](PHLWINDOW w, Desktop::eFocusReason r) {
         const auto m = g_pCompositor->getMonitorFromCursor();
         trace("FOCUS %s ws=%d reason=%d (monitor on ws %d) swipeLive=%d", w ? windowAddr(w).c_str() : "none", w ? (int)w->workspaceID() : 0,
@@ -6022,6 +6161,9 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     // A window that dies while minimized must leave the dock too — and its
     // record must go, because Hyprland REUSES window pointer addresses.
     g_windowDestroyListener = Event::bus()->m_events.window.destroy.listen([](PHLWINDOW w) {
+        unwatchWindow(w);
+        if (w)
+            markDirty(w->workspaceID());
         const std::string addr = windowAddr(w);
         const bool        had  = std::erase_if(g_minimized, [&](const MinRec& r) { return r.addr == addr; }) > 0;
         if (had) {
@@ -6041,7 +6183,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "1.45"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "1.47"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
@@ -6085,6 +6227,9 @@ APICALL EXPORT void PLUGIN_EXIT() {
     // flushed above.
     g_windowOpenListener.reset();
     g_windowDestroyListener.reset();
+    g_windowTitleListener.reset();
+    g_commitListeners.clear();
+    g_winSigs.clear();
     g_focusDiagListener.reset();
     g_wsDiagListener.reset();
     for (auto& f : g_minFlies) // a restore cut short by the unload must not leave its window invisible
@@ -6131,4 +6276,14 @@ APICALL EXPORT void PLUGIN_EXIT() {
     // elements die a frame early with them: harmless, the pass rebuilds.
     g_pHyprRenderer->m_renderPass.clear();
     damageAll();
+    g_ownedButtons.clear();
+    g_ownedKeys.clear();
+    // LAST: drain and join the sender — no thread of ours may outlive the .so.
+    {
+        std::lock_guard lk(g_sendMx);
+        g_sendQuit = true;
+    }
+    g_sendCv.notify_one();
+    if (g_sender.joinable())
+        g_sender.join();
 }

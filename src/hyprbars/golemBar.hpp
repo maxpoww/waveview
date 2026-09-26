@@ -144,7 +144,6 @@ class CGolemBar : public IHyprWindowDecoration {
     virtual uint64_t                   getDecorationFlags();
     virtual std::string                getDisplayName();
 
-    PHLWINDOW    getOwner();
 
     /// How far below the strip the notch fill reaches (logical px). Public
     /// because the pass element's occlusion box must cover the fill too.
@@ -155,17 +154,18 @@ class CGolemBar : public IHyprWindowDecoration {
     /// its cover so the landing shows it already focused.
     void         settleColor();
 
+    /// The bar's sticky input flags, or "" when none is set (see Bars::debugState).
+    std::string  debugLine() const;
+
     WP<CGolemBar> m_self;
 
   private:
-    SBoxExtents          m_seExtents;
     PHLWINDOWREF         m_pWindow;
     CBox                 m_bAssignedBox;
 
     /// The bar is only for windows OUT of the layout. Upstream drove this from
     /// a `hyprbars:no_bar` window rule; Golem asks the window itself.
     bool                 m_hidden         = true;
-    bool                 m_bButtonsDirty  = true;
 
     /// The centred title texture, and the state it was rendered from: the
     /// title, the ink it was set in, and the bar width that capped it. Any of
@@ -247,8 +247,8 @@ class CGolemBar : public IHyprWindowDecoration {
     /// spread has taken the screen, and their cards own the pointer now.
     void     standDown();
 
-    void     handleDownEvent(Event::SCallbackInfo& info);
-    void     handleUpEvent(Event::SCallbackInfo& info);
+    void     handleDownEvent(Event::SCallbackInfo& info, uint32_t button);
+    void     handleUpEvent(Event::SCallbackInfo& info, uint32_t button, bool valid);
     void     handleMovement();
     bool     doButtonPress(Vector2D COORDS);
 
@@ -259,7 +259,9 @@ class CGolemBar : public IHyprWindowDecoration {
 
     bool                m_bDraggingThis  = false;
     bool                m_bDragPending   = false;
-    bool                m_bCancelledDown = false;
+    bool                m_bCancelledDown = false; // the current press is OURS (the compositor never saw it)
+    uint32_t            m_pressedButton  = 0;     // …and which button, so only ITS release is paired with it
+    int                 m_ffFloatSignal  = -1;    // the browser float signal as last written by THIS bar
 
     /// Hover state per button, as a bitfield.
     unsigned int m_iButtonHoverState = 0;
