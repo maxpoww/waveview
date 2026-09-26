@@ -39,6 +39,7 @@
 #include <climits>
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 
 using namespace Render::GL;
 
@@ -86,6 +87,32 @@ static bool windowStaged(PHLWINDOW w) {
     return w && w->m_ruleApplicator && w->m_ruleApplicator->m_tagKeeper.isTagged("golem-stage", true);
 }
 
+// Golem's browser (Firefox) carries its OWN window controls INSIDE its toolbar
+// (the macOS "traffic lights"), so it must never wear a Golem titlebar — it
+// floats bare, like a macOS window. Matched by class; the browser keeps the
+// "firefox" WM class even rebranded (update here if that ever changes).
+static bool windowIsFirefox(PHLWINDOW w) {
+    return w && (w->m_class == "firefox" || w->m_initialClass == "firefox");
+}
+
+// The browser's traffic lights show ONLY while it is a FLOATING window (not
+// staged, not tiled) — the same condition that would raise a bar on any other
+// window. The browser's own chrome can't see Hyprland's float state, so hand it
+// across a 1-byte file it polls (golem-chrome.js `trafficLights`). Written only
+// on CHANGE — this is reached from the per-window update path, and a compare is
+// all an unchanged frame costs.
+static int g_ffFloatSignal = -1;  // last written: -1 unknown, 0 not-floating, 1 floating
+static void writeFirefoxFloatSignal(bool floating) {
+    const int v = floating ? 1 : 0;
+    if (v == g_ffFloatSignal)
+        return;
+    g_ffFloatSignal = v;
+    if (FILE* f = fopen("/tmp/golem-ff-float", "w")) {
+        fputc(floating ? '1' : '0', f);
+        fclose(f);
+    }
+}
+
 CGolemBar::CGolemBar(PHLWINDOW pWindow) : IHyprWindowDecoration(pWindow) {
     m_pWindow = pWindow;
 
@@ -93,7 +120,11 @@ CGolemBar::CGolemBar(PHLWINDOW pWindow) : IHyprWindowDecoration(pWindow) {
     if (PMONITOR)
         PMONITOR->m_scheduledRecalc = true;
 
-    m_hidden = !pWindow->m_isFloating || windowStaged(pWindow);
+    m_hidden = !pWindow->m_isFloating || windowStaged(pWindow) || windowIsFirefox(pWindow);
+    if (windowIsFirefox(pWindow)) {
+        writeFirefoxFloatSignal(pWindow->m_isFloating && !windowStaged(pWindow));
+        syncFirefoxBorder(); // mute the browser's 1px border to a faint hairline
+    }
 
     m_pMouseButtonCallback =
         Event::bus()->m_events.input.mouse.button.listen([&](IPointer::SButtonEvent e, Event::SCallbackInfo& info) { onMouseButton(info, e); });
@@ -222,6 +253,37 @@ void CGolemBar::syncFloatTint() {
     refreshDecorationsLater();
 }
 
+void CGolemBar::syncFirefoxBorder() {
+    if (!validMapped(m_pWindow))
+        return;
+    const auto PWINDOW = m_pWindow.lock();
+
+    // A fixed faint hairline. Alpha is the whole point of "subtle": a low-alpha
+    // light edge over the dark window reads as a delicate macOS-style border, and
+    // a FIXED colour stays quiet no matter what screen-matched colour the shell's
+    // dynamic border takes. Copy the window's live border gradient only for its
+    // STRUCTURE (angle, the ok-cache), then swap in a single faint stop.
+    const auto make = [&](uint64_t argb) {
+        Config::CGradientValueData g = PWINDOW->m_realBorderColor;
+        g.m_colors.clear();
+        g.m_colors.push_back(CHyprColor{argb});
+        g.updateColorsOk(); // the shader reads this, not m_colors
+        return g;
+    };
+    // ~9% white focused, ~4% unfocused. 1px is Hyprland's thinnest real border
+    // (border_size is a whole number; 0 = none), so past here "thinner" is really
+    // "fainter" — a lighter line reads as a more delicate edge. Tune HERE (needs a
+    // rebuild) for fainter still or a warmer hue; thickness stays the config rule's.
+    PWINDOW->m_ruleApplicator->activeBorderColor().set(make(0x16FFFFFFULL), Desktop::Types::PRIORITY_SET_PROP);
+    PWINDOW->m_ruleApplicator->inactiveBorderColor().set(make(0x0BFFFFFFULL), Desktop::Types::PRIORITY_SET_PROP);
+    // borderSize is deliberately NOT set here — the 1px comes from the
+    // `firefox-subtle-border` window rule, so the thickness retunes without a
+    // plugin rebuild. On the stage the stage rule drops size to 0 (no border),
+    // and this colour override simply has nothing to paint.
+    m_tinted = true; // routes through the same guarded dtor / teardown as the tint
+    refreshDecorationsLater();
+}
+
 /// Make the compositor pick the overrides up — NEVER inline.
 ///
 /// ⚠️ `updateDecorationValues()` re-applies a window's rules and walks its
@@ -279,7 +341,15 @@ void CGolemBar::syncHidden() {
     if (!validMapped(m_pWindow))
         return;
 
-    const bool WANT = !m_pWindow->m_isFloating || windowStaged(m_pWindow.lock());
+    const auto PWINDOW = m_pWindow.lock();
+
+    // Refresh the browser's traffic-light signal on every float/tile flip. Done
+    // BEFORE the early-return below: the browser's bar is always hidden, so WANT
+    // never changes for it and the return would otherwise skip this.
+    if (windowIsFirefox(PWINDOW))
+        writeFirefoxFloatSignal(PWINDOW->m_isFloating && !windowStaged(PWINDOW));
+
+    const bool WANT = !PWINDOW->m_isFloating || windowStaged(PWINDOW) || windowIsFirefox(PWINDOW);
     if (WANT == m_hidden)
         return;
 
@@ -850,7 +920,13 @@ void CGolemBar::renderBarButtonsText(CBox* barBox, const float scale, const floa
             barBox->y + golemButtonY(barBox->height, BORDER * scale, scaledButtonSize) + (scaledButtonSize - button.iconTex->m_size.y) / 2.0;
         CBox       pos   = {iconX, iconY, button.iconTex->m_size.x, button.iconTex->m_size.y};
 
-        g_pHyprOpenGL->renderTexture(button.iconTex, pos, {.a = a});
+        // Never DIMMED: `decoration:dim_inactive` tints every texture drawn
+        // for an unfocused window (`allowDim` defaults on), which greyed the
+        // glyphs on every card but the focused one while their discs — plain
+        // rects, untinted — stayed bright. The buttons are targets at full
+        // strength (Max, 2026-09-25: *"the title bars buttons should not be
+        // dimmed"*), same rule as their opacity above.
+        g_pHyprOpenGL->renderTexture(button.iconTex, pos, {.a = a, .allowDim = false});
     }
 }
 
@@ -1046,6 +1122,14 @@ void CGolemBar::renderPass(PHLMONITOR pMonitor, const float& a) {
     m_bButtonsDirty = false;
 
     renderBarButtonsText(&barBox, pMonitor->m_scale, a);
+}
+
+void CGolemBar::settleColor() {
+    const auto PWINDOW = m_pWindow.lock();
+    if (!PWINDOW || !m_cRealBarColor)
+        return;
+    *m_cRealBarColor = barColor(PWINDOW);
+    m_cRealBarColor->warp();
 }
 
 eDecorationType CGolemBar::getDecorationType() {

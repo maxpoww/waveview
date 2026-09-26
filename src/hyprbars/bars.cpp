@@ -19,6 +19,14 @@
 #include <algorithm>
 
 namespace Bars {
+    void settleFocus(PHLWINDOW window) {
+        if (!window)
+            return;
+        for (auto& d : window->m_windowDecorations)
+            if (auto* bar = dynamic_cast<CGolemBar*>(d.get()))
+                bar->settleColor();
+    }
+
 
     void onWindowOpen(PHLWINDOW window) {
         if (!window || window->m_X11DoesntWantBorders)

@@ -150,6 +150,11 @@ class CGolemBar : public IHyprWindowDecoration {
     /// because the pass element's occlusion box must cover the fill too.
     double       notchDepth();
 
+    /// Jump the bar's colour to where the window's focus state says it is
+    /// going (no fade) — the overview settles a clicked window's look under
+    /// its cover so the landing shows it already focused.
+    void         settleColor();
+
     WP<CGolemBar> m_self;
 
   private:
@@ -187,6 +192,15 @@ class CGolemBar : public IHyprWindowDecoration {
     /// as a per-window override, so the tint follows the colour pass instead
     /// of freezing a snapshot of it.
     void     syncFloatTint();
+
+    /// Firefox floats with a real (thin, config-set 1px) border rather than the
+    /// bar-as-frame the other floats get. Mute that border to a faint fixed
+    /// hairline so it reads subtle (Max, 2026-09-17: "subtler") — a FIXED
+    /// low-alpha colour, not the shell's dynamic border, so it stays quiet
+    /// whatever screen-matched colour the borders take. Touches colour only; the
+    /// 1px size is the `firefox-subtle-border` window rule's. Set once at map;
+    /// unset by the same `m_tinted` teardown as the float tint.
+    void     syncFirefoxBorder();
 
     /// The pending deferred `updateDecorationValues()`, as a cancellable lock:
     /// destroyed with the bar, so the callback can never outlive it (or the

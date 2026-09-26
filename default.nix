@@ -9,12 +9,16 @@
       # offset. Reading the patch directory keeps the two package sets in
       # lockstep automatically: a new system patch lands here on the next
       # rebuild, and a patch that no longer applies fails this build loudly.
-      (final: prev: {
+      (final: prev: let
+        # The host path; the Toolbx dev container sees the same dir under /run/host.
+        patchDir = if builtins.pathExists /etc/nixos/patches then /etc/nixos/patches
+                   else /run/host/etc/nixos/patches;
+      in {
         hyprland = prev.hyprland.overrideAttrs (old: {
           patches = (old.patches or [ ])
-            ++ map (n: /etc/nixos/patches + "/${n}")
+            ++ map (n: patchDir + "/${n}")
               (builtins.filter (n: builtins.match ".*\\.patch" n != null)
-                (builtins.attrNames (builtins.readDir /etc/nixos/patches)));
+                (builtins.attrNames (builtins.readDir patchDir)));
         });
       })
     ];

@@ -207,6 +207,11 @@ fn recentre(rects: &mut [Rect], ax: f64, ay: f64, aw: f64, ah: f64) {
     }
 }
 
+/// How far a window may poke past the spread area and still count as inside
+/// (sub-margin slop — a window flush with the screen edge sits a few px past
+/// the margined area; that is not "put away").
+const OUT_EPS: f64 = 40.0;
+
 /// Spread `n` window rects into a JUSTIFIED COLLAGE of the usable area —
 /// the photo-wall algorithm, built rather than simulated:
 ///
@@ -249,7 +254,15 @@ pub unsafe extern "C" fn waveview_spread_layout(
     let input = std::slice::from_raw_parts(wins, n);
     let out = std::slice::from_raw_parts_mut(out, n);
 
-    if !any_overlap(input, 0.0, OVERLAP_EPS) {
+    // A window hanging OUT of the area is hidden too (Max, 2026-09-25: a
+    // window put away past the screen edge "counts as overlapped" — the spread
+    // brings it back into view). Only a desk that is both separate AND inside
+    // comes back untouched; otherwise the nudge's clamp pulls a slightly-out
+    // window in, and a far-out one gets its seat in the collage.
+    let inside = input.iter().all(|r| {
+        r.x >= ax - OUT_EPS && r.y >= ay - OUT_EPS && r.x + r.w <= ax + aw + OUT_EPS && r.y + r.h <= ay + ah + OUT_EPS
+    });
+    if !any_overlap(input, 0.0, OVERLAP_EPS) && inside {
         out.copy_from_slice(input); // nothing hidden: move nothing
         return 1;
     }
@@ -555,6 +568,17 @@ mod tests {
         assert_eq!(ok, 1);
         for (a, b) in wins.iter().zip(out.iter()) {
             assert_eq!((a.x, a.y, a.w, a.h), (b.x, b.y, b.w, b.h));
+        }
+    }
+
+    #[test]
+    fn out_of_area_is_brought_in() {
+        // No overlap, but one window parked mostly past the right edge.
+        let wins = [r(200.0, 200.0, 500.0, 400.0), r(AREA.0 + AREA.2 - 60.0, 300.0, 600.0, 400.0)];
+        let (out, ok) = spread(&wins);
+        assert_eq!(ok, 1);
+        for b in &out {
+            assert!(b.x >= AREA.0 - 0.5 && b.x + b.w <= AREA.0 + AREA.2 + 0.5, "({}, {}, {}, {}) not inside", b.x, b.y, b.w, b.h);
         }
     }
 

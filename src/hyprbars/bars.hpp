@@ -27,4 +27,7 @@ namespace Bars {
 
     /// Drop what the bars are holding. Call from `PLUGIN_EXIT`.
     void shutdown();
+
+    /// Snap `window`'s bar colour to its focus state, skipping the fade.
+    void settleFocus(PHLWINDOW window);
 }
