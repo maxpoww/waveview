@@ -6211,6 +6211,34 @@ static int luaStageReady(lua_State*) {
     return 0;
 }
 
+// `hl.plugin.waveview.cycle()` — the Mac's Mission Control key (F3). A strict
+// three-press cycle (Max, 2026-09-29: "spread on the first touch, overview the
+// second time, close the third time"). Unlike the gesture's ladder (`spread`,
+// below), which skips the spread when nothing hides anything, and unlike
+// Super+R (`toggle`), whose second press tours the other page before closing.
+//   closed          → the spread (the overview when the workspace has nothing to spread)
+//   spread up       → the overview (the same escalation as the second swipe)
+//   overview up     → close
+static int luaCycle(lua_State*) {
+    if (g_active && g_animTarget >= 0.5f) {
+        closeOverview();
+        return 0;
+    }
+    if (g_spreadActive && g_spreadTarget >= 0.5f) {
+        toggle();
+        return 0;
+    }
+    if (!g_active) {
+        const auto m = g_pCompositor->getMonitorFromCursor();
+        if (m && !spreadPopulation(m).empty()) {
+            openSpread(m);
+            return 0;
+        }
+    }
+    toggle();
+    return 0;
+}
+
 // `hl.plugin.waveview.spread()` — the 3-up decision without a trackpad (a
 // swipe cannot be faked from a script; this is the spread's debug/CLI route,
 // same idiom as the toggle dispatch trick). Walks the ladder exactly like the
@@ -6358,6 +6386,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     HyprlandAPI::addLuaFunction(handle, "waveview", "debug_state", luaDebugState);
     HyprlandAPI::addLuaFunction(handle, "waveview", "kb_focus", luaKbFocus);
     HyprlandAPI::addLuaFunction(handle, "waveview", "spread", luaSpread);
+    HyprlandAPI::addLuaFunction(handle, "waveview", "cycle", luaCycle);
     HyprlandAPI::addLuaFunction(handle, "waveview", "minimize", luaMinimize);
     HyprlandAPI::addLuaFunction(handle, "waveview", "restore_min", luaRestoreMin);
     HyprlandAPI::addLuaFunction(handle, "waveview", "set_stage", luaSetStage);
@@ -6419,7 +6448,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "1.80"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "1.81"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
