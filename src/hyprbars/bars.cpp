@@ -18,6 +18,9 @@
 
 #include <algorithm>
 
+/// Free the colour sampler's framebuffer (defined in `../main.cpp`).
+void golemSampleRelease();
+
 namespace Bars {
     std::string debugState() {
         std::string out;
@@ -63,11 +66,23 @@ namespace Bars {
         HyprlandAPI::addWindowDecoration(g_barsHandle, window, std::move(bar));
     }
 
+    /// A disc's ink: the disc's own colour, lifted toward white or darkened
+    /// (see GOLEM_GLYPH_TONE).
+    static CHyprColor inkFor(const CHyprColor& disc) {
+        const auto tone = [](double c) {
+            const double v = GOLEM_GLYPH_TONE >= 0.F ? c + (1.0 - c) * GOLEM_GLYPH_TONE : c * (1.0 + GOLEM_GLYPH_TONE);
+            return static_cast<float>(std::clamp(v, 0.0, 1.0));
+        };
+        return CHyprColor{tone(disc.r), tone(disc.g), tone(disc.b), 1.F};
+    }
+
     void init(HANDLE handle) {
         g_barsHandle = handle;
         g_pBarsState = makeUnique<SGolemBarsState>();
 
         golemBarCursorTimerInit();
+        golemBarSampleTimerInit();
+        golemResizeHandInit();
 
         // GOLEM'S TRAFFIC LIGHTS (Max, 2026-09-15: *"three colors, macOS style
         // but different colors, that make sense"*): the familiar three-disc
@@ -77,8 +92,8 @@ namespace Bars {
         // (Max, 2026-09-26: *"put the buttons on the right order, R Y G"*;
         // green had sat in the middle since the minimize button arrived).
         // Close is outermost, where every desktop has taught the hand to
-        // expect it. The glyphs are dark on all three — every disc is a light
-        // colour, and one ink keeps the row reading as a set.
+        // expect it. Each glyph is its own disc's colour, shifted in
+        // lightness (`inkFor`) — one rule keeps the row reading as a set.
         //
         // VIVID, not pastel (Max, 2026-09-15: *"super saturated colors that
         // outstand"*) — the first cut used soft Golem-family tones and read as
@@ -90,7 +105,7 @@ namespace Bars {
         g_pBarsState->buttons.push_back(SGolemButton{
             .action = GOLEM_BAR_CLOSE,
             .bgcol  = CHyprColor{0xFFFF2E2EULL},
-            .fgcol  = CHyprColor{0xFF1A1A1AULL},
+            .fgcol  = inkFor(CHyprColor{0xFFFF2E2EULL}),
             .icon   = "×",
         });
         // ORANGE — minimize to the dock, macOS-style: the card flies into
@@ -99,17 +114,22 @@ namespace Bars {
         g_pBarsState->buttons.push_back(SGolemButton{
             .action = GOLEM_BAR_MIN,
             .bgcol  = CHyprColor{0xFFFF9500ULL},
-            .fgcol  = CHyprColor{0xFF1A1A1AULL},
+            .fgcol  = inkFor(CHyprColor{0xFFFF9500ULL}),
             .icon   = "–",
+            .glyph  = GOLEM_GLYPH_DASH,
         });
         // GREEN — back into the layout. Where macOS's green means "grow to
         // fullscreen", Golem's means "grow back into the tiling": the same
-        // gesture of order, Golem's own answer.
+        // gesture of order, Golem's own answer. The glyph is a square OUTLINE
+        // (Max, 2026-09-26: *"change the icon of the green button for a
+        // square"* → *"i meant an square shape, not a solid square"*; it was
+        // ▤, then ■ for a minute).
         g_pBarsState->buttons.push_back(SGolemButton{
             .action = GOLEM_BAR_TILE,
             .bgcol  = CHyprColor{0xFF21D758ULL},
-            .fgcol  = CHyprColor{0xFF1A1A1AULL},
-            .icon   = "▤",
+            .fgcol  = inkFor(CHyprColor{0xFF21D758ULL}),
+            .icon   = "□",
+            .glyph  = GOLEM_GLYPH_SQUARE,
         });
 
         for (auto& w : g_pCompositor->m_windows) {
@@ -127,6 +147,10 @@ namespace Bars {
         g_barsShuttingDown = true;
 
         golemBarCursorTimerDrop();
+        golemBarSampleTimerDrop();
+        golemResizeHandDrop();
+        golemSampleRelease(); // the sampler's framebuffer (main.cpp)
+        golemBarSolidTexDrop();
 
         // Give the pointer its arrow back. A bar that owned the "grab" shape
         // when the plugin went away would leave the whole desktop wearing it,

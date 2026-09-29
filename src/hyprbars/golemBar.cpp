@@ -36,6 +36,7 @@
 #include "BarPassElement.hpp"
 #include "bars.hpp"
 
+#include <chrono>
 #include <climits>
 #include <algorithm>
 #include <cmath>
@@ -66,12 +67,42 @@ static CHyprColor barColor(PHLWINDOW w) {
     return CHyprColor{0xEE0D0F14ULL};
 }
 
-/// Ink that stays readable on whatever the bar turns out to be: the bar wears
-/// the border, and Golem's borders run from a light peach (focused) to a dark
-/// brown (not) — one fixed text colour cannot serve both.
+// sRGB ↔ linear, the daemon's own (`srgb_to_linear` / `linear_to_srgb`).
+static float srgbToLinear(float c) {
+    return c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f);
+}
+static float linearToSrgb(float c) {
+    return c <= 0.0031308f ? c * 12.92f : 1.055f * std::pow(c, 1.0f / 2.4f) - 0.055f;
+}
+/// Relative luminance of a LINEAR colour.
+static float linearLuma(float r, float g, float b) {
+    return 0.2126f * r + 0.7152f * g + 0.0722f * b;
+}
+
+/// Ink that reads on whatever the bar turns out to be — the daemon's `ink_on`
+/// rule: linear luminance of the fill against the WCAG flip point, so the
+/// strip and the OPTIONS bar choose their ink the same way.
 static CHyprColor inkOn(const CHyprColor& bg) {
-    const float L = 0.2126f * bg.r + 0.7152f * bg.g + 0.0722f * bg.b;
-    return L > 0.5f ? CHyprColor{0xFF14171CULL} : CHyprColor{0xFFE8E6E3ULL};
+    const float L = linearLuma(srgbToLinear(bg.r), srgbToLinear(bg.g), srgbToLinear(bg.b));
+    return L > GOLEM_BRIGHT_LUMA ? CHyprColor{0xFF14171CULL} : CHyprColor{0xFFE8E6E3ULL};
+}
+
+/// The strip's colour from the window's sampled top edge — the daemon's
+/// `Backdrop::surface` for a matched window: the sample with the resting wash
+/// composited over it in linear light (`box_fill` of `rest_wash`), back to
+/// sRGB, at the content's sampled alpha (the window's own opacity is applied
+/// by the draw, once — see `GOLEM_SAMPLE_ROWS`'s neighbours in the header).
+/// `dim` darkens it the way Hyprland dims an unfocused window's content (a
+/// straight multiply on the output colour).
+static CHyprColor sampledBarColor(const float sample[4], float dim) {
+    const float lr = srgbToLinear(sample[0]), lg = srgbToLinear(sample[1]), lb = srgbToLinear(sample[2]);
+    const bool  bright = linearLuma(lr, lg, lb) > GOLEM_BRIGHT_LUMA;
+    // the daemon's `wash(white, a)`: white = srgb_to_linear(a)/a per channel
+    const float a = bright ? GOLEM_WASH_BLACK_A : GOLEM_WASH_WHITE_A;
+    const float w = (bright || a <= 0.F) ? 0.F : srgbToLinear(a) / a;
+    const float fr = lr * (1.F - a) + w * a, fg = lg * (1.F - a) + w * a, fb = lb * (1.F - a) + w * a;
+    const float k = 1.F - dim;
+    return CHyprColor{std::clamp(linearToSrgb(fr) * k, 0.F, 1.F), std::clamp(linearToSrgb(fg) * k, 0.F, 1.F), std::clamp(linearToSrgb(fb) * k, 0.F, 1.F), std::clamp(sample[3], 0.F, 1.F)};
 }
 
 /// A window on the STAGE owns the whole screen (task mode maximizes it into the
@@ -91,9 +122,9 @@ static bool windowStaged(PHLWINDOW w) {
 // Golem's browser (Firefox) carries its OWN window controls INSIDE its toolbar
 // (the macOS "traffic lights"), so it must never wear a Golem titlebar — it
 // floats bare, like a macOS window. Matched by class; the browser keeps the
-// "firefox" WM class even rebranded (update here if that ever changes).
+// "firefox" WM class; Golem's Seam (2026-09-27) has its own class "seam".
 static bool windowIsFirefox(PHLWINDOW w) {
-    return w && (w->m_class == "firefox" || w->m_initialClass == "firefox");
+    return w && (w->m_class == "firefox" || w->m_initialClass == "firefox" || w->m_class == "seam" || w->m_initialClass == "seam");
 }
 
 // THE STRAIGHT SEAM (Max, 2026-09-26: *"make the bottom of the bar straight…
@@ -146,6 +177,11 @@ CGolemBar::CGolemBar(PHLWINDOW pWindow) : IHyprWindowDecoration(pWindow) {
         writeFirefoxFloatSignal(m_ffFloatSignal, pWindow->m_isFloating && !windowStaged(pWindow));
         syncFirefoxBorder(); // mute the browser's 1px border to a faint hairline
     }
+
+    // Every commit of the window's main surface may change the colour under
+    // the seam; the sampler's tick picks the flag up off the render pass.
+    if (pWindow->wlSurface() && pWindow->wlSurface()->resource())
+        m_commitListener = pWindow->wlSurface()->resource()->m_events.commit.listen([this] { m_sampleDirty = true; });
 
     m_pMouseButtonCallback =
         Event::bus()->m_events.input.mouse.button.listen([&](IPointer::SButtonEvent e, Event::SCallbackInfo& info) { onMouseButton(info, e); });
@@ -203,6 +239,13 @@ CGolemBar::~CGolemBar() {
 /// the top of that file, and the overview's rings already read it the same way.
 extern Config::CGradientValueData* borderGradient(bool active);
 
+/// Read the top `rows` logical px of `w`'s main surface, averaged, as sRGB
+/// 0..1 (defined in `../main.cpp`, which owns the capture plumbing). Renders,
+/// so: event loop only.
+extern bool golemSampleWindowTop(PHLWINDOW w, double rows, float out[4]);
+/// A line into the plugin's trace file (/tmp/waveview-trace.log).
+extern void golemTrace(const std::string& line);
+
 /// Whether waveview's overview or spread owns the screen (defined in
 /// `main.cpp`). While it does, pointer input belongs to their CARDS: a press
 /// must never take hold of an invisible bar beneath the overlay, and any
@@ -245,8 +288,20 @@ void CGolemBar::syncFloatTint() {
         out.updateColorsOk(); // the shader reads this, not m_colors
         return out;
     };
-    auto wantActive   = tint(*ACTIVE);
-    auto wantInactive = tint(*INACTIVE);
+    // The window's own colour once sampled (see `sampledBarColor`): one flat
+    // stop for the focused window, the same stop dimmed like its content for
+    // the unfocused one. The compositor animates between the two with focus,
+    // exactly as it does for its own border colours. Until the first sample
+    // lands the daemon's gradient stands in, as it always did.
+    const auto flat = [&](const Config::CGradientValueData& structure, float dim) {
+        Config::CGradientValueData out = structure;
+        out.m_colors.clear();
+        out.m_colors.push_back(sampledBarColor(m_sample, dim));
+        out.updateColorsOk();
+        return out;
+    };
+    auto wantActive   = m_hasSample ? flat(*ACTIVE, 0.F) : tint(*ACTIVE);
+    auto wantInactive = m_hasSample ? flat(*INACTIVE, GOLEM_DIM_INACTIVE) : tint(*INACTIVE);
 
     // Only when they actually changed — see the note on `m_tintActive`.
     if (m_tinted && wantActive == m_tintActive && wantInactive == m_tintInactive)
@@ -394,6 +449,7 @@ void CGolemBar::syncHidden() {
 
     m_hidden = WANT;
     syncSquareTop();
+    m_sampleDirty = true; // a bar coming back looks at its window afresh
     // A bar arriving or leaving changes how much room the window has, so the
     // layout has to hear about it — without this the window keeps the reserved
     // strip it no longer has (or loses one it just gained).
@@ -546,6 +602,41 @@ static void                      applyBarCursorLater();
 /// and settles it; released (empty `g_barCursor`) it does nothing.
 static SP<CEventLoopTimer> g_barCursorTimer;
 
+// ─────────────────────────── The resize hand ───────────────────────────
+//
+// One global motion listener: while the compositor's drag controller is in
+// MBIND_RESIZE — the bar's corner grip or Hyprland's own edge resize — the
+// closed hand is (re)asserted on every motion, because the compositor re-sets
+// its directional arrow on every motion too (`m_borderIconDirection`, which
+// `setBarCursor` clears). On the first motion after the drag ends the hand is
+// handed back unless a bar holds the shape (the grip's own release logic then
+// takes over): the edge hover re-arms its arrow on the next motion by itself.
+static bool                g_resizeHand = false;
+static CHyprSignalListener g_resizeHandListener;
+static void                setBarCursor(const char* shape); // defined below, with the cursor state
+
+void golemResizeHandInit() {
+    g_resizeHandListener = Event::bus()->m_events.input.mouse.move.listen([](Vector2D, Event::SCallbackInfo&) {
+        if (g_barsShuttingDown || !g_layoutManager)
+            return;
+        const auto& dc       = g_layoutManager->dragController();
+        const bool  resizing = dc && dc->target() && dc->mode() == MBIND_RESIZE;
+        if (resizing) {
+            g_resizeHand = true;
+            setBarCursor("grabbing");
+        } else if (g_resizeHand) {
+            g_resizeHand = false;
+            if (!g_barCursorOwner)
+                setBarCursor(nullptr);
+        }
+    });
+}
+
+void golemResizeHandDrop() {
+    g_resizeHandListener.reset();
+    g_resizeHand = false;
+}
+
 void golemBarCursorTimerInit() {
     g_barCursorTimer = makeShared<CEventLoopTimer>(
         std::nullopt,
@@ -553,7 +644,7 @@ void golemBarCursorTimerInit() {
             // Owner too, not just the shape: this timer is the thing that
             // stamped a STALE hand back over the app's cursor when the release
             // was broken. A shape without a live owner is by definition stale.
-            if (g_barCursor.empty() || !g_barCursorOwner || !g_pCursorManager)
+            if (g_barCursor.empty() || (!g_barCursorOwner && !g_resizeHand) || !g_pCursorManager)
                 return;
             if (g_pInputManager)
                 g_pInputManager->m_borderIconDirection = BORDERICON_NONE;
@@ -561,6 +652,95 @@ void golemBarCursorTimerInit() {
         },
         nullptr);
     g_pEventLoopManager->addTimer(g_barCursorTimer);
+}
+
+// ─────────────────────────── The strip's texel ───────────────────────────
+//
+// One 1×1 texture shared by every bar, holding the colour of whichever strip is
+// being drawn: `renderTexture` is the compositor's blurred-surface path and it
+// draws textures, not colours. The texel is opaque; the strip's alpha rides the
+// draw's `a`, so the result is premultiplied exactly like a window's pixels.
+static SP<Render::ITexture> g_barSolidTex;
+static uint8_t              g_barSolidPx[4] = {0, 0, 0, 0};
+
+static bool ensureSolidTex(const CHyprColor& c) {
+    const uint8_t px[4] = {(uint8_t)std::lround(std::clamp(c.r, 0.0, 1.0) * 255.0), (uint8_t)std::lround(std::clamp(c.g, 0.0, 1.0) * 255.0),
+                           (uint8_t)std::lround(std::clamp(c.b, 0.0, 1.0) * 255.0), 255};
+    if (!g_barSolidTex) {
+        g_barSolidTex = makeShared<Render::GL::CGLTexture>(DRM_FORMAT_ABGR8888, (uint8_t*)px, 4, Vector2D(1, 1), false, false);
+        std::copy(px, px + 4, g_barSolidPx);
+        return g_barSolidTex && g_barSolidTex->m_texID != 0;
+    }
+    if (!std::equal(px, px + 4, g_barSolidPx)) {
+        glBindTexture(GL_TEXTURE_2D, g_barSolidTex->m_texID);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        std::copy(px, px + 4, g_barSolidPx);
+    }
+    return g_barSolidTex->m_texID != 0;
+}
+
+void golemBarSolidTexDrop() {
+    if (g_barSolidTex) {
+        Render::GL::g_pHyprOpenGL->makeEGLCurrent();
+        g_barSolidTex.reset();
+    }
+}
+
+// ─────────────────────────── The colour sampler ───────────────────────────
+//
+// One tick for all bars, on the event loop: each bar whose window committed
+// since it last looked is re-sampled, at most every GOLEM_SAMPLE_MIN_MS. A
+// sample is a tiny render + readback (`golemSampleWindowTop`), so it must
+// never run from inside a render pass — hence a timer, not `draw()`.
+static SP<CEventLoopTimer> g_barSampleTimer;
+
+void CGolemBar::syncSample() {
+    if (m_hidden || !m_sampleDirty || !validMapped(m_pWindow))
+        return;
+    const auto now = std::chrono::steady_clock::now();
+    if (m_hasSample && now - m_lastSample < std::chrono::milliseconds(GOLEM_SAMPLE_MIN_MS))
+        return; // the flag stays up; the next tick gets it
+    m_sampleDirty = false;
+    m_lastSample  = now;
+
+    float c[4];
+    if (!golemSampleWindowTop(m_pWindow.lock(), GOLEM_SAMPLE_ROWS, c))
+        return;
+    // Only a visible change re-pushes the override — same threshold as the
+    // daemon's border push (~1.5/255), so sampling noise stays off the window.
+    constexpr float EPS = 0.006F;
+    if (m_hasSample && std::abs(c[0] - m_sample[0]) < EPS && std::abs(c[1] - m_sample[1]) < EPS && std::abs(c[2] - m_sample[2]) < EPS &&
+        std::abs(c[3] - m_sample[3]) < EPS)
+        return;
+    for (int i = 0; i < 4; ++i)
+        m_sample[i] = c[i];
+    m_hasSample = true;
+    syncFloatTint(); // event loop: the deferred refresh inside is still the right shape
+}
+
+void golemBarSampleTimerInit() {
+    g_barSampleTimer = makeShared<CEventLoopTimer>(
+        std::chrono::milliseconds(100),
+        [](SP<CEventLoopTimer> self, void*) {
+            if (g_barsShuttingDown || !g_pBarsState)
+                return;
+            // `m_self` is unique-backed: valid()/get(), never lock() — see the
+            // 2026-09-15 note on the owner pointer.
+            for (auto& b : g_pBarsState->bars)
+                if (b.valid())
+                    b.get()->syncSample();
+            self->updateTimeout(std::chrono::milliseconds(100));
+        },
+        nullptr);
+    g_pEventLoopManager->addTimer(g_barSampleTimer);
+}
+
+void golemBarSampleTimerDrop() {
+    // Same reason as the cursor timer: the callback's code lives in this .so.
+    if (g_barSampleTimer && g_pEventLoopManager)
+        g_pEventLoopManager->removeTimer(g_barSampleTimer);
+    g_barSampleTimer.reset();
 }
 
 void golemBarCursorTimerDrop() {
@@ -693,13 +873,14 @@ CGolemBar::eBarHover CGolemBar::hoverZone() {
     if (!VECINRECT(COORDS, 0, 0, assignedBoxGlobal().w, GOLEM_BAR_HEIGHT - 1))
         return HOVER_NONE;
 
-    for (size_t i = 0; i < g_pBarsState->buttons.size(); ++i) {
-        const auto BARBUF     = Vector2D{(int)assignedBoxGlobal().w, GOLEM_BAR_HEIGHT};
-        Vector2D   currentPos = Vector2D{golemButtonX(i, 1.F), golemButtonY(BARBUF.y, borderBelow(), GOLEM_BUTTON_SIZE)}.floor();
-        if (VECINRECT(COORDS, currentPos.x, currentPos.y, currentPos.x + GOLEM_BUTTON_SIZE + GOLEM_BUTTON_PADDING, currentPos.y + GOLEM_BUTTON_SIZE))
-            return HOVER_BUTTON;
+    // One map for the hand, the lift and the press — see `golemBarZone`.
+    switch (golemBarZone(COORDS, g_pBarsState->buttons.size(), assignedBoxGlobal().w, GOLEM_BAR_HEIGHT, borderBelow()).kind) {
+        case SGolemBarZone::BUTTON: return HOVER_BUTTON;
+        case SGolemBarZone::CORNER_LEFT: return HOVER_CORNER_LEFT;
+        case SGolemBarZone::CORNER_RIGHT: return HOVER_CORNER_RIGHT;
+        case SGolemBarZone::STRIP: return HOVER_STRIP;
+        default: return HOVER_NONE;
     }
-    return HOVER_STRIP;
 }
 
 void CGolemBar::standDown() {
@@ -744,6 +925,14 @@ void CGolemBar::onMouseMove(Vector2D coords) {
                 g_barCursorOwner = this;
                 setBarCursor("pointer");
                 break;
+            case HOVER_CORNER_LEFT:
+                g_barCursorOwner = this;
+                setBarCursor("nw-resize");
+                break;
+            case HOVER_CORNER_RIGHT:
+                g_barCursorOwner = this;
+                setBarCursor("ne-resize");
+                break;
             case HOVER_NONE:
                 if (g_barCursorOwner == this) {
                     g_barCursorOwner = nullptr;
@@ -766,7 +955,7 @@ void CGolemBar::handleDownEvent(Event::SCallbackInfo& info, uint32_t button) {
 
     if (!VECINRECT(COORDS, 0, 0, assignedBoxGlobal().w, GOLEM_BAR_HEIGHT - 1)) {
         if (m_bDraggingThis) {
-            g_pKeybindManager->m_dispatchers["mouse"]("0movewindow");
+            g_pKeybindManager->m_dispatchers["mouse"](m_bResizeFromCorner ? "0resizewindow" : "0movewindow");
             Log::logger->log(Log::DEBUG, "[golembar] drag ended on {:x}", (uintptr_t)PWINDOW.get());
         }
 
@@ -796,9 +985,15 @@ void CGolemBar::handleDownEvent(Event::SCallbackInfo& info, uint32_t button) {
     if (doButtonPress(COORDS))
         return;
 
-    m_bDragPending = true;
+    m_bDragPending      = true;
+    {
+        const auto ZONE     = golemBarZone(COORDS, g_pBarsState->buttons.size(), assignedBoxGlobal().w, GOLEM_BAR_HEIGHT, borderBelow()).kind;
+        m_bResizeFromCorner = ZONE == SGolemBarZone::CORNER_LEFT || ZONE == SGolemBarZone::CORNER_RIGHT;
+    }
     // The hand closes ON THE PRESS, not when motion starts: taking hold is
-    // the press, the drag is just where the hand goes afterwards.
+    // the press, the drag is just where the hand goes afterwards — on the
+    // corner grip too (the diagonal arrow is the hover hint, the closed hand
+    // is the hold; see `golemResizeHandInit` for the edge resizes).
     g_barCursorOwner = this;
     setBarCursor("grabbing");
 }
@@ -836,6 +1031,8 @@ void CGolemBar::handleUpEvent(Event::SCallbackInfo& info, uint32_t button, bool 
     switch (hoverZone()) {
         case HOVER_STRIP: setBarCursor("grab"); break;
         case HOVER_BUTTON: setBarCursor("pointer"); break;
+        case HOVER_CORNER_LEFT: setBarCursor("nw-resize"); break;
+        case HOVER_CORNER_RIGHT: setBarCursor("ne-resize"); break;
         case HOVER_NONE:
             g_barCursorOwner = nullptr;
             setBarCursor(nullptr);
@@ -844,44 +1041,45 @@ void CGolemBar::handleUpEvent(Event::SCallbackInfo& info, uint32_t button, bool 
 }
 
 void CGolemBar::handleMovement() {
-    g_pKeybindManager->changeMouseBindMode(MBIND_MOVE);
+    // A press on the corner grip resizes; anywhere else on the strip moves.
+    // The compositor's resize picks its corner from the pointer's quadrant —
+    // top-right here, by construction.
+    g_pKeybindManager->changeMouseBindMode(m_bResizeFromCorner ? MBIND_RESIZE : MBIND_MOVE);
     m_bDraggingThis = true;
     Log::logger->log(Log::DEBUG, "[golembar] drag started on {:x}", (uintptr_t)m_pWindow.lock().get());
 }
 
 bool CGolemBar::doButtonPress(Vector2D COORDS) {
-    for (size_t i = 0; i < g_pBarsState->buttons.size(); ++i) {
-        auto&      b          = g_pBarsState->buttons[i];
-        const auto BARBUF     = Vector2D{(int)assignedBoxGlobal().w, GOLEM_BAR_HEIGHT};
-        Vector2D   currentPos = Vector2D{golemButtonX(i, 1.F), golemButtonY(BARBUF.y, borderBelow(), GOLEM_BUTTON_SIZE)}.floor();
+    // A press anywhere in a button's spot is that button's — the same spot
+    // the hand and the hover lift answer to (`golemBarZone`).
+    const auto ZONE = golemBarZone(COORDS, g_pBarsState->buttons.size(), assignedBoxGlobal().w, GOLEM_BAR_HEIGHT, borderBelow());
+    if (ZONE.kind != SGolemBarZone::BUTTON)
+        return false;
+    const int col = ZONE.button;
 
-        if (VECINRECT(COORDS, currentPos.x, currentPos.y, currentPos.x + GOLEM_BUTTON_SIZE + GOLEM_BUTTON_PADDING, currentPos.y + GOLEM_BUTTON_SIZE)) {
-            const auto PWINDOW = m_pWindow.lock();
-            switch (b.action) {
-                // The window's own close, not a dispatcher on "activewindow":
-                // the press focuses this window first, but saying which window
-                // outright cannot be raced by anything that focuses in between.
-                case GOLEM_BAR_CLOSE: PWINDOW->sendClose(); break;
-                // Back into the layout — through the DAEMON, not the
-                // compositor. Golem's tiled state is more than "not floating":
-                // a space showing one tile shows it pseudo, and the bar's state
-                // pill has to hear about the change. The compositor's own float
-                // toggle does neither, and using it left windows plainly tiled
-                // where the rule promised pseudo (2026-09-13). The press has
-                // already focused this window, which is the one the verb acts
-                // on.
-                case GOLEM_BAR_TILE: sendWaverunner("window-mode tiled\n"); break;
-                // Minimize to the dock — the plugin's own machinery (main.cpp):
-                // it owns the card capture, the fly animation and the
-                // special-workspace park, and tells the daemon when the card
-                // lands so the dock entry appears as the window arrives.
-                case GOLEM_BAR_MIN: golemMinimize(PWINDOW); break;
-            }
-            return true;
-        }
-
+    auto&      b       = g_pBarsState->buttons[col];
+    const auto PWINDOW = m_pWindow.lock();
+    switch (b.action) {
+        // The window's own close, not a dispatcher on "activewindow":
+        // the press focuses this window first, but saying which window
+        // outright cannot be raced by anything that focuses in between.
+        case GOLEM_BAR_CLOSE: PWINDOW->sendClose(); break;
+        // Back into the layout — through the DAEMON, not the
+        // compositor. Golem's tiled state is more than "not floating":
+        // a space showing one tile shows it pseudo, and the bar's state
+        // pill has to hear about the change. The compositor's own float
+        // toggle does neither, and using it left windows plainly tiled
+        // where the rule promised pseudo (2026-09-13). The press has
+        // already focused this window, which is the one the verb acts
+        // on.
+        case GOLEM_BAR_TILE: sendWaverunner("window-mode tiled\n"); break;
+        // Minimize to the dock — the plugin's own machinery (main.cpp):
+        // it owns the card capture, the fly animation and the
+        // special-workspace park, and tells the daemon when the card
+        // lands so the dock entry appears as the window arrives.
+        case GOLEM_BAR_MIN: golemMinimize(PWINDOW); break;
     }
-    return false;
+    return true;
 }
 
 /// (Re)render the title texture, TIGHT — sized to the words, not to the room
@@ -928,13 +1126,22 @@ size_t CGolemBar::getVisibleButtonCount(const Vector2D& bufferSize, const float 
     return count;
 }
 
+/// The `i`th disc's box as it is DRAWN: scaled, then rounded to whole
+/// pixels. The glyph centres on this same box, so the two can never disagree
+/// by the half pixel that `scaledButtonSize` (25.6 at Golem's scale) leaves.
+static CBox golemDiscBox(const CBox& barBox, size_t i, float border, float scale) {
+    const auto scaledButtonSize = GOLEM_BUTTON_SIZE * scale;
+    CBox       box = {barBox.x + golemButtonX(i, scale), barBox.y + golemButtonY(barBox.h, border * scale, scaledButtonSize), scaledButtonSize, scaledButtonSize};
+    box.round();
+    return box;
+}
+
 void CGolemBar::renderBarButtons(CBox* barBox, const float scale, const float a) {
     const auto visibleCount = getVisibleButtonCount(Vector2D{barBox->w, barBox->h}, scale);
     const auto BORDER       = borderBelow();
 
     for (size_t i = 0; i < visibleCount; ++i) {
-        auto&      button           = g_pBarsState->buttons[i];
-        const auto scaledButtonSize = GOLEM_BUTTON_SIZE * scale;
+        auto& button = g_pBarsState->buttons[i];
 
         // The buttons keep their OWN colour at full strength — they are the one
         // thing on the bar you aim at, and a target you can see through is a
@@ -953,11 +1160,96 @@ void CGolemBar::renderBarButtons(CBox* barBox, const float scale, const float a)
             color.b += (1.0 - color.b) * GOLEM_BUTTON_HOVER_LIFT;
         }
 
-        CBox buttonBox = {barBox->x + golemButtonX(i, scale), barBox->y + golemButtonY(barBox->h, BORDER * scale, scaledButtonSize), scaledButtonSize, scaledButtonSize};
-        buttonBox.round();
+        CBox buttonBox = golemDiscBox(*barBox, i, BORDER, scale);
 
-        g_pHyprOpenGL->renderRect(buttonBox, color, {.round = static_cast<int>(std::round(scaledButtonSize / 2.0)), .roundingPower = 2.F});
+        // The hovered disc grows by GOLEM_BUTTON_HOVER_SCALE about its centre.
+        // Drawn from a separate box so the glyph below keeps its whole-pixel
+        // geometry (and its centre, which is the same point).
+        CBox discDraw = buttonBox;
+        if ((m_iButtonHoverState >> i) & 1u) {
+            const double grow = buttonBox.w * (GOLEM_BUTTON_HOVER_SCALE - 1.0);
+            discDraw.x -= grow / 2.0;
+            discDraw.y -= grow / 2.0;
+            discDraw.w += grow;
+            discDraw.h += grow;
+        }
+        g_pHyprOpenGL->renderRect(discDraw, color, {.round = static_cast<int>(std::ceil(discDraw.w / 2.0)), .roundingPower = 2.F});
+
+        // DRAWN glyphs (see `eGolemGlyph`): rectangles on the disc, in the
+        // disc's parity so they centre exactly. The square is an outline: its
+        // ink square, then the disc's own colour (hover lift and all) laid
+        // back over the inside.
+        if (button.glyph == GOLEM_GLYPH_TEXT)
+            continue;
+        auto ink = button.fgcol;
+        ink.a *= a;
+        const double w      = buttonBox.w; // whole pixels
+        double       span   = std::round(w * GOLEM_GLYPH_SPAN);
+        if (std::fmod(span, 2.0) != std::fmod(w, 2.0))
+            span += 1.0; // same parity as the disc → equal whole margins
+        const double stroke = std::max(1.0, std::round(GOLEM_GLYPH_STROKE * scale));
+        const double sx     = buttonBox.x + (w - span) / 2.0;
+        if (button.glyph == GOLEM_GLYPH_SQUARE) {
+            const double sy = buttonBox.y + (w - span) / 2.0;
+            // Slightly rounded corners (GOLEM_GLYPH_SQUARE_R); the inner cut-out's
+            // radius is the outer's less the stroke, so the outline stays even.
+            const int    rOut = static_cast<int>(std::round(GOLEM_GLYPH_SQUARE_R * scale));
+            const int    rIn  = std::max(0, rOut - static_cast<int>(stroke));
+            g_pHyprOpenGL->renderRect(CBox{sx, sy, span, span}, ink, {.round = rOut, .roundingPower = 2.F});
+            if (span > 2.0 * stroke)
+                g_pHyprOpenGL->renderRect(CBox{sx + stroke, sy + stroke, span - 2.0 * stroke, span - 2.0 * stroke}, color, {.round = rIn, .roundingPower = 2.F});
+        } else if (button.glyph == GOLEM_GLYPH_DASH) {
+            double th = stroke;
+            if (std::fmod(th, 2.0) != std::fmod(w, 2.0))
+                th += 1.0;
+            g_pHyprOpenGL->renderRect(CBox{sx, buttonBox.y + (w - th) / 2.0, span, th}, ink, {});
+        }
     }
+}
+
+// The centre of a text texture's INK relative to the texture's centre, from
+// its alpha (glyph coverage). Read back through an FBO of our own, mid-pass,
+// with the compositor's framebuffer binding put back after — once per glyph
+// texture, so the stall is paid three times a session, not per frame.
+static bool measureInkOffset(const SP<Render::ITexture>& tex, Vector2D& offset) {
+    if (!tex || tex->m_texID == 0 || tex->m_size.x < 1 || tex->m_size.y < 1)
+        return false;
+    const int            W = (int)tex->m_size.x, H = (int)tex->m_size.y;
+    std::vector<uint8_t> px((size_t)W * H * 4, 0);
+    GLint                prevFBO = 0;
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFBO);
+    GLuint fbo = 0;
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex->m_texID, 0);
+    while (glGetError() != GL_NO_ERROR) {}
+    const bool ok = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+    if (ok)
+        glReadPixels(0, 0, W, H, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+    const bool readOk = ok && glGetError() == GL_NO_ERROR;
+    glBindFramebuffer(GL_FRAMEBUFFER, prevFBO);
+    glDeleteFramebuffers(1, &fbo);
+    if (!readOk) {
+        golemTrace(std::format("ink-measure: readback failed (fbo complete={}, tex {}x{})", ok, W, H));
+        return false;
+    }
+    int minX = W, minY = H, maxX = -1, maxY = -1;
+    for (int y = 0; y < H; ++y)
+        for (int x = 0; x < W; ++x)
+            if (px[((size_t)y * W + x) * 4 + 3] > 24) {
+                minX = std::min(minX, x);
+                maxX = std::max(maxX, x);
+                minY = std::min(minY, y);
+                maxY = std::max(maxY, y);
+            }
+    if (maxX < 0) {
+        golemTrace(std::format("ink-measure: no ink (tex {}x{})", W, H));
+        return false;
+    }
+    // pixel centres: the ink spans [minX, maxX] inclusive
+    offset = Vector2D((minX + maxX + 1) / 2.0 - W / 2.0, (minY + maxY + 1) / 2.0 - H / 2.0);
+    golemTrace(std::format("ink-measure: tex {}x{} ink x[{},{}] y[{},{}] → offset ({:.1f},{:.1f})", W, H, minX, maxX, minY, maxY, offset.x, offset.y));
+    return true;
 }
 
 void CGolemBar::renderBarButtonsText(CBox* barBox, const float scale, const float a) {
@@ -968,20 +1260,26 @@ void CGolemBar::renderBarButtonsText(CBox* barBox, const float scale, const floa
         auto&      button           = g_pBarsState->buttons[i];
         const auto scaledButtonSize = GOLEM_BUTTON_SIZE * scale;
 
-        if ((!button.iconTex || button.iconTex->m_texID == 0) && !button.icon.empty())
-            button.iconTex = g_pHyprRenderer->renderText(button.icon, button.fgcol, std::round(GOLEM_BUTTON_SIZE * 0.62 * scale), false, GOLEM_BAR_FONT, scaledButtonSize);
+        if (button.glyph != GOLEM_GLYPH_TEXT)
+            continue; // drawn with its disc (renderBarButtons)
+
+        if ((!button.iconTex || button.iconTex->m_texID == 0) && !button.icon.empty()) {
+            button.iconTex     = g_pHyprRenderer->renderText(button.icon, button.fgcol, std::round(GOLEM_BUTTON_SIZE * GOLEM_BUTTON_GLYPH * scale), false, GOLEM_BAR_FONT, scaledButtonSize);
+            button.inkOffset   = {};
+            button.inkMeasured = measureInkOffset(button.iconTex, button.inkOffset);
+        }
 
         if (!button.iconTex || button.iconTex->m_texID == 0)
             continue;
 
-        // Centred on the button it belongs to, which is what the shared
-        // `golemButtonX` places.
-        const auto iconX = barBox->x + golemButtonX(i, scale) + (scaledButtonSize - button.iconTex->m_size.x) / 2.0;
-        // Centred on the BUTTON, which is what `golemButtonY` places — not on
-        // the bar, or the glyph floats above the disc it belongs to.
-        const auto iconY =
-            barBox->y + golemButtonY(barBox->height, BORDER * scale, scaledButtonSize) + (scaledButtonSize - button.iconTex->m_size.y) / 2.0;
-        CBox       pos   = {iconX, iconY, button.iconTex->m_size.x, button.iconTex->m_size.y};
+        // Centred on the disc AS DRAWN (`golemDiscBox`, rounded) — and by its
+        // INK, not its texture: the offset measured above moves the texture
+        // so the glyph's own centre lands on the disc's centre (see
+        // `SGolemButton::inkOffset`).
+        const CBox disc  = golemDiscBox(*barBox, i, BORDER, scale);
+        const auto iconX = disc.x + disc.w / 2.0 - button.iconTex->m_size.x / 2.0 - button.inkOffset.x;
+        const auto iconY = disc.y + disc.h / 2.0 - button.iconTex->m_size.y / 2.0 - button.inkOffset.y;
+        CBox       pos   = {std::round(iconX), std::round(iconY), button.iconTex->m_size.x, button.iconTex->m_size.y};
 
         // Never DIMMED: `decoration:dim_inactive` tints every texture drawn
         // for an unfocused window (`allowDim` defaults on), which greyed the
@@ -1005,6 +1303,15 @@ void CGolemBar::draw(PHLMONITOR pMonitor, const float& a) {
         return;
 
     auto data = CBarPassElement::SBarData{this, a};
+    // A translucent strip wants the window's blur behind it, and the pass has
+    // to know before it draws anything. Same decision the compositor makes for
+    // the content: a floating window blurs the live framebuffer; xray windows
+    // and tiled ones use the precomputed blur of the layers beneath.
+    if (m_cRealBarColor && m_cRealBarColor->value().a * a < 1.F) {
+        const bool XRAY     = g_pHyprRenderer->shouldUseNewBlurOptimizations(nullptr, PWINDOW);
+        data.liveBlur       = !XRAY;
+        data.precomputeBlur = XRAY;
+    }
     g_pHyprRenderer->m_renderPass.add(makeUnique<CBarPassElement>(data));
 }
 
@@ -1059,13 +1366,21 @@ void CGolemBar::renderPass(PHLMONITOR pMonitor, const float& a) {
     // showing through the frame (Max, 2026-09-15).
     //
     // So the strip is cut back to the border's OUTER edge, derived from the
-    // window itself rather than from the decoration box, and FLOORED so a
-    // rounding wobble can only ever leave the border a hair short — which is
-    // invisible, because the border paints that hair itself. Overlapping is the
-    // failure; abutting is not.
-    const double BORDEROUT = std::floor((PWINDOW->m_realPosition->value().y + PWINDOW->m_floatingOffset.y - PWINDOW->getRealBorderSize() - pMonitor->m_position.y) * pMonitor->m_scale);
+    // window itself rather than from the decoration box.
+    //
+    // ⭐ ROUNDED THE WAY THE CONTENT IS, not floored (Max, 2026-09-26: *"there
+    // is a tiny gap between the window and the titlebar"*). The compositor
+    // rounds the content's box to the nearest device pixel (`CBox::round` in
+    // the surface draw); a floor here left the strip a row short whenever the
+    // window's top edge fell past .5 — and with no border on a float any more,
+    // nothing painted that row. Same for the decoration box's own rounding:
+    // the cut is SET, not min'd, so a short clip is stretched to the seam (the
+    // slab behind it is drawn tall on purpose). The border's thickness is
+    // rounded like `renderBorder` rounds it. Abutting, to the pixel.
+    const double CONTENTTOP = std::round((PWINDOW->m_realPosition->value().y + PWINDOW->m_floatingOffset.y - pMonitor->m_position.y) * pMonitor->m_scale);
+    const double BORDEROUT  = CONTENTTOP - std::round(PWINDOW->getRealBorderSize() * pMonitor->m_scale);
     if (BORDEROUT > clipBox.y)
-        clipBox.h = std::min(clipBox.h, BORDEROUT - clipBox.y);
+        clipBox.h = BORDEROUT - clipBox.y;
 
     // ⭐ THE OVERHANG IS CLIPPED BY **DAMAGE**, AND ONLY BY DAMAGE.
     //
@@ -1153,7 +1468,63 @@ void CGolemBar::renderPass(PHLMONITOR pMonitor, const float& a) {
     // Rounded on all four corners and clipped at the bar's bottom edge, which
     // leaves exactly a titlebar: curved on top, square where it meets the
     // window.
-    g_pHyprOpenGL->renderRect(titleBarBox, color, {.damage = &barDamage, .round = scaledRounding, .roundingPower = m_pWindow->roundingPower()});
+    //
+    // ⭐ THE SAME OPACITY AS THE WINDOW (Max, 2026-09-26: *"make it also the
+    // same opacity"*). Equal alpha alone did not read as equal: the content
+    // sits on Hyprland's blur, the strip sat on the sharp wallpaper, and 5% of
+    // a sharp wallpaper reads as more see-through than 5% of a frosted one.
+    // So a translucent strip is drawn the way the compositor draws the content
+    // itself — a solid-colour texture through `renderTexture` with blur — so
+    // the blurred backdrop, its rounding and the alpha come from the very code
+    // path the window's own pixels take (`IElementRenderer::drawTex`,
+    // mirrored here: live blur of the framebuffer for a float, the precomputed
+    // blur for xray/tiled).
+    if (color.a < 1.F && ensureSolidTex(color)) {
+        const bool XRAY = g_pHyprRenderer->shouldUseNewBlurOptimizations(nullptr, PWINDOW);
+        // `a` is the window's opacity × its fade. The content's blur takes the
+        // FADE alone as `blurA` (its opacity is already in `.a`), so divide the
+        // opacity back out — or the backdrop under the strip fades twice.
+        const float opacity = PWINDOW->m_ruleApplicator->opaque().valueOrDefault() ? 1.F : PWINDOW->alphaValue(Desktop::View::WINDOW_ALPHA_ACTIVE);
+        const float fade    = opacity > 0.001F ? std::clamp(a / opacity, 0.F, 1.F) : 1.F;
+        Render::GL::CHyprOpenGLImpl::STextureRenderData td;
+        td.blur                  = true;
+        td.blurA                 = fade;
+        td.overallA              = 1.F;
+        td.blockBlurOptimization = !XRAY;
+        if (XRAY)
+            td.blurredBG = pMonitor->resources()->m_blurFB->getTexture();
+        else {
+            // Only the strip (and only its damaged part) is blurred — the
+            // overhang below the seam is under the content, which does its own.
+            CRegion blurRegion = barDamage.copy().intersect(g_pHyprRenderer->m_renderData.damage);
+            td.blurredBG       = g_pHyprRenderer->blurMainFramebuffer(color.a, &blurRegion);
+        }
+        td.damage        = &barDamage;
+        td.a             = color.a;
+        td.round         = scaledRounding;
+        td.roundingPower = m_pWindow->roundingPower();
+        td.discardMode   = 0;     // a solid texel: nothing to discard, no stencil pass
+        td.allowDim      = false; // the strip dims itself (the inactive stop); the compositor's tint must not dim it twice
+        g_pHyprOpenGL->renderTexture(g_barSolidTex, titleBarBox, td);
+    } else
+        g_pHyprOpenGL->renderRect(titleBarBox, color, {.damage = &barDamage, .round = scaledRounding, .roundingPower = m_pWindow->roundingPower()});
+
+    // ⭐ THE HAIRLINE (see GOLEM_CARD_HAIRLINE_*): Beam's border around the whole
+    // card. The compositor's border shader draws a ring OUTSIDE the box it is
+    // given, so the box is the card itself — strip top to content bottom — and
+    // the ring hugs the card's outer edge, corners following the same radius
+    // as the strip's top and the content's bottom. Focus picks the alpha the
+    // way Beam's rule does; the window's own fade (`a`) rides along.
+    {
+        CBox card = {DECOBOX.x - pMonitor->m_position.x, DECOBOX.y - pMonitor->m_position.y, DECOBOX.w, DECOBOX.h + PWINDOW->m_realSize->value().y};
+        card.translate(PWINDOW->m_floatingOffset).scale(pMonitor->m_scale).round();
+        const bool                 FOCUSED = Desktop::focusState()->window() == PWINDOW;
+        Config::CGradientValueData hair    = PWINDOW->m_realBorderColor; // structure only (angle, the ok cache)
+        hair.m_colors.clear();
+        hair.m_colors.push_back(CHyprColor{FOCUSED ? GOLEM_CARD_HAIRLINE_FOCUSED : GOLEM_CARD_HAIRLINE_UNFOCUSED});
+        hair.updateColorsOk();
+        g_pHyprOpenGL->renderBorder(card, hair, {.round = scaledRounding, .roundingPower = m_pWindow->roundingPower(), .borderSize = GOLEM_CARD_HAIRLINE_PX, .a = a});
+    }
 
     // THE TITLE, BACK AND CENTRED (Max, 2026-09-15: *"put the title on the
     // title bar, on the center"* — it left the bar earlier the same day, and
@@ -1221,9 +1592,19 @@ void CGolemBar::damageEntire() {
     // animated bar colour, so a focus flip has to redraw it too — damaged as
     // only the strip, the notches keep the old colour until the window next
     // moves. Damage is not paint; the window simply redraws over most of it.
-    CBox box = assignedBoxGlobal();
+    // The whole card plus the hairline outside it (see `cardBoxGlobal`), so a
+    // focus flip repaints the ring on every side.
+    CBox box = cardBoxGlobal();
     box.h += notchDepth();
+    box.expand(GOLEM_CARD_HAIRLINE_PX + 1);
     g_pHyprRenderer->damageBox(box);
+}
+
+CBox CGolemBar::cardBoxGlobal() {
+    CBox box = assignedBoxGlobal();
+    if (const auto PWINDOW = m_pWindow.lock())
+        box.h += PWINDOW->m_realSize->value().y;
+    return box;
 }
 
 // How far below the seam the notch fill reaches: the corner's full span, where
@@ -1278,12 +1659,11 @@ void CGolemBar::damageOnButtonHover() {
     unsigned int mask = 0;
     if (!m_hidden && inputIsValid()) {
         const auto COORDS = cursorRelativeToBar();
-        for (size_t i = 0; i < g_pBarsState->buttons.size(); ++i) {
-            const auto BARBUF     = Vector2D{(int)assignedBoxGlobal().w, GOLEM_BAR_HEIGHT};
-            Vector2D   currentPos = Vector2D{golemButtonX(i, 1.F), golemButtonY(BARBUF.y, borderBelow(), GOLEM_BUTTON_SIZE)}.floor();
-            if (VECINRECT(COORDS, currentPos.x, currentPos.y, currentPos.x + GOLEM_BUTTON_SIZE + GOLEM_BUTTON_PADDING, currentPos.y + GOLEM_BUTTON_SIZE))
-                mask |= 1u << i;
-        }
+        // The whole column lights its disc (`golemButtonColumn`), so the lift
+        // answers the hand as it arrives, not only once it is on the disc.
+        const auto ZONE = golemBarZone(COORDS, g_pBarsState->buttons.size(), assignedBoxGlobal().w, GOLEM_BAR_HEIGHT, borderBelow());
+        if (ZONE.kind == SGolemBarZone::BUTTON)
+            mask = 1u << ZONE.button;
     }
     if (mask != m_iButtonHoverState) {
         m_iButtonHoverState = mask;

@@ -27,6 +27,19 @@ enum eGolemBarButton : uint8_t {
     GOLEM_BAR_MIN,
 };
 
+/// How a button's glyph is made. A font glyph rasterised at 13px lands its
+/// strokes on different sub-pixel phases on each side, and no amount of
+/// measuring centres what the eye reads as lopsided (Max, 2026-09-26: *"they
+/// dont look well.. not centered… the worse is the square"*). The square and
+/// the dash are therefore DRAWN — rectangles centred on the disc by
+/// construction, with sizes of the disc's parity so the margins are whole and
+/// equal. Only the × stays a font glyph (diagonals are not rectangles).
+enum eGolemGlyph : uint8_t {
+    GOLEM_GLYPH_TEXT = 0,
+    GOLEM_GLYPH_SQUARE,
+    GOLEM_GLYPH_DASH,
+};
+
 /// One button: what it does, what it looks like, and the glyph texture once it
 /// has been rendered.
 struct SGolemButton {
@@ -34,7 +47,16 @@ struct SGolemButton {
     CHyprColor           bgcol;
     CHyprColor           fgcol;
     std::string          icon;
+    eGolemGlyph          glyph = GOLEM_GLYPH_TEXT;
     SP<Render::ITexture> iconTex;
+    /// Where the glyph's INK sits in `iconTex`: its centre relative to the
+    /// texture's centre, in texture px. A text texture carries the font's
+    /// ascent, descent and side bearings around the glyph, so centring the
+    /// texture on the disc left every glyph a little off (Max, 2026-09-26:
+    /// *"the icons are not centered on the circles"*). Measured once from
+    /// the texture's alpha after it is rendered.
+    Vector2D             inkOffset;
+    bool                 inkMeasured = false;
 };
 
 class CGolemBar;

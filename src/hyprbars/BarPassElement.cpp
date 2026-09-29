@@ -18,9 +18,10 @@ std::vector<UP<IPassElement>> CBarPassElement::draw() {
 }
 
 bool CBarPassElement::needsLiveBlur() {
-    // Golem's bar is opaque, so there is nothing behind it to blur. (Upstream
-    // asked its config here.)
-    return false;
+    // Set at creation from the strip's alpha and the window's blur mode: a
+    // translucent strip on a floating window blurs the live framebuffer
+    // behind it, exactly as its content does.
+    return data.liveBlur;
 }
 
 std::optional<CBox> CBarPassElement::boundingBox() {
@@ -30,11 +31,15 @@ std::optional<CBox> CBarPassElement::boundingBox() {
     // Extended by the notch depth: the strip's paint reaches below the seam
     // into the two corner notches (`renderPass`), and a box that stops at the
     // strip lets occlusion cull the fill while the corners are still visible.
-    CBox box = data.deco->assignedBoxGlobal();
+    //
+    // And the whole CARD since the hairline (`cardBoxGlobal`): the ring runs
+    // down the content's sides and under its bottom, outside the window, so a
+    // box that stops at the strip lets a repaint there wipe the ring.
+    CBox box = data.deco->cardBoxGlobal();
     box.h += data.deco->notchDepth();
     return box.translate(-g_pHyprRenderer->m_renderData.pMonitor->m_position).expand(10);
 }
 
 bool CBarPassElement::needsPrecomputeBlur() {
-    return false;
+    return data.precomputeBlur;
 }

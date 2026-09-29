@@ -34,6 +34,7 @@
 #include <hyprland/src/desktop/view/Window.hpp>
 #include <hyprland/src/desktop/Workspace.hpp>
 #include <hyprland/src/render/Renderer.hpp>
+#include <hyprland/src/helpers/cm/ColorManagement.hpp>
 #include <hyprland/src/render/OpenGL.hpp>
 #include <hyprland/src/render/Framebuffer.hpp>
 #include <hyprland/src/render/pass/RectPassElement.hpp>
@@ -5439,6 +5440,168 @@ static bool writeRaw(const std::string& path, const std::vector<uint8_t>& px) {
 /// times over. Filling the deck when the mode opens is only affordable this way.
 ///
 /// Each window is written to `<dir>/<addr>.rgba`. Returns how many landed.
+// ─────────────────────────── Titlebar colour sampling ───────────────────────────
+//
+// The bar takes the colour of the content it sits on, the way the OPTIONS bar
+// takes a flush window's (Max, 2026-09-26: *"i want the title bars to sample
+// the color of the window as the option bar does (same color / one thing)"*).
+// The daemon has to screencopy the screen for that; here the window's own
+// texture is in hand, so the sample is a direct read of its top rows — the
+// rows right under the seam, which is what the strip has to continue.
+//
+// Reads the top `rows` logical px of `w`'s main surface, squeezed into a small
+// framebuffer: the DOMINANT colour as sRGB 0..1 in `out[0..2]`, and its pixels'
+// mean alpha in `out[3]` — the content's own translucency (a terminal with a
+// see-through background), which the strip has to share to be the same thing
+// (Max, 2026-09-26: *"make it also the same opacity"*).
+//
+// Dominant, not mean: the rows under the seam carry text and glyph edges, and
+// a mean drifts a level or two off the background with every change of text
+// (Max, 2026-09-26: *"its not the same color. is super close but its not"*).
+// The pixels are bucketed coarsely, the fullest bucket wins, and exactly its
+// pixels are averaged — that is the background the strip continues, to the
+// level, and it only moves when the app's own background does. Clear pixels
+// (a CSD app's corners) are left out. Runs on the event loop only (its own
+// begin/endRender, like every capture here) — never from inside a render pass.
+static SP<Render::IFramebuffer> g_barSampleFB;
+
+bool golemSampleWindowTop(PHLWINDOW w, double rows, float out[4]) {
+    if (!w || !w->m_isMapped || !w->wlSurface() || !w->wlSurface()->resource())
+        return false;
+    const auto tex = w->wlSurface()->resource()->m_current.texture;
+    if (!tex || tex->m_size.x < 1 || tex->m_size.y < 1)
+        return false;
+    const auto m = w->m_monitor.lock();
+    if (!m)
+        return false;
+
+    constexpr int W = 128, H = 8; // 1024 samples across the strip's width
+    Render::GL::g_pHyprOpenGL->makeEGLCurrent(); // context first — see captureDeckToDir
+    if (!g_barSampleFB)
+        g_barSampleFB = g_pHyprRenderer->createFB("waveview-bar-sample");
+    if (!g_barSampleFB->isAllocated()) {
+        if (!g_barSampleFB->alloc(W, H, DRM_FORMAT_ABGR8888) || !g_barSampleFB->isAllocated()) {
+            trace("bar-sample: alloc failed");
+            return false;
+        }
+        // ⭐ READ IN sRGB. A render targets the compositor's WORK BUFFER colour
+        // space by default, so the readback was the window's colour converted
+        // once — and the strip, drawn from it, was converted again on screen:
+        // a mid grey came back 123 for 128 and the strip sat a shade dark
+        // (Max, 2026-09-26: *"its not the same color. is super close but its
+        // not"*). Declaring this framebuffer sRGB makes the render an identity
+        // copy: sRGB in, sRGB out, the strip converted exactly once like the
+        // content.
+        g_barSampleFB->setImageDescription(NColorManagement::getDefaultImageDescription());
+    }
+
+    // The buffer is scaled; `rows` is logical. Never past the buffer's bottom.
+    const double bufRows = std::clamp(rows * m->m_scale, 1.0, (double)tex->m_size.y);
+    const double frac    = bufRows / (double)tex->m_size.y;
+
+    CRegion fakeDamage{0, 0, INT16_MAX, INT16_MAX};
+    g_pHyprRenderer->beginRender(m, fakeDamage, Render::RENDER_MODE_FULL_FAKE, nullptr, g_barSampleFB);
+    glClearColor(0.0F, 0.0F, 0.0F, 0.0F);
+    glClear(GL_COLOR_BUFFER_BIT);
+    Render::GL::CHyprOpenGLImpl::STextureRenderData td;
+    td.allowCustomUV               = true;
+    td.primarySurfaceUVTopLeft     = Vector2D(0, 0);
+    td.primarySurfaceUVBottomRight = Vector2D(1.0, frac);
+    Render::GL::g_pHyprOpenGL->renderTexture(tex, CBox{0, 0, W, H}, td);
+    g_pHyprRenderer->m_renderData.blockScreenShader = true;
+    g_pHyprRenderer->endRender(); // the pass is submitted here; nothing is readable before it
+
+    // Read through an FBO of our own — Hyprland's own binding is gone after
+    // endRender (see blitAndRead).
+    std::vector<uint8_t> px((size_t)W * H * 4, 0);
+    Render::GL::g_pHyprOpenGL->makeEGLCurrent();
+    const auto ftex = g_barSampleFB->getTexture();
+    GLuint     fbo  = 0;
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, ftex ? ftex->m_texID : 0, 0);
+    while (glGetError() != GL_NO_ERROR) {}
+    const GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    if (status == GL_FRAMEBUFFER_COMPLETE)
+        glReadPixels(0, 0, W, H, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+    const GLenum glErr = glGetError();
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDeleteFramebuffers(1, &fbo);
+    if (status != GL_FRAMEBUFFER_COMPLETE || glErr != GL_NO_ERROR) {
+        trace("bar-sample: readback failed status=0x%x glErr=0x%x", status, glErr);
+        return false;
+    }
+
+    // Premultiplied in the framebuffer: un-premultiply each pixel to its exact
+    // 8-bit colour, count the exact colours, and take the most frequent one —
+    // a solid background is one exact value and wins outright, reproduced to
+    // the level (a bucket MEAN pulled in near-background glyph edges and sat a
+    // level off). Only when no single colour carries the strip (a gradient, a
+    // picture) does it fall back to the mean of a coarse 5-bit bucket.
+    struct SBucket {
+        double r = 0, g = 0, b = 0, a = 0;
+        int    n = 0;
+    };
+    std::unordered_map<uint32_t, SBucket> exact, coarse;
+    for (int i = 0; i < W * H; ++i) {
+        const double pa = px[i * 4 + 3] / 255.0;
+        if (pa <= 0.0)
+            continue;
+        const double r = std::clamp(px[i * 4 + 0] / 255.0 / pa, 0.0, 1.0), g = std::clamp(px[i * 4 + 1] / 255.0 / pa, 0.0, 1.0),
+                     b = std::clamp(px[i * 4 + 2] / 255.0 / pa, 0.0, 1.0);
+        const uint32_t r8 = (uint32_t)std::lround(r * 255.0), g8 = (uint32_t)std::lround(g * 255.0), b8 = (uint32_t)std::lround(b * 255.0);
+        for (auto* map : {&exact, &coarse}) {
+            const uint32_t key = map == &exact ? ((r8 << 16) | (g8 << 8) | b8) : (((r8 >> 3) << 10) | ((g8 >> 3) << 5) | (b8 >> 3));
+            auto&          bk  = (*map)[key];
+            bk.r += r;
+            bk.g += g;
+            bk.b += b;
+            bk.a += pa;
+            bk.n++;
+        }
+    }
+    const SBucket* best = nullptr;
+    for (const auto& [k, bk] : exact)
+        if (!best || bk.n > best->n)
+            best = &bk;
+    if (!best)
+        return false; // fully clear rows: nothing to be the colour of
+    if (best->n < (W * H) / 8) { // no dominant exact colour: the coarse bucket's mean
+        best = nullptr;
+        for (const auto& [k, bk] : coarse)
+            if (!best || bk.n > best->n)
+                best = &bk;
+    }
+    out[0] = (float)(best->r / best->n);
+    out[1] = (float)(best->g / best->n);
+    out[2] = (float)(best->b / best->n);
+    out[3] = (float)(best->a / best->n);
+    // Traced only when it moves — a blinking cursor re-samples every commit.
+    static std::unordered_map<const void*, std::array<float, 4>> lastTraced;
+    auto&                                                        lt = lastTraced[w.get()];
+    if (std::abs(lt[0] - out[0]) > 0.002F || std::abs(lt[1] - out[1]) > 0.002F || std::abs(lt[2] - out[2]) > 0.002F || std::abs(lt[3] - out[3]) > 0.002F) {
+        lt = {out[0], out[1], out[2], out[3]};
+        trace("bar-sample %s: %d %d %d a=%.3f (mode %d/%d)", w->m_title.c_str(), (int)std::lround(out[0] * 255.F), (int)std::lround(out[1] * 255.F),
+              (int)std::lround(out[2] * 255.F), out[3], best->n, W * H);
+    }
+    return true;
+}
+
+/// The plugin's trace file, for the bar code (main.cpp's `trace` is static).
+void golemTrace(const std::string& line) {
+    trace("%s", line.c_str());
+}
+
+/// Release the sampler's framebuffer — a GL resource that must not outlive
+/// the plugin. Called from Bars::shutdown.
+void golemSampleRelease() {
+    if (g_barSampleFB) {
+        Render::GL::g_pHyprOpenGL->makeEGLCurrent();
+        g_barSampleFB->release();
+        g_barSampleFB.reset();
+    }
+}
+
 static int captureDeckToDir(const std::string& addrsCsv, int size, double tileAspect, const std::string& dir) {
     if (size <= 0 || size > 1024)
         return 0;
@@ -6256,7 +6419,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "1.54"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "1.80"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
