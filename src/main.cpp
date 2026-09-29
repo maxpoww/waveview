@@ -187,6 +187,7 @@ static constexpr uint32_t EVDEV_9     = 10;
 static constexpr uint32_t EVDEV_Q     = 16;  // KEY_Q — close the hovered window
 static constexpr uint32_t EVDEV_LMETA = 125; // Super, tracked so bind combos
 static constexpr uint32_t EVDEV_RMETA = 126; // pass through the key swallow
+static constexpr uint32_t EVDEV_MUTE  = 113; // KEY_MUTE: the first of the control keys (see onKey)
 static bool               g_superHeld = false;
 
 static constexpr auto REFRESH_MS = std::chrono::milliseconds(150);
@@ -5199,6 +5200,16 @@ static void onKey(IKeyboard::SKeyEvent e, Event::SCallbackInfo& info) {
         g_superHeld = e.state == WL_KEYBOARD_KEY_STATE_PRESSED;
         return;
     }
+    // Control keys are never ours: evdev 113 (KEY_MUTE) and up are volume,
+    // mute, media, screen and keyboard brightness, the Mac's Mission Control
+    // (KEY_SCALE, F3) and Launchpad (KEY_DASHBOARD, F4), none of them typing. The
+    // swallow below exists so TYPING can't leak into the window underneath;
+    // swallowing these too left F3 unable to walk its own spread → overview →
+    // close cycle (Max, 2026-09-29: "one touch, it stays there") and muted
+    // the volume keys over the overview. Escape, digits, Q and the arrows are
+    // all below 113 and stay ours.
+    if (e.keycode >= EVDEV_MUTE)
+        return;
     // Typing into the focused window is USE (desktop-side only; keys while
     // the overview is open are ours). Super-chords are binds, not use — the
     // Super+Tab that drives the focus cycle must never commit it.
@@ -6448,7 +6459,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "1.81"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "1.82"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
