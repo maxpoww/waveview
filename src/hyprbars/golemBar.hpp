@@ -108,6 +108,15 @@ inline constexpr double GOLEM_SAMPLE_ROWS = 12.0;
 /// Least time between two samples of one window (a busy terminal commits at
 /// the refresh rate; the strip's colour does not need to).
 inline constexpr int GOLEM_SAMPLE_MIN_MS = 120;
+/// A sample whose alpha is below this is a failed read, not a colour. On the
+/// laptops (2026-09-30) the first readback after a resume from suspend came back
+/// all but clear ("0 0 0 a=0.012"); the bar took it, went invisible, and a static
+/// page (Gemini) never committed again to fix it. A rejected sample keeps the
+/// bar's last colour and retries every GOLEM_SAMPLE_MIN_MS, at most
+/// GOLEM_SAMPLE_RETRIES times (~6 s), then waits for the window's next commit.
+/// A translucent window (a terminal at 0.9) is nowhere near it.
+inline constexpr float GOLEM_SAMPLE_MIN_ALPHA = 0.25F;
+inline constexpr int   GOLEM_SAMPLE_RETRIES   = 50;
 /// Resting washes, as the daemon's `rest_wash` (white 0.11 / black 0.10,
 /// asymmetric because a white wash reads stronger than a black one at equal
 /// alpha). **Both ZERO here**: the first cut carried the OPTIONS bar's lift and
@@ -371,6 +380,7 @@ class CGolemBar : public IHyprWindowDecoration {
     float                      m_sample[4]   = {0.F, 0.F, 0.F, 1.F}; // sRGB + the content's mean alpha
     /// Set by the surface's commit listener; cleared when the sampler looks.
     bool                       m_sampleDirty = true;
+    int                        m_sampleRetries = 0;
     std::chrono::steady_clock::time_point m_lastSample{};
     CHyprSignalListener        m_commitListener;
     /// The window's SUBSURFACES commit too, and a browser paints the page (what

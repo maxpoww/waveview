@@ -736,9 +736,16 @@ void CGolemBar::syncSample() {
     m_sampleDirty = false;
     m_lastSample  = now;
 
-    float c[4];
-    if (!golemSampleWindowTop(m_pWindow.lock(), GOLEM_SAMPLE_ROWS, c))
+    float c[4] = {0.F, 0.F, 0.F, 0.F};
+    if (!golemSampleWindowTop(m_pWindow.lock(), GOLEM_SAMPLE_ROWS, c) || c[3] < GOLEM_SAMPLE_MIN_ALPHA) {
+        // a failed read (see GOLEM_SAMPLE_MIN_ALPHA): keep the last colour, look again
+        if (m_sampleRetries == 0)
+            golemTrace(std::format("bar-sample rejected (a={:.3f}), keeping the last colour; retrying", c[3]));
+        if (++m_sampleRetries <= GOLEM_SAMPLE_RETRIES)
+            m_sampleDirty = true;
         return;
+    }
+    m_sampleRetries = 0;
     // Only a visible change re-pushes the override — same threshold as the
     // daemon's border push (~1.5/255), so sampling noise stays off the window.
     constexpr float EPS = 0.006F;
