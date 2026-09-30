@@ -12,6 +12,7 @@
 #include <hyprland/src/desktop/view/Window.hpp>
 #include <hyprland/src/render/Renderer.hpp>
 #include <hyprland/src/managers/CursorManager.hpp>
+#include <hyprland/src/render/decorations/DecorationPositioner.hpp>
 
 #include "barsGlobals.hpp"
 #include "golemBar.hpp"
@@ -164,6 +165,25 @@ namespace Bars {
         // Flush queued bar draws while this .so is still mapped — their vtables
         // live in it.
         g_pHyprRenderer->m_renderPass.removeAllOfType("CBarPassElement");
+        // A window Hyprland will not take our bar off: its removal only QUEUES
+        // the decoration, and `CWindow::updateWindowDecos` returns early for a
+        // window that is unmapped or hidden — so the bar stayed on it, the
+        // library unmapped, and deleting the window at exit ran `~CGolemBar`
+        // in freed code: the compositor SEGV'd on every exit that followed a
+        // titled window's close (`CCompositor::cleanup` → `CWindow` delete →
+        // 0x0; parity P6 stack 2, reproduced 2026-09-30 with a killed terminal,
+        // on any workspace). Those bars come off here, while their code is
+        // still mapped; a mapped, shown window keeps Hyprland's own path.
+        for (auto& w : g_pCompositor->m_windows) {
+            if (!w || (w->m_isMapped && !w->isHidden()))
+                continue;
+            std::erase_if(w->m_windowDecorations, [](const auto& d) {
+                if (!dynamic_cast<CGolemBar*>(d.get()))
+                    return false;
+                g_pDecorationPositioner->uncacheDecoration(d.get());
+                return true;
+            });
+        }
         // The state is NOT reset here, and that is deliberate: Hyprland removes
         // the plugin's window decorations *after* PLUGIN_EXIT returns, so every
         // `~CGolemBar` still runs — and one that finds the state already gone
