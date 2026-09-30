@@ -5460,11 +5460,22 @@ static bool writeRaw(const std::string& path, const std::vector<uint8_t>& px) {
 // texture is in hand, so the sample is a direct read of its top rows — the
 // rows right under the seam, which is what the strip has to continue.
 //
-// Reads the top `rows` logical px of `w`'s main surface, squeezed into a small
-// framebuffer: the DOMINANT colour as sRGB 0..1 in `out[0..2]`, and its pixels'
-// mean alpha in `out[3]` — the content's own translucency (a terminal with a
-// see-through background), which the strip has to share to be the same thing
-// (Max, 2026-09-26: *"make it also the same opacity"*).
+// Reads the top `rows` logical px of `w`'s surfaces — the main surface AND its
+// subsurfaces, composited in their stacking order at their offsets — squeezed
+// into a small framebuffer: the DOMINANT colour as sRGB 0..1 in `out[0..2]`, and
+// its pixels' mean alpha in `out[3]` — the content's own translucency (a
+// terminal with a see-through background), which the strip has to share to be
+// the same thing (Max, 2026-09-26: *"make it also the same opacity"*).
+//
+// ⭐ SUBSURFACES (2026-09-30, the Seam webapps). Firefox draws a web page into
+// its own opaque subsurface over the main surface, and leaves a HOLE in the main
+// surface under it. Reading the main surface alone gave a Seam webapp window
+// (the page right under the seam, no toolbar) a strip of alpha 0.007: the
+// wallpaper showed through, a light bar on YouTube's black. What the strip has
+// to continue is what the eye sees at the window's top edge, which is every
+// surface of the window stacked; decorations (this strip, the border) are not
+// surfaces, so they never feed back into the sample. Popups are not subsurfaces
+// either and stay out.
 //
 // Dominant, not mean: the rows under the seam carry text and glyph edges, and
 // a mean drifts a level or two off the background with every change of text
@@ -5479,11 +5490,17 @@ static SP<Render::IFramebuffer> g_barSampleFB;
 bool golemSampleWindowTop(PHLWINDOW w, double rows, float out[4]) {
     if (!w || !w->m_isMapped || !w->wlSurface() || !w->wlSurface()->resource())
         return false;
-    const auto tex = w->wlSurface()->resource()->m_current.texture;
+    const auto root = w->wlSurface()->resource();
+    const auto tex  = root->m_current.texture;
     if (!tex || tex->m_size.x < 1 || tex->m_size.y < 1)
         return false;
     const auto m = w->m_monitor.lock();
     if (!m)
+        return false;
+    // The strip is laid over the main surface's logical box; every surface of
+    // the window is placed in it by its logical offset.
+    const Vector2D rootSize = root->m_current.size;
+    if (rootSize.x < 1 || rootSize.y < 1)
         return false;
 
     constexpr int W = 128, H = 8; // 1024 samples across the strip's width
@@ -5506,21 +5523,48 @@ bool golemSampleWindowTop(PHLWINDOW w, double rows, float out[4]) {
         g_barSampleFB->setImageDescription(NColorManagement::getDefaultImageDescription());
     }
 
-    // The buffer is scaled; `rows` is logical. Never past the buffer's bottom.
-    const double bufRows = std::clamp(rows * m->m_scale, 1.0, (double)tex->m_size.y);
-    const double frac    = bufRows / (double)tex->m_size.y;
+    // `rows` is logical; never past the window's bottom. The framebuffer's W x H
+    // pixels stand for the logical box (0, 0) .. (rootSize.x, rowsL).
+    const double rowsL = std::clamp(rows, 1.0, rootSize.y);
+    const double sx = (double)W / rootSize.x, sy = (double)H / rowsL;
 
     CRegion fakeDamage{0, 0, INT16_MAX, INT16_MAX};
     g_pHyprRenderer->beginRender(m, fakeDamage, Render::RENDER_MODE_FULL_FAKE, nullptr, g_barSampleFB);
     glClearColor(0.0F, 0.0F, 0.0F, 0.0F);
     glClear(GL_COLOR_BUFFER_BIT);
-    Render::GL::CHyprOpenGLImpl::STextureRenderData td;
-    td.allowCustomUV               = true;
-    td.primarySurfaceUVTopLeft     = Vector2D(0, 0);
-    td.primarySurfaceUVBottomRight = Vector2D(1.0, frac);
-    Render::GL::g_pHyprOpenGL->renderTexture(tex, CBox{0, 0, W, H}, td);
+    // Stacked bottom to top (the walk visits a parent before its children), each
+    // surface whole at its logical rect: the framebuffer keeps only the strip.
+    // A viewport source crop is honoured, so a cropped buffer lands as the app
+    // shows it.
+    int layers = 0;
+    root->breadthfirst(
+        [&](SP<CWLSurfaceResource> s, const Vector2D& off, void*) {
+            if (!s)
+                return;
+            const auto stex = s->m_current.texture;
+            const auto ssz  = s->m_current.size;
+            if (!stex || stex->m_size.x < 1 || stex->m_size.y < 1 || ssz.x < 1 || ssz.y < 1)
+                return;
+            if (off.y >= rowsL || off.y + ssz.y <= 0.0 || off.x >= rootSize.x || off.x + ssz.x <= 0.0)
+                return; // nowhere near the top edge
+            Render::GL::CHyprOpenGLImpl::STextureRenderData td;
+            td.allowCustomUV               = true;
+            td.primarySurfaceUVTopLeft     = Vector2D(0, 0);
+            td.primarySurfaceUVBottomRight = Vector2D(1, 1);
+            const auto& vp                 = s->m_current.viewport;
+            const auto  bsz                = s->m_current.bufferSize;
+            if (vp.hasSource && bsz.x > 0 && bsz.y > 0) {
+                td.primarySurfaceUVTopLeft     = Vector2D(vp.source.x / bsz.x, vp.source.y / bsz.y);
+                td.primarySurfaceUVBottomRight = Vector2D((vp.source.x + vp.source.w) / bsz.x, (vp.source.y + vp.source.h) / bsz.y);
+            }
+            Render::GL::g_pHyprOpenGL->renderTexture(stex, CBox{off.x * sx, off.y * sy, ssz.x * sx, ssz.y * sy}, td);
+            ++layers;
+        },
+        nullptr);
     g_pHyprRenderer->m_renderData.blockScreenShader = true;
     g_pHyprRenderer->endRender(); // the pass is submitted here; nothing is readable before it
+    if (layers == 0)
+        return false;
 
     // Read through an FBO of our own — Hyprland's own binding is gone after
     // endRender (see blitAndRead).
@@ -5592,8 +5636,8 @@ bool golemSampleWindowTop(PHLWINDOW w, double rows, float out[4]) {
     auto&                                                        lt = lastTraced[w.get()];
     if (std::abs(lt[0] - out[0]) > 0.002F || std::abs(lt[1] - out[1]) > 0.002F || std::abs(lt[2] - out[2]) > 0.002F || std::abs(lt[3] - out[3]) > 0.002F) {
         lt = {out[0], out[1], out[2], out[3]};
-        trace("bar-sample %s: %d %d %d a=%.3f (mode %d/%d)", w->m_title.c_str(), (int)std::lround(out[0] * 255.F), (int)std::lround(out[1] * 255.F),
-              (int)std::lround(out[2] * 255.F), out[3], best->n, W * H);
+        trace("bar-sample %s: %d %d %d a=%.3f (mode %d/%d, %d layer%s)", w->m_title.c_str(), (int)std::lround(out[0] * 255.F), (int)std::lround(out[1] * 255.F),
+              (int)std::lround(out[2] * 255.F), out[3], best->n, W * H, layers, layers == 1 ? "" : "s");
     }
     return true;
 }
@@ -6459,7 +6503,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "1.82"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "1.83"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {

@@ -373,6 +373,14 @@ class CGolemBar : public IHyprWindowDecoration {
     bool                       m_sampleDirty = true;
     std::chrono::steady_clock::time_point m_lastSample{};
     CHyprSignalListener        m_commitListener;
+    /// The window's SUBSURFACES commit too, and a browser paints the page (what
+    /// sits under the seam) into one of its own: those commits never reach the
+    /// main surface's signal. One listener per subsurface, re-walked when the
+    /// tree grows (on the sampler's tick, never inside a signal's emission).
+    std::vector<CHyprSignalListener> m_subCommitListeners;
+    CHyprSignalListener        m_newSubListener;
+    bool                       m_resubscribe = false;
+    void                       listenSubsurfaces();
 
     /// The tinted gradients as last applied. Kept so the tint is re-pushed
     /// ONLY when the colours actually change — the daemon's screen-following

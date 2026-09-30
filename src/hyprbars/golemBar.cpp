@@ -28,6 +28,8 @@
 #include <hyprland/src/config/shared/actions/ConfigActions.hpp>
 #include <hyprland/src/managers/animation/AnimationManager.hpp>
 #include <hyprland/src/protocols/LayerShell.hpp>
+#include <hyprland/src/protocols/core/Compositor.hpp>    // the surface tree (subsurface commits)
+#include <hyprland/src/protocols/core/Subcompositor.hpp>
 #include <hyprland/src/event/EventBus.hpp>
 #include <hyprland/src/layout/LayoutManager.hpp>
 #include <hyprland/src/render/OpenGL.hpp>
@@ -182,6 +184,9 @@ CGolemBar::CGolemBar(PHLWINDOW pWindow) : IHyprWindowDecoration(pWindow) {
     // the seam; the sampler's tick picks the flag up off the render pass.
     if (pWindow->wlSurface() && pWindow->wlSurface()->resource())
         m_commitListener = pWindow->wlSurface()->resource()->m_events.commit.listen([this] { m_sampleDirty = true; });
+    // ...and so may a commit of any of its subsurfaces (a Seam webapp's page is
+    // one: the bar stayed the colour of the blank page it sampled at map).
+    listenSubsurfaces();
 
     m_pMouseButtonCallback =
         Event::bus()->m_events.input.mouse.button.listen([&](IPointer::SButtonEvent e, Event::SCallbackInfo& info) { onMouseButton(info, e); });
@@ -695,7 +700,34 @@ void golemBarSolidTexDrop() {
 // never run from inside a render pass — hence a timer, not `draw()`.
 static SP<CEventLoopTimer> g_barSampleTimer;
 
+void CGolemBar::listenSubsurfaces() {
+    m_resubscribe = false;
+    m_subCommitListeners.clear();
+    const auto w = m_pWindow.lock();
+    if (!w || !w->wlSurface() || !w->wlSurface()->resource())
+        return;
+    const auto root = w->wlSurface()->resource();
+    root->breadthfirst(
+        [this, &root](SP<CWLSurfaceResource> s, const Vector2D&, void*) {
+            if (!s || s == root)
+                return;
+            m_subCommitListeners.emplace_back(s->m_events.commit.listen([this] { m_sampleDirty = true; }));
+            // a subsurface of a subsurface arrives on ITS parent's signal
+            m_subCommitListeners.emplace_back(s->m_events.newSubsurface.listen([this](SP<CWLSubsurfaceResource>) {
+                m_resubscribe = true;
+                m_sampleDirty = true;
+            }));
+        },
+        nullptr);
+    m_newSubListener = root->m_events.newSubsurface.listen([this](SP<CWLSubsurfaceResource>) {
+        m_resubscribe = true; // re-walked on the tick: never swap listeners mid-emission
+        m_sampleDirty = true;
+    });
+}
+
 void CGolemBar::syncSample() {
+    if (m_resubscribe && validMapped(m_pWindow))
+        listenSubsurfaces();
     if (m_hidden || !m_sampleDirty || !validMapped(m_pWindow))
         return;
     const auto now = std::chrono::steady_clock::now();
