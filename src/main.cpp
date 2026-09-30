@@ -4585,6 +4585,46 @@ static void onMinReapTimer(SP<CEventLoopTimer>, void*) {
     g_minReap.clear();
 }
 
+// --- A dock restart replays the minimized set ------------------------------
+// The dock's tiles for minimized windows live in the daemon's memory; the
+// windows themselves sit on special:minimized, known here. A dock that
+// restarts mid-session (a switch that changed its unit, a crash) came back
+// knowing none of them, and the windows stranded until `restore_min`
+// (parity P17, both laptops 2026-09-30). The dock binds a NEW socket file
+// when it starts: once a second the socket's identity (inode + birth time —
+// tmpfs hands the SAME inode number straight back, measured) is compared
+// with the last one seen, and a new socket after a known one means a new
+// dock: every minimized window is announced to it again (`min-add` is
+// idempotent on the dock side; the thumbnail is still on disk).
+static SP<CEventLoopTimer> g_dockWatchTimer;
+static std::pair<ino_t, int64_t> g_dockSockId{0, 0}; // {0,0} until a dock has been seen at all
+static std::string         minAddLine(const MinRec& r, PHLWINDOW w) {
+    const Vector2D sz     = w->m_realSize->goal();
+    const double   aspect = sz.y > 0.0 ? sz.x / sz.y : 1.6;
+    const auto     cls    = w->fetchClass();
+    return std::format("min-add {} {} {:.4f} {} {}/{}.rgba {}\n", r.addr, r.ws, aspect, cls.empty() ? "?" : cls, minThumbDir(), r.addr, w->m_title);
+}
+static void onDockWatchTimer(SP<CEventLoopTimer> self, void*) {
+    struct stat                st{};
+    std::pair<ino_t, int64_t>  id{0, 0};
+    if (const char* rt = getenv("XDG_RUNTIME_DIR"); rt && stat((std::string(rt) + "/waverunner.sock").c_str(), &st) == 0)
+        id = {st.st_ino, (int64_t)st.st_ctim.tv_sec * 1000000000LL + st.st_ctim.tv_nsec};
+    if (id.first != 0 && id != g_dockSockId) {
+        if (g_dockSockId.first != 0) {
+            size_t n = 0;
+            for (auto& r : g_minimized)
+                if (const auto w = r.win.lock()) {
+                    sendWaverunner(minAddLine(r, w));
+                    ++n;
+                }
+            trace("dock restarted (socket %llu/%lld -> %llu/%lld): replayed %zu minimized", (unsigned long long)g_dockSockId.first, (long long)g_dockSockId.second,
+                  (unsigned long long)id.first, (long long)id.second, n);
+        }
+        g_dockSockId = id;
+    }
+    self->updateTimeout(std::chrono::milliseconds(1000));
+}
+
 // --- Overview → topbar (waverunner draws the bar over the overview) --------
 // The current-task pill follows the POINTER while we own the screen: it
 // shows the hovered thumbnail's title, plus the live size while a thumbnail
@@ -6499,11 +6539,13 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     g_pEventLoopManager->addTimer(g_handTimer);
     g_minReapTimer = makeShared<CEventLoopTimer>(std::nullopt, onMinReapTimer, nullptr);
     g_pEventLoopManager->addTimer(g_minReapTimer);
+    g_dockWatchTimer = makeShared<CEventLoopTimer>(std::chrono::milliseconds(1000), onDockWatchTimer, nullptr);
+    g_pEventLoopManager->addTimer(g_dockWatchTimer);
     HyprlandAPI::addNotification(handle, std::string("[waveview] loaded -- ") + waveview_hello(),
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "1.85"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "1.86"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
@@ -6564,6 +6606,9 @@ APICALL EXPORT void PLUGIN_EXIT() {
     g_minReap.clear();
     if (g_minReapTimer) {
         g_pEventLoopManager->removeTimer(g_minReapTimer);
+        if (g_dockWatchTimer)
+            g_pEventLoopManager->removeTimer(g_dockWatchTimer);
+        g_dockWatchTimer.reset();
         g_minReapTimer.reset();
     }
     Bars::shutdown();
