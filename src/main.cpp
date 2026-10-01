@@ -174,6 +174,7 @@ static SP<CEventLoopTimer> g_handTimer;      // one-shot: the open hand shown at
 // actually renders as a beat.
 static constexpr int HAND_CLOSE_MS = 90;
 static void                checkResizeDrag(); // defined with the waverunner channel below
+static void                checkPlaceDrag();  // ditto: a window drag ended -> window-placed
 static void                noteInteraction(bool pointer); // ditto — feeds the daemon's focus-cycle frecency
 static void                sendOverviewHover(PHLWINDOW w); // topbar pill follows the overview's pointer
 static void                sendOverviewSize(PHLWINDOW w, bool force); // live size while resizing a thumbnail
@@ -2928,6 +2929,7 @@ static void endRealResize() {
 // The first uncancelled motion after close re-focuses under the cursor.
 static void onMouseMove(Vector2D, Event::SCallbackInfo& info) {
     checkResizeDrag(); // resize-drag watch runs desktop-side too (cheap)
+    checkPlaceDrag();
     if (g_spreadActive && !g_active) {
         const auto m = g_spreadMon.lock();
         if (!m)
@@ -4567,8 +4569,28 @@ static void checkResizeDrag() {
     sendWaverunner(on ? "resize-drag-on\n" : "resize-drag-off\n");
 }
 
+// And when ANY drag of a window ends — a move or a resize, by Super+drag, a
+// border or the title bar — tell waverunner which window just landed, so its
+// window memory notes the new size and place at once instead of on its next
+// slow re-read (Max, 2026-10-01: "can't we trigger using the pointer?").
+static std::string g_placeDragAddr;
+static void checkPlaceDrag() {
+    const auto& dc = g_layoutManager->dragController();
+    const auto  t  = dc->target();
+    if (t) {
+        if (const auto w = t->window())
+            g_placeDragAddr = windowAddr(w);
+        return;
+    }
+    if (g_placeDragAddr.empty())
+        return;
+    sendWaverunner("window-placed " + g_placeDragAddr + "\n");
+    g_placeDragAddr.clear();
+}
+
 static void onDragCheckTimer(SP<CEventLoopTimer> self, void*) {
     checkResizeDrag();
+    checkPlaceDrag();
 }
 
 static void onHandTimer(SP<CEventLoopTimer> self, void*) {
@@ -6545,7 +6567,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "1.86"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "1.87"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
