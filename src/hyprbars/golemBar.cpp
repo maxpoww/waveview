@@ -506,7 +506,7 @@ bool CGolemBar::inputIsValid() {
     // fire for every pointer event on every window's bar, so one bar outliving
     // its window by a beat would take the session down on the next mouse move.
     // (Upstream checks its config here and the window not at all.)
-    if (m_hidden || !validMapped(m_pWindow))
+    if (!validMapped(m_pWindow) || (m_hidden && !bare()))
         return false;
 
     if (!m_pWindow->m_workspace || !m_pWindow->m_workspace->isVisible() || !g_pInputManager->m_exclusiveLSes.empty() ||
@@ -894,7 +894,7 @@ void CGolemBar::releaseCursorIfOwner() {
 // them, or not on the bar at all. One probe feeding both the cursor shape and
 // the ownership logic, so they can never disagree about what is hovered.
 CGolemBar::eBarHover CGolemBar::hoverZone() {
-    if (m_hidden || !inputIsValid())
+    if (!inputIsValid())
         return HOVER_NONE;
 
     // Only the window ACTUALLY UNDER the pointer may claim a hover.
@@ -907,6 +907,15 @@ CGolemBar::eBarHover CGolemBar::hoverZone() {
                                                                      Desktop::View::RESERVED_EXTENTS | Desktop::View::INPUT_EXTENTS | Desktop::View::ALLOW_FLOATING);
     if (WINDOWATCURSOR != m_pWindow)
         return HOVER_NONE;
+
+    // The browser floating bare: only its two corner grips are ours.
+    if (m_hidden) {
+        switch (golemBareZone(cursorRelativeToWindow(), m_pWindow->m_realSize->value().x).kind) {
+            case SGolemBarZone::CORNER_LEFT: return HOVER_CORNER_LEFT;
+            case SGolemBarZone::CORNER_RIGHT: return HOVER_CORNER_RIGHT;
+            default: return HOVER_NONE;
+        }
+    }
 
     const auto COORDS = cursorRelativeToBar();
     if (!VECINRECT(COORDS, 0, 0, assignedBoxGlobal().w, GOLEM_BAR_HEIGHT - 1))
@@ -990,6 +999,30 @@ void CGolemBar::onMouseMove(Vector2D coords) {
 
 void CGolemBar::handleDownEvent(Event::SCallbackInfo& info, uint32_t button) {
     const auto PWINDOW = m_pWindow.lock();
+
+    // The browser floating bare (`golemBareZone`): a press on one of its two top
+    // corners takes hold of the window for a resize, exactly like a bar's grip;
+    // any other press in its strip is the browser's own and passes untouched.
+    if (m_hidden) {
+        const auto ZONE = golemBareZone(cursorRelativeToWindow(), PWINDOW->m_realSize->value().x).kind;
+        if (ZONE != SGolemBarZone::CORNER_LEFT && ZONE != SGolemBarZone::CORNER_RIGHT)
+            return;
+        if (g_pCompositor->vectorToWindowUnified(g_pInputManager->getMouseCoordsInternal(),
+                                                 Desktop::View::RESERVED_EXTENTS | Desktop::View::INPUT_EXTENTS | Desktop::View::ALLOW_FLOATING) != PWINDOW)
+            return;
+        if (Desktop::focusState()->window() != PWINDOW)
+            Desktop::focusState()->fullWindowFocus(PWINDOW, Desktop::FOCUS_REASON_CLICK);
+        g_pCompositor->changeWindowZOrder(PWINDOW, true);
+        info.cancelled      = true;
+        m_bCancelledDown    = true;
+        m_pressedButton     = button;
+        m_bDragPending      = true;
+        m_bResizeFromCorner = true;
+        g_barCursorOwner    = this;
+        setBarCursor("grabbing");
+        return;
+    }
+
     const auto COORDS  = cursorRelativeToBar();
 
     if (!VECINRECT(COORDS, 0, 0, assignedBoxGlobal().w, GOLEM_BAR_HEIGHT - 1)) {
@@ -1657,6 +1690,16 @@ double CGolemBar::notchDepth() {
 
 Vector2D CGolemBar::cursorRelativeToBar() {
     return g_pInputManager->getMouseCoordsInternal() - assignedBoxGlobal().pos();
+}
+
+bool CGolemBar::bare() {
+    const auto W = m_pWindow.lock();
+    return m_hidden && W && windowIsFirefox(W) && W->m_isFloating && !W->isFullscreen() && !windowStaged(W);
+}
+
+Vector2D CGolemBar::cursorRelativeToWindow() {
+    const auto W = m_pWindow.lock();
+    return W ? g_pInputManager->getMouseCoordsInternal() - W->m_realPosition->value() : Vector2D{-1, -1};
 }
 
 eDecorationLayer CGolemBar::getDecorationLayer() {

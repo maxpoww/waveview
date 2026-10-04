@@ -269,6 +269,33 @@ inline SGolemBarZone golemBarZone(const Vector2D& p, size_t count, double barWid
     return {SGolemBarZone::STRIP, -1};
 }
 
+/// THE BROWSER'S CORNER GRIPS (Max, 2026-10-04: *"make the resize also work on seam, as
+/// any other window"*). Seam floats BARE — no bar, its own traffic lights in its
+/// toolbar — so the top corners every other float is resized by were plain browser
+/// chrome there. (Hyprland ignores a client's own xdg resize request, and its mouse
+/// resize can only be started from inside the compositor: Seam cannot do this itself.)
+/// The same grips, on the window's OWN top strip (the bar's height, measured from the
+/// window's surface): the left one is the first GOLEM_BAR_CORNER_GRAB px around the red
+/// disc — whose circle, one px generous, stays the browser's; its centre is where
+/// golem-chrome.js draws it (6 + 8, 7 + 8 from the surface) — and the right one only
+/// the last GOLEM_BARE_RIGHT_GRAB px: Seam's tab-overview button ends 6px from the edge
+/// and must stay whole. Everything else in the strip is the browser's (NONE).
+inline constexpr double GOLEM_BARE_DISC_CX    = 14.0;
+inline constexpr double GOLEM_BARE_DISC_CY    = 15.0;
+inline constexpr int    GOLEM_BARE_RIGHT_GRAB = 6;
+inline SGolemBarZone golemBareZone(const Vector2D& p, double winWidth) {
+    if (p.x < 0 || p.y < 0 || p.x >= winWidth || p.y >= GOLEM_BAR_HEIGHT)
+        return {};
+    if (p.x >= winWidth - GOLEM_BARE_RIGHT_GRAB)
+        return {SGolemBarZone::CORNER_RIGHT, -1};
+    if (p.x < GOLEM_BAR_CORNER_GRAB - 1) { // 20 from the OUTER corner; the browser wears a 1px border
+        const double r = GOLEM_BUTTON_SIZE / 2.0 + 1.0;
+        if ((p.x - GOLEM_BARE_DISC_CX) * (p.x - GOLEM_BARE_DISC_CX) + (p.y - GOLEM_BARE_DISC_CY) * (p.y - GOLEM_BARE_DISC_CY) > r * r)
+            return {SGolemBarZone::CORNER_LEFT, -1};
+    }
+    return {};
+}
+
 /// THE HAIRLINE: a faint light border around the whole card — bar and
 /// content as one rounded shape — the same one Beam (the browser) wears
 /// (Max, 2026-09-27: *"i want a border around the floating windows (the same
@@ -459,6 +486,10 @@ class CGolemBar : public IHyprWindowDecoration {
     void     releaseCursorIfOwner();
 
     bool     inputIsValid();
+    /// The browser floating bare: no bar, but its top corners are still grips
+    /// (`golemBareZone`). False for every window that wears (or could wear) a bar.
+    bool     bare();
+    Vector2D cursorRelativeToWindow();
     void     onMouseButton(Event::SCallbackInfo& info, IPointer::SButtonEvent e);
     void     onMouseMove(Vector2D coords);
 
