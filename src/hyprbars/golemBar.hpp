@@ -249,7 +249,10 @@ inline constexpr int      GOLEM_CARD_MIN_BAR  = 150;
 inline constexpr uint64_t GOLEM_CARD_ON       = 0xFFE8935AULL;
 inline constexpr float    GOLEM_CARD_OFF_INK  = 0.55F; // the resting glyph, of the bar's ink
 inline constexpr float    GOLEM_CARD_HOVER_BG = 0.14F; // the off button's disc under the hand, of the bar's ink
-/// The card button's left edge from the bar's left edge, at `scale`.
+/// The card button's left edge from the bar's left edge, at `scale` —
+/// `barWidth` in that SAME space (scaled for the draw, logical for the
+/// hit-test). Handing the draw a logical width put the button ~40% of the way
+/// in from the right at Golem's 1.6× (2026-10-08), away from its own hit zone.
 inline float golemCardX(double barWidth, float scale) {
     return static_cast<float>(barWidth) - (GOLEM_CARD_RIGHT + GOLEM_BUTTON_SIZE) * scale;
 }
