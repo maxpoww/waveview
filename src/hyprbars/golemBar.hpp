@@ -244,7 +244,11 @@ inline constexpr int GOLEM_BAR_CORNER_GRAB = 20;
 /// the same way — its circle is the button, the corner around it resizes.
 /// Off it is only its glyph, in the bar's ink; on, an orange disc (the card's
 /// own accent). A bar narrower than GOLEM_CARD_MIN_BAR has no card button.
-inline constexpr int      GOLEM_CARD_RIGHT    = 7;
+/// Bigger than the three discs and further in (Max, 2026-10-08: *"make the
+/// icon slightly bigger (as big as the titlebar let you) and move it a little
+/// to the left"*): 21 in a 25 bar leaves 2px of air above and below.
+inline constexpr int      GOLEM_CARD_RIGHT    = 13;
+inline constexpr float    GOLEM_CARD_SIZE     = 21;
 inline constexpr int      GOLEM_CARD_MIN_BAR  = 150;
 inline constexpr uint64_t GOLEM_CARD_ON       = 0xFFE8935AULL;
 inline constexpr float    GOLEM_CARD_OFF_INK  = 0.55F; // the resting glyph, of the bar's ink
@@ -254,7 +258,7 @@ inline constexpr float    GOLEM_CARD_HOVER_BG = 0.14F; // the off button's disc 
 /// hit-test). Handing the draw a logical width put the button ~40% of the way
 /// in from the right at Golem's 1.6× (2026-10-08), away from its own hit zone.
 inline float golemCardX(double barWidth, float scale) {
-    return static_cast<float>(barWidth) - (GOLEM_CARD_RIGHT + GOLEM_BUTTON_SIZE) * scale;
+    return static_cast<float>(barWidth) - (GOLEM_CARD_RIGHT + GOLEM_CARD_SIZE) * scale;
 }
 
 /// What a bar-local logical point is ON: a button (by index), one of the two
@@ -279,8 +283,8 @@ inline SGolemBarZone golemBarZone(const Vector2D& p, size_t count, double barWid
     // The card button's disc (one px generous), ahead of the grip it shares
     // the corner with.
     if (barWidth >= GOLEM_CARD_MIN_BAR) {
-        const double cx = golemCardX(barWidth, 1.F) + GOLEM_BUTTON_SIZE / 2.0, cy = golemButtonY(barHeight, border, GOLEM_BUTTON_SIZE) + GOLEM_BUTTON_SIZE / 2.0;
-        const double r  = GOLEM_BUTTON_SIZE / 2.0 + 1.0;
+        const double cx = golemCardX(barWidth, 1.F) + GOLEM_CARD_SIZE / 2.0, cy = golemButtonY(barHeight, border, GOLEM_CARD_SIZE) + GOLEM_CARD_SIZE / 2.0;
+        const double r  = GOLEM_CARD_SIZE / 2.0 + 1.0;
         if ((p.x - cx) * (p.x - cx) + (p.y - cy) * (p.y - cy) <= r * r)
             return {SGolemBarZone::CARD, -1};
     }

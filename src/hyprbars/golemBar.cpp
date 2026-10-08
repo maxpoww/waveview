@@ -1291,7 +1291,7 @@ void CGolemBar::renderBarButtons(CBox* barBox, const float scale, const float a)
     // card's orange disc, lifted under the hand like the three on the left.
     if (barBox->w < GOLEM_CARD_MIN_BAR * scale)
         return;
-    const auto scaledSize = GOLEM_BUTTON_SIZE * scale;
+    const auto scaledSize = GOLEM_CARD_SIZE * scale;
     CBox       box = {barBox->x + golemCardX(barBox->w, scale), barBox->y + golemButtonY(barBox->h, BORDER * scale, scaledSize), scaledSize, scaledSize};
     box.round();
     CHyprColor disc = CHyprColor{GOLEM_CARD_ON};
