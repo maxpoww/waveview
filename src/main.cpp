@@ -6479,6 +6479,15 @@ static int luaSetStage(lua_State* L) {
     return 0;
 }
 
+// `hl.plugin.waveview.card("0x…"|"*", true|false)` — waverunner says which
+// windows its card is on for; their title bars' card button shows it.
+static int luaCard(lua_State* L) {
+    const char* a = lua_tostring(L, 1);
+    if (a && *a)
+        Bars::setCard(a, lua_toboolean(L, 2) != 0);
+    return 0;
+}
+
 APICALL EXPORT std::string PLUGIN_API_VERSION() {
     return HYPRLAND_API_VERSION;
 }
@@ -6507,6 +6516,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     HyprlandAPI::addLuaFunction(handle, "waveview", "minimize", luaMinimize);
     HyprlandAPI::addLuaFunction(handle, "waveview", "restore_min", luaRestoreMin);
     HyprlandAPI::addLuaFunction(handle, "waveview", "set_stage", luaSetStage);
+    HyprlandAPI::addLuaFunction(handle, "waveview", "card", luaCard);
     HyprlandAPI::addLuaFunction(handle, "waveview", "capture_deck", luaCaptureDeck);
     HyprlandAPI::addLuaFunction(handle, "waveview", "capture_desks", luaCaptureDesks);
     g_renderListener = Event::bus()->m_events.render.stage.listen([](eRenderStage s) { onRender(s); });
@@ -6567,7 +6577,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "1.88"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "1.89"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {

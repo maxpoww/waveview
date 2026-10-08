@@ -923,7 +923,8 @@ CGolemBar::eBarHover CGolemBar::hoverZone() {
 
     // One map for the hand, the lift and the press — see `golemBarZone`.
     switch (golemBarZone(COORDS, g_pBarsState->buttons.size(), assignedBoxGlobal().w, GOLEM_BAR_HEIGHT, borderBelow()).kind) {
-        case SGolemBarZone::BUTTON: return HOVER_BUTTON;
+        case SGolemBarZone::BUTTON:
+        case SGolemBarZone::CARD: return HOVER_BUTTON;
         case SGolemBarZone::CORNER_LEFT: return HOVER_CORNER_LEFT;
         case SGolemBarZone::CORNER_RIGHT: return HOVER_CORNER_RIGHT;
         case SGolemBarZone::STRIP: return HOVER_STRIP;
@@ -1125,12 +1126,19 @@ bool CGolemBar::doButtonPress(Vector2D COORDS) {
     // A press anywhere in a button's spot is that button's — the same spot
     // the hand and the hover lift answer to (`golemBarZone`).
     const auto ZONE = golemBarZone(COORDS, g_pBarsState->buttons.size(), assignedBoxGlobal().w, GOLEM_BAR_HEIGHT, borderBelow());
+    const auto PWINDOW = m_pWindow.lock();
+    // The card button: waverunner owns the card and which windows it is on
+    // for; it answers with `hl.plugin.waveview.card(addr, on)`, which is what
+    // turns the button orange (`Bars::setCard`).
+    if (ZONE.kind == SGolemBarZone::CARD) {
+        sendWaverunner(std::format("card toggle 0x{:x}\n", (uintptr_t)PWINDOW.get()));
+        return true;
+    }
     if (ZONE.kind != SGolemBarZone::BUTTON)
         return false;
     const int col = ZONE.button;
 
     auto&      b       = g_pBarsState->buttons[col];
-    const auto PWINDOW = m_pWindow.lock();
     switch (b.action) {
         // The window's own close, not a dispatcher on "activewindow":
         // the press focuses this window first, but saying which window
@@ -1277,6 +1285,62 @@ void CGolemBar::renderBarButtons(CBox* barBox, const float scale, const float a)
             g_pHyprOpenGL->renderRect(CBox{sx, buttonBox.y + (w - th) / 2.0, span, th}, ink, {});
         }
     }
+
+    // The card button, at the other end (see GOLEM_CARD_RIGHT). Off: only
+    // its glyph, in the bar's ink, with a faint disc under the hand. On: the
+    // card's orange disc, lifted under the hand like the three on the left.
+    if (barBox->w < GOLEM_CARD_MIN_BAR * scale)
+        return;
+    const auto scaledSize = GOLEM_BUTTON_SIZE * scale;
+    CBox       box = {barBox->x + golemCardX(barBox->w / scale, scale), barBox->y + golemButtonY(barBox->h, BORDER * scale, scaledSize), scaledSize, scaledSize};
+    box.round();
+    CHyprColor disc = CHyprColor{GOLEM_CARD_ON};
+    CHyprColor ink;
+    if (m_cardOn) {
+        if (m_cardHover) {
+            disc.r += (1.0 - disc.r) * GOLEM_BUTTON_HOVER_LIFT;
+            disc.g += (1.0 - disc.g) * GOLEM_BUTTON_HOVER_LIFT;
+            disc.b += (1.0 - disc.b) * GOLEM_BUTTON_HOVER_LIFT;
+        }
+        ink = CHyprColor{0xFF15121AULL}; // the mockup's dark on orange
+    } else {
+        disc   = m_lastInk;
+        disc.a = m_cardHover ? GOLEM_CARD_HOVER_BG : 0.F;
+        ink    = m_lastInk;
+        ink.a  = m_cardHover ? 1.F : GOLEM_CARD_OFF_INK;
+    }
+    disc.a *= a;
+    ink.a *= a;
+    if (disc.a > 0.F)
+        g_pHyprOpenGL->renderRect(box, disc, {.round = static_cast<int>(std::ceil(box.w / 2.0)), .roundingPower = 2.F});
+    // The glyph: the card as a frame with two dividers (the mockup's three
+    // columns), drawn — whole pixels, the disc's parity, centred by
+    // construction.
+    const double w      = box.w;
+    double       gw     = std::round(w * 0.62);
+    if (std::fmod(gw, 2.0) != std::fmod(w, 2.0))
+        gw += 1.0;
+    double       gh     = std::round(w * 0.5);
+    if (std::fmod(gh, 2.0) != std::fmod(w, 2.0))
+        gh += 1.0;
+    const double stroke = std::max(1.0, std::round(GOLEM_GLYPH_STROKE * scale));
+    const double gx = box.x + (w - gw) / 2.0, gy = box.y + (w - gh) / 2.0;
+    // Four sides, then the two dividers: strokes only, so nothing has to be
+    // cut back out in the disc's colour (off, there is no disc to cut with).
+    g_pHyprOpenGL->renderRect(CBox{gx, gy, gw, stroke}, ink, {});
+    g_pHyprOpenGL->renderRect(CBox{gx, gy + gh - stroke, gw, stroke}, ink, {});
+    g_pHyprOpenGL->renderRect(CBox{gx, gy + stroke, stroke, gh - 2.0 * stroke}, ink, {});
+    g_pHyprOpenGL->renderRect(CBox{gx + gw - stroke, gy + stroke, stroke, gh - 2.0 * stroke}, ink, {});
+    const double third = std::round((gw - stroke) / 3.0);
+    for (int i = 1; i <= 2; ++i)
+        g_pHyprOpenGL->renderRect(CBox{gx + third * i, gy + stroke, stroke, gh - 2.0 * stroke}, ink, {});
+}
+
+void CGolemBar::setCard(bool on) {
+    if (m_cardOn == on)
+        return;
+    m_cardOn = on;
+    damageEntire();
 }
 
 // The centre of a text texture's INK relative to the texture's centre, from
@@ -1739,6 +1803,7 @@ float CGolemBar::borderBelow() {
 void CGolemBar::damageOnButtonHover() {
     // Hidden or unhoverable, nothing may stay lit.
     unsigned int mask = 0;
+    bool         card = false;
     if (!m_hidden && inputIsValid()) {
         const auto COORDS = cursorRelativeToBar();
         // The whole column lights its disc (`golemButtonColumn`), so the lift
@@ -1746,9 +1811,11 @@ void CGolemBar::damageOnButtonHover() {
         const auto ZONE = golemBarZone(COORDS, g_pBarsState->buttons.size(), assignedBoxGlobal().w, GOLEM_BAR_HEIGHT, borderBelow());
         if (ZONE.kind == SGolemBarZone::BUTTON)
             mask = 1u << ZONE.button;
+        card = ZONE.kind == SGolemBarZone::CARD;
     }
-    if (mask != m_iButtonHoverState) {
+    if (mask != m_iButtonHoverState || card != m_cardHover) {
         m_iButtonHoverState = mask;
+        m_cardHover         = card;
         damageEntire();
     }
 }

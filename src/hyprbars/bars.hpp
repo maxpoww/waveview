@@ -31,6 +31,10 @@ namespace Bars {
     /// Snap `window`'s bar colour to its focus state, skipping the fade.
     void settleFocus(PHLWINDOW window);
 
+    /// The card is on (or off) for the window at `addr` ("0x…"; "*" = every
+    /// window): its bar's card button shows it. Called for waverunner.
+    void setCard(const std::string& addr, bool on);
+
     /// One entry per bar holding a sticky input flag (drag pending/active, a
     /// cancelled press), for waveview's `debug_state` dump.
     std::string debugState();

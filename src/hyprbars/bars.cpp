@@ -18,6 +18,8 @@
 #include "golemBar.hpp"
 
 #include <algorithm>
+#include <format>
+#include <string>
 
 /// Free the colour sampler's framebuffer (defined in `../main.cpp`).
 void golemSampleRelease();
@@ -37,6 +39,18 @@ namespace Bars {
                 }
         }
         return std::to_string(bars) + " bars" + (out.empty() ? ", none sticky" : ": " + out);
+    }
+
+    void setCard(const std::string& addr, bool on) {
+        for (auto& w : g_pCompositor->m_windows) {
+            if (!w)
+                continue;
+            if (addr != "*" && std::format("0x{:x}", (uintptr_t)w.get()) != addr)
+                continue;
+            for (auto& d : w->m_windowDecorations)
+                if (auto* bar = dynamic_cast<CGolemBar*>(d.get()))
+                    bar->setCard(on);
+        }
     }
 
     void settleFocus(PHLWINDOW window) {

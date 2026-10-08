@@ -236,6 +236,24 @@ inline constexpr float GOLEM_GLYPH_TONE = -0.16F;
 /// takes the corner from the pointer's quadrant.
 inline constexpr int GOLEM_BAR_CORNER_GRAB = 20;
 
+/// THE CARD BUTTON: the card (waverunner's shelf that rides the windows) is
+/// turned on and off per window from its title bar, at the RIGHT end (Max,
+/// 2026-10-08: *"i want the toggle per windows on the title bars only for now.
+/// at the right of the title bar"*). The red disc's mirror: the same disc, the
+/// same inset from the other corner, sharing that corner with the resize grip
+/// the same way — its circle is the button, the corner around it resizes.
+/// Off it is only its glyph, in the bar's ink; on, an orange disc (the card's
+/// own accent). A bar narrower than GOLEM_CARD_MIN_BAR has no card button.
+inline constexpr int      GOLEM_CARD_RIGHT    = 7;
+inline constexpr int      GOLEM_CARD_MIN_BAR  = 150;
+inline constexpr uint64_t GOLEM_CARD_ON       = 0xFFE8935AULL;
+inline constexpr float    GOLEM_CARD_OFF_INK  = 0.55F; // the resting glyph, of the bar's ink
+inline constexpr float    GOLEM_CARD_HOVER_BG = 0.14F; // the off button's disc under the hand, of the bar's ink
+/// The card button's left edge from the bar's left edge, at `scale`.
+inline float golemCardX(double barWidth, float scale) {
+    return static_cast<float>(barWidth) - (GOLEM_CARD_RIGHT + GOLEM_BUTTON_SIZE) * scale;
+}
+
 /// What a bar-local logical point is ON: a button (by index), one of the two
 /// corner resize grips, the strip, or nothing. THE one map for the hand, the
 /// hover lift and the press. Order matters and is the design:
@@ -249,12 +267,20 @@ inline constexpr int GOLEM_BAR_CORNER_GRAB = 20;
 ///    safer miss;
 ///  · otherwise the button columns (`golemButtonColumn`), then the strip.
 struct SGolemBarZone {
-    enum eKind : uint8_t { NONE = 0, STRIP, BUTTON, CORNER_LEFT, CORNER_RIGHT } kind = NONE;
+    enum eKind : uint8_t { NONE = 0, STRIP, BUTTON, CORNER_LEFT, CORNER_RIGHT, CARD } kind = NONE;
     int button = -1; // for BUTTON
 };
 inline SGolemBarZone golemBarZone(const Vector2D& p, size_t count, double barWidth, double barHeight, float border) {
     if (p.x < 0 || p.y < 0 || p.x >= barWidth || p.y >= barHeight)
         return {};
+    // The card button's disc (one px generous), ahead of the grip it shares
+    // the corner with.
+    if (barWidth >= GOLEM_CARD_MIN_BAR) {
+        const double cx = golemCardX(barWidth, 1.F) + GOLEM_BUTTON_SIZE / 2.0, cy = golemButtonY(barHeight, border, GOLEM_BUTTON_SIZE) + GOLEM_BUTTON_SIZE / 2.0;
+        const double r  = GOLEM_BUTTON_SIZE / 2.0 + 1.0;
+        if ((p.x - cx) * (p.x - cx) + (p.y - cy) * (p.y - cy) <= r * r)
+            return {SGolemBarZone::CARD, -1};
+    }
     if (p.x >= barWidth - GOLEM_BAR_CORNER_GRAB)
         return {SGolemBarZone::CORNER_RIGHT, -1};
     const int col = golemButtonColumn(p, count, barHeight);
@@ -377,6 +403,11 @@ class CGolemBar : public IHyprWindowDecoration {
     /// (event loop only — it renders; the sampler's timer calls this). Applies
     /// the result through `syncFloatTint` when the colour actually moved.
     void         syncSample();
+
+    /// The card is on (or off) for this window: the button's look. Told by
+    /// waverunner, which owns the answer (`Bars::setCard`).
+    void         setCard(bool on);
+    PHLWINDOW    window() { return m_pWindow.lock(); }
 
     WP<CGolemBar> m_self;
 
@@ -516,6 +547,9 @@ class CGolemBar : public IHyprWindowDecoration {
 
     /// Hover state per button, as a bitfield.
     unsigned int m_iButtonHoverState = 0;
+    /// The card button: on for this window, and under the pointer.
+    bool         m_cardOn    = false;
+    bool         m_cardHover = false;
 
     size_t       getVisibleButtonCount(const Vector2D& bufferSize, const float scale);
 
