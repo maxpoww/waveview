@@ -4578,8 +4578,15 @@ static void checkPlaceDrag() {
     const auto& dc = g_layoutManager->dragController();
     const auto  t  = dc->target();
     if (t) {
-        if (const auto w = t->window())
-            g_placeDragAddr = windowAddr(w);
+        if (const auto w = t->window()) {
+            // …and when it BEGINS: the window's card (waverunner's shelf)
+            // goes away while the window is in hand and comes back where it
+            // is put down (Max, 2026-10-08).
+            const auto addr = windowAddr(w);
+            if (addr != g_placeDragAddr)
+                sendWaverunner("card lifted " + addr + "\n");
+            g_placeDragAddr = addr;
+        }
         return;
     }
     if (g_placeDragAddr.empty())
@@ -6577,7 +6584,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "1.92"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "1.93"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
