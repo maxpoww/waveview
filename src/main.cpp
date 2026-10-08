@@ -6552,6 +6552,11 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     // hyprbars — see PROVENANCE.md there). They live in this plugin rather than
     // beside it so there is ONE thing to keep in ABI lockstep with Hyprland.
     Bars::init(handle);
+    // The bars have just been made and know nothing of the card: ask
+    // waverunner which windows it is on for (it answers through
+    // `hl.plugin.waveview.card`, once this load has returned). Without
+    // this a reloaded plugin's card buttons all read "off".
+    sendWaverunner("card bars\n");
     g_windowOpenListener = Event::bus()->m_events.window.open.listen([](PHLWINDOW w) {
         Bars::onWindowOpen(w);
         watchWindowCommits(w);
@@ -6598,7 +6603,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "1.95"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "1.96"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
