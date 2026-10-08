@@ -4999,6 +4999,8 @@ static void toggle() {
     damageAll();
 }
 
+static bool g_cardAway = false; // this swipe sent waverunner's card away (see onSwipeBegin)
+
 // A trackpad swipe begins: remember the finger count and reset the accumulator.
 // While the overview is open the whole gesture stream is consumed so the
 // compositor's workspace-swipe never engages underneath (a sideways 3/4-finger
@@ -5022,6 +5024,14 @@ static void onSwipeBegin(IPointer::SSwipeBeginEvent e, Event::SCallbackInfo& inf
     g_stageSwipeSent = 0.0;
     if (g_active || g_stageMode || g_spreadActive)
         info.cancelled = true;
+    // Out on the desktop a 3/4-finger swipe is about to slide the workspaces
+    // (or open the overview): waverunner's card, which is a layer and would
+    // stay put over the sliding windows, goes away at once (Max, 2026-10-08:
+    // *"i want the card to hide instantly when i swipe through workspaces"*)
+    // and comes back when the fingers have left and the slide has settled.
+    g_cardAway = !info.cancelled && (e.fingers == 3 || e.fingers == 4);
+    if (g_cardAway)
+        sendWaverunner("card away\n");
     trace("SWIPE begin f=%d active=%d spread=%d stage=%d consumed=%d", (int)e.fingers, (int)g_active, (int)g_spreadActive,
           (int)g_stageMode, (int)info.cancelled);
 }
@@ -5177,6 +5187,10 @@ static void onSwipeEnd(IPointer::SSwipeEndEvent, Event::SCallbackInfo& info) {
     if (g_stageSwipe) {
         sendWaverunner(std::format("stage-swipe-end {:.1f}\n", g_stageSwipeDx));
         g_stageSwipe = false;
+    }
+    if (g_cardAway) {
+        sendWaverunner("card back\n");
+        g_cardAway = false;
     }
     g_swipeFingers = 0;
     g_swipeFired   = false;
@@ -6584,7 +6598,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "1.93"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "1.94"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
