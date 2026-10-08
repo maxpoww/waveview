@@ -530,6 +530,10 @@ class CGolemBar : public IHyprWindowDecoration {
     Vector2D cursorRelativeToWindow();
     void     onMouseButton(Event::SCallbackInfo& info, IPointer::SButtonEvent e);
     void     onMouseMove(Vector2D coords);
+    /// A scroll on the bar slides this window's card sideways (Max,
+    /// 2026-10-08: *"i want to move it by scrolling on the bar"*) — only while
+    /// the card is on for the window; any other scroll passes untouched.
+    void     onMouseAxis(Event::SCallbackInfo& info, IPointer::SAxisEvent e);
 
     /// End any press/drag/pointer-hint this bar holds — the overview or the
     /// spread has taken the screen, and their cards own the pointer now.
@@ -544,6 +548,11 @@ class CGolemBar : public IHyprWindowDecoration {
 
     CHyprSignalListener m_pMouseButtonCallback;
     CHyprSignalListener m_pMouseMoveCallback;
+    CHyprSignalListener m_pMouseAxisCallback;
+    /// Scroll gathered since the last line sent to waverunner (one line per
+    /// frame at most; a touchpad reports far more often than that).
+    double                                m_cardScroll = 0.0;
+    std::chrono::steady_clock::time_point m_cardScrollSent{};
 
     bool                m_bDraggingThis  = false;
     bool                m_bDragPending   = false;

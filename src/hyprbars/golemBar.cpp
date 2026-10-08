@@ -191,6 +191,7 @@ CGolemBar::CGolemBar(PHLWINDOW pWindow) : IHyprWindowDecoration(pWindow) {
     m_pMouseButtonCallback =
         Event::bus()->m_events.input.mouse.button.listen([&](IPointer::SButtonEvent e, Event::SCallbackInfo& info) { onMouseButton(info, e); });
     m_pMouseMoveCallback = Event::bus()->m_events.input.mouse.move.listen([&](Vector2D c, Event::SCallbackInfo& info) { onMouseMove(c); });
+    m_pMouseAxisCallback = Event::bus()->m_events.input.mouse.axis.listen([&](IPointer::SAxisEvent e, Event::SCallbackInfo& info) { onMouseAxis(info, e); });
 
     g_pAnimationManager->createAnimation(barColor(pWindow), m_cRealBarColor, Config::animationTree()->getAnimationPropertyConfig("border"), pWindow, AVARDAMAGE_NONE);
     m_cRealBarColor->setUpdateCallback([&](auto) { damageEntire(); });
@@ -568,6 +569,25 @@ void CGolemBar::onMouseButton(Event::SCallbackInfo& info, IPointer::SButtonEvent
     if (!inputIsValid())
         return;
     handleDownEvent(info, e.button);
+}
+
+void CGolemBar::onMouseAxis(Event::SCallbackInfo& info, IPointer::SAxisEvent e) {
+    if (!m_cardOn || m_hidden || waveviewOwnsScreen())
+        return;
+    // On THIS bar, with this window the one under the pointer (`hoverZone`
+    // checks both): anywhere along it, buttons and grips included.
+    if (hoverZone() == HOVER_NONE)
+        return;
+    info.cancelled = true; // the bar's: nothing under it scrolls
+    m_cardScroll += e.delta;
+    const auto NOW = std::chrono::steady_clock::now();
+    if (NOW - m_cardScrollSent < std::chrono::milliseconds(12))
+        return;
+    const auto PWINDOW = m_pWindow.lock();
+    if (PWINDOW && m_cardScroll != 0.0)
+        sendWaverunner(std::format("card slide 0x{:x} {:.2f}\n", (uintptr_t)PWINDOW.get(), m_cardScroll));
+    m_cardScroll     = 0.0;
+    m_cardScrollSent = NOW;
 }
 
 /// The shape the BARS currently have on the pointer, "" when they have given it
