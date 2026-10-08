@@ -549,10 +549,6 @@ class CGolemBar : public IHyprWindowDecoration {
     CHyprSignalListener m_pMouseButtonCallback;
     CHyprSignalListener m_pMouseMoveCallback;
     CHyprSignalListener m_pMouseAxisCallback;
-    /// Scroll gathered since the last line sent to waverunner (one line per
-    /// frame at most; a touchpad reports far more often than that).
-    double                                m_cardScroll = 0.0;
-    std::chrono::steady_clock::time_point m_cardScrollSent{};
 
     bool                m_bDraggingThis  = false;
     bool                m_bDragPending   = false;

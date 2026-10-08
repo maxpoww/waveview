@@ -579,15 +579,13 @@ void CGolemBar::onMouseAxis(Event::SCallbackInfo& info, IPointer::SAxisEvent e) 
     if (hoverZone() == HOVER_NONE)
         return;
     info.cancelled = true; // the bar's: nothing under it scrolls
-    m_cardScroll += e.delta;
-    const auto NOW = std::chrono::steady_clock::now();
-    if (NOW - m_cardScrollSent < std::chrono::milliseconds(12))
-        return;
-    const auto PWINDOW = m_pWindow.lock();
-    if (PWINDOW && m_cardScroll != 0.0)
-        sendWaverunner(std::format("card slide 0x{:x} {:.2f}\n", (uintptr_t)PWINDOW.get(), m_cardScroll));
-    m_cardScroll     = 0.0;
-    m_cardScrollSent = NOW;
+    // Every step goes out as it comes. They used to be gathered and sent
+    // every 12 ms — but waverunner judges a throw by when the scroll STOPS,
+    // and a step held back here was both late and, at the end of a scroll,
+    // never sent at all. The channel is a queue on its own thread; a
+    // touchpad's hundred steps a second are nothing to it.
+    if (const auto PWINDOW = m_pWindow.lock(); PWINDOW && e.delta != 0.0)
+        sendWaverunner(std::format("card slide 0x{:x} {:.2f}\n", (uintptr_t)PWINDOW.get(), e.delta));
 }
 
 /// The shape the BARS currently have on the pointer, "" when they have given it
