@@ -252,8 +252,8 @@ inline constexpr int GOLEM_BAR_CORNER_GRAB = 20;
 inline constexpr int      GOLEM_CARD_RIGHT    = 15;
 inline constexpr float    GOLEM_CARD_SIZE     = GOLEM_BUTTON_SIZE;
 inline constexpr int      GOLEM_CARD_MIN_BAR  = 150;
-inline constexpr float    GOLEM_CARD_ON_BG    = 0.24F; // the on button's disc, of the bar's ink
-inline constexpr float    GOLEM_CARD_ON_HOVER = 0.36F; // …under the hand
+inline constexpr float    GOLEM_CARD_ON_BG    = 0.45F; // the on button's disc, of the bar's ink (stronger: it was 0.24)
+inline constexpr float    GOLEM_CARD_ON_HOVER = 0.60F; // …under the hand
 inline constexpr float    GOLEM_CARD_OFF_INK  = 0.55F; // the resting glyph, of the bar's ink
 inline constexpr float    GOLEM_CARD_HOVER_BG = 0.14F; // the off button's disc under the hand, of the bar's ink
 /// The card button's left edge from the bar's left edge, at `scale` —

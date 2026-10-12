@@ -1328,9 +1328,10 @@ void CGolemBar::renderBarButtons(CBox* barBox, const float scale, const float a)
     ink.a *= a;
     if (disc.a > 0.F)
         g_pHyprOpenGL->renderRect(box, disc, {.round = static_cast<int>(std::ceil(box.w / 2.0)), .roundingPower = 2.F});
-    // The glyph: the card as a frame with two dividers (the mockup's three
-    // columns), drawn — whole pixels, the disc's parity, centred by
-    // construction.
+    // The glyph: A WINDOW WITH ITS SIDE PANEL — a frame whose right part is
+    // filled, where the card stands on the window (Max, 2026-10-12: *"i
+    // dont like that symbol"* of the frame with two dividers). Drawn — whole
+    // pixels, the disc's parity, centred by construction.
     const double w      = box.w;
     double       gw     = std::round(w * 0.62);
     if (std::fmod(gw, 2.0) != std::fmod(w, 2.0))
@@ -1340,15 +1341,14 @@ void CGolemBar::renderBarButtons(CBox* barBox, const float scale, const float a)
         gh += 1.0;
     const double stroke = std::max(1.0, std::round(GOLEM_GLYPH_STROKE * scale));
     const double gx = box.x + (w - gw) / 2.0, gy = box.y + (w - gh) / 2.0;
-    // Four sides, then the two dividers: strokes only, so nothing has to be
-    // cut back out in the disc's colour (off, there is no disc to cut with).
+    // Four sides, then the panel: nothing has to be cut back out in the
+    // disc's colour (off, there is no disc to cut with).
     g_pHyprOpenGL->renderRect(CBox{gx, gy, gw, stroke}, ink, {});
     g_pHyprOpenGL->renderRect(CBox{gx, gy + gh - stroke, gw, stroke}, ink, {});
     g_pHyprOpenGL->renderRect(CBox{gx, gy + stroke, stroke, gh - 2.0 * stroke}, ink, {});
     g_pHyprOpenGL->renderRect(CBox{gx + gw - stroke, gy + stroke, stroke, gh - 2.0 * stroke}, ink, {});
-    const double third = std::round((gw - stroke) / 3.0);
-    for (int i = 1; i <= 2; ++i)
-        g_pHyprOpenGL->renderRect(CBox{gx + third * i, gy + stroke, stroke, gh - 2.0 * stroke}, ink, {});
+    const double panel = std::max(stroke + 1.0, std::round(gw * 0.40));
+    g_pHyprOpenGL->renderRect(CBox{gx + gw - panel, gy + stroke, panel - stroke, gh - 2.0 * stroke}, ink, {});
 }
 
 void CGolemBar::setCard(bool on) {
