@@ -244,13 +244,15 @@ inline constexpr int GOLEM_BAR_CORNER_GRAB = 20;
 /// the same way — its circle is the button, the corner around it resizes.
 /// Off it is only its glyph, in the bar's ink; on, an orange disc (the card's
 /// own accent). A bar narrower than GOLEM_CARD_MIN_BAR has no card button.
-/// Bigger than the three discs and further in (Max, 2026-10-08: *"make the
-/// icon slightly bigger (as big as the titlebar let you) and move it a little
-/// to the left"*): 21 in a 25 bar leaves 2px of air above and below.
-inline constexpr int      GOLEM_CARD_RIGHT    = 13;
-inline constexpr float    GOLEM_CARD_SIZE     = 21;
+/// THE SIZE OF THE THREE DISCS (Max, 2026-10-12: *"make it the same size of
+/// the traffic lights"* — it was 21, as big as the bar let it be), its
+/// centre where it was (further in than the discs are from their corner:
+/// Max, 2026-10-08, *"move it a little to the left"*). On, its disc is THE
+/// WINDOW'S ACCENT — the bar's own colour, stronger and brighter, as the
+/// card's accent is the card's (`golemAccent`; it was a fixed orange).
+inline constexpr int      GOLEM_CARD_RIGHT    = 15;
+inline constexpr float    GOLEM_CARD_SIZE     = GOLEM_BUTTON_SIZE;
 inline constexpr int      GOLEM_CARD_MIN_BAR  = 150;
-inline constexpr uint64_t GOLEM_CARD_ON       = 0xFFE8935AULL;
 inline constexpr float    GOLEM_CARD_OFF_INK  = 0.55F; // the resting glyph, of the bar's ink
 inline constexpr float    GOLEM_CARD_HOVER_BG = 0.14F; // the off button's disc under the hand, of the bar's ink
 /// The card button's left edge from the bar's left edge, at `scale` —
