@@ -84,43 +84,6 @@ static float linearLuma(float r, float g, float b) {
 /// Ink that reads on whatever the bar turns out to be — the daemon's `ink_on`
 /// rule: linear luminance of the fill against the WCAG flip point, so the
 /// strip and the OPTIONS bar choose their ink the same way.
-// THE WINDOW'S ACCENT: the bar's own colour, stronger and brighter — the
-// same hue pushed up in saturation and lightness (waverunner's card does
-// this with the card's colour: `Paint::accent`, the same numbers). A bar
-// with no hue of its own has a grey one. `ink` is the bar's ink: dark ink
-// means a light bar, whose accent is a deep colour instead of a bright one.
-static CHyprColor golemAccent(const CHyprColor& bar, const CHyprColor& ink) {
-    const double r = bar.r, g = bar.g, b = bar.b;
-    const double mx = std::max({r, g, b}), mn = std::min({r, g, b});
-    const double l = (mx + mn) / 2.0, d = mx - mn;
-    double       h = 0.0, s = 0.0;
-    if (d > 1e-6) {
-        s = l > 0.5 ? d / (2.0 - mx - mn) : d / (mx + mn);
-        if (mx == r)
-            h = (g - b) / d + (g < b ? 6.0 : 0.0);
-        else if (mx == g)
-            h = (b - r) / d + 2.0;
-        else
-            h = (r - g) / d + 4.0;
-        h /= 6.0;
-    }
-    const double hued   = std::clamp((s - 0.02) / 0.06, 0.0, 1.0);
-    const bool   bright = 0.2126 * ink.r + 0.7152 * ink.g + 0.0722 * ink.b < 0.5;
-    const double sat = (bright ? 0.70 : 0.78) * hued, light = bright ? 0.36 : 0.76;
-    const double q = light < 0.5 ? light * (1.0 + sat) : light + sat - light * sat, p = 2.0 * light - q;
-    const auto   ch = [&](double t) {
-        t = t < 0.0 ? t + 1.0 : (t > 1.0 ? t - 1.0 : t);
-        if (t < 1.0 / 6.0)
-            return p + (q - p) * 6.0 * t;
-        if (t < 0.5)
-            return q;
-        if (t < 2.0 / 3.0)
-            return p + (q - p) * (2.0 / 3.0 - t) * 6.0;
-        return p;
-    };
-    return CHyprColor{static_cast<float>(ch(h + 1.0 / 3.0)), static_cast<float>(ch(h)), static_cast<float>(ch(h - 1.0 / 3.0)), 1.F};
-}
-
 static CHyprColor inkOn(const CHyprColor& bg) {
     const float L = linearLuma(srgbToLinear(bg.r), srgbToLinear(bg.g), srgbToLinear(bg.b));
     return L > GOLEM_BRIGHT_LUMA ? CHyprColor{0xFF14171CULL} : CHyprColor{0xFFE8E6E3ULL};
@@ -1341,30 +1304,24 @@ void CGolemBar::renderBarButtons(CBox* barBox, const float scale, const float a)
         }
     }
 
-    // The card button, at the other end (see GOLEM_CARD_RIGHT). Off: only
-    // its glyph, in the bar's ink, with a faint disc under the hand. On: a
-    // disc of the window's accent, lifted under the hand like the three on
-    // the left.
+    // The card button, at the other end (see GOLEM_CARD_RIGHT).
     if (barBox->w < GOLEM_CARD_MIN_BAR * scale)
         return;
     const auto scaledSize = GOLEM_CARD_SIZE * scale;
     CBox       box = {barBox->x + golemCardX(barBox->w, scale), barBox->y + golemButtonY(barBox->h, BORDER * scale, scaledSize), scaledSize, scaledSize};
     box.round();
-    CHyprColor disc = golemAccent(m_cRealBarColor->value(), m_lastInk);
-    CHyprColor ink;
+    // ON, IT IS GREY (Max, 2026-10-12: *"lets keep the button toggled on
+    // grey"* — it was orange, then for an hour the window's accent): a disc
+    // of the bar's own ink, faint, a little stronger under the hand; its
+    // glyph in that ink, whole. Off: only the glyph, dimmer, and the faint
+    // disc under the hand alone.
+    CHyprColor disc = m_lastInk;
+    CHyprColor ink  = m_lastInk;
     if (m_cardOn) {
-        // (Its glyph: dark on a light accent, light on a dark one.)
-        const bool light = 0.2126 * disc.r + 0.7152 * disc.g + 0.0722 * disc.b > 0.5;
-        if (m_cardHover) {
-            disc.r += (1.0 - disc.r) * GOLEM_BUTTON_HOVER_LIFT;
-            disc.g += (1.0 - disc.g) * GOLEM_BUTTON_HOVER_LIFT;
-            disc.b += (1.0 - disc.b) * GOLEM_BUTTON_HOVER_LIFT;
-        }
-        ink = light ? CHyprColor{0xFF15121AULL} : CHyprColor{0xFFF4F1F8ULL};
+        disc.a = m_cardHover ? GOLEM_CARD_ON_HOVER : GOLEM_CARD_ON_BG;
+        ink.a  = 1.F;
     } else {
-        disc   = m_lastInk;
         disc.a = m_cardHover ? GOLEM_CARD_HOVER_BG : 0.F;
-        ink    = m_lastInk;
         ink.a  = m_cardHover ? 1.F : GOLEM_CARD_OFF_INK;
     }
     disc.a *= a;
