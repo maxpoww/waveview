@@ -97,6 +97,7 @@ namespace Bars {
 
         golemBarCursorTimerInit();
         golemBarSampleTimerInit();
+        golemNavWatchInit();
         golemResizeHandInit();
 
         // GOLEM'S TRAFFIC LIGHTS (Max, 2026-09-15: *"three colors, macOS style
@@ -163,6 +164,7 @@ namespace Bars {
 
         golemBarCursorTimerDrop();
         golemBarSampleTimerDrop();
+        golemNavWatchDrop();
         golemResizeHandDrop();
         golemSampleRelease(); // the sampler's framebuffer (main.cpp)
         golemBarSolidTexDrop();

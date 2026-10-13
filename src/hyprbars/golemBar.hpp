@@ -247,21 +247,62 @@ inline constexpr int GOLEM_BAR_CORNER_GRAB = 20;
 /// THE SIZE OF THE THREE DISCS (Max, 2026-10-12: *"make it the same size of
 /// the traffic lights"* — it was 21, as big as the bar let it be), its
 /// centre where it was (further in than the discs are from their corner:
-/// Max, 2026-10-08, *"move it a little to the left"*). On, its disc is
-/// GREY — the bar's ink, faint (Max, 2026-10-12; it was a fixed orange).
-inline constexpr int      GOLEM_CARD_RIGHT    = 15;
+/// Max, 2026-10-08, *"move it a little to the left"*). NO DISC is drawn any
+/// more (Max, 2026-10-12, later the same day): the glyph alone, grey off and
+/// the bar's full ink on — see `renderBarButtons`. The circle is still its
+/// hit zone.
+/// AS FAR FROM ITS CORNER AS THE RED DISC IS FROM ITS OWN (Max, 2026-10-13:
+/// *"quiero los botones de la barra de título a la derecha, a la misma
+/// distancia de la esquina que los de la izquierda (semáforos)"*). It was 15,
+/// further in. The pin and the arrows are placed from this one.
+inline constexpr int      GOLEM_CARD_RIGHT    = GOLEM_BUTTONS_LEFT;
 inline constexpr float    GOLEM_CARD_SIZE     = GOLEM_BUTTON_SIZE;
 inline constexpr int      GOLEM_CARD_MIN_BAR  = 150;
-inline constexpr float    GOLEM_CARD_ON_BG    = 0.45F; // the on button's disc, of the bar's ink (stronger: it was 0.24)
-inline constexpr float    GOLEM_CARD_ON_HOVER = 0.60F; // …under the hand
-inline constexpr float    GOLEM_CARD_OFF_INK  = 0.55F; // the resting glyph, of the bar's ink
-inline constexpr float    GOLEM_CARD_HOVER_BG = 0.14F; // the off button's disc under the hand, of the bar's ink
+inline constexpr float    GOLEM_CARD_OFF_INK  = 0.45F; // the glyph while the card is off: this much of the bar's ink (the arrows' grey); on, it is the whole ink
 /// The card button's left edge from the bar's left edge, at `scale` —
 /// `barWidth` in that SAME space (scaled for the draw, logical for the
 /// hit-test). Handing the draw a logical width put the button ~40% of the way
 /// in from the right at Golem's 1.6× (2026-10-08), away from its own hit zone.
 inline float golemCardX(double barWidth, float scale) {
     return static_cast<float>(barWidth) - (GOLEM_CARD_RIGHT + GOLEM_CARD_SIZE) * scale;
+}
+
+/// THE PIN BUTTON, left of the card button (Max, 2026-10-12: *"a new button.
+/// to the left of the card button, it "pin" the window, that means, the window
+/// stays alwaysontop, and always on the same position (follows me trought the
+/// Worspaces) it stays where it is and always ontop unless i move it manually
+/// or monimize it"*). It is the compositor's own pin: a pinned float is drawn
+/// above every other window and belongs to whichever workspace is showing.
+/// Minimizing a pinned window unpins it first (a pinned window cannot be
+/// parked on the special workspace the minimize uses), and it comes back
+/// unpinned. Drawn as the card button is: a glyph alone, grey off, the bar's
+/// full ink under the hand and while pinned. One button gap from the card
+/// button; a bar narrower than GOLEM_PIN_MIN_BAR has none.
+inline constexpr int GOLEM_PIN_MIN_BAR = 190;
+inline float golemPinX(double barWidth, float scale) {
+    return golemCardX(barWidth, scale) - (GOLEM_CARD_SIZE + GOLEM_BUTTON_PADDING) * scale;
+}
+
+/// BACK AND FORWARD, on the webapps only (Max, 2026-10-12: *"i want a back and
+/// a foward buttons on the titlebars only on the webapps"*). A webapp is a
+/// page with no browser around it (`webapp-<slug>`, Seam's Taskbar Tabs
+/// window), so the bar is the one place its history can be reached by hand.
+/// Two more spots after the three discs, one GOLEM_NAV_GAP further in so they
+/// read as their own pair. The chevron alone, big, and NOTHING behind it:
+/// grey at rest, the bar's full ink — black on a light bar, white on a dark
+/// one — under the hand (Max, 2026-10-12, after always-there discs and then
+/// hover discs: *"i dont like it, lets get rid of the hover circles, make
+/// the arrows grey and hover turn them on black or white depending on the
+/// title bar color"*). A press sends the window the browser's own keys
+/// (Alt+Left / Alt+Right). A bar narrower than GOLEM_NAV_MIN_BAR has none.
+inline constexpr int    GOLEM_NAV_GAP      = 8;
+inline constexpr int    GOLEM_NAV_MIN_BAR  = 240;
+inline constexpr double GOLEM_NAV_GLYPH    = 1.8;   // the chevron's pt, of the disc (1.3 → 1.8: *"still too small"*; 2.35, as tall as the discs, was tried and rolled back: *"i like it better as it was"*)
+inline constexpr float  GOLEM_NAV_REST_INK = 0.45F; // the resting chevron's grey: this much of the bar's ink
+/// The `i`th nav button's left edge (0 = back, 1 = forward; 2 = one past the
+/// pair, which is where the title's room starts), after `count` discs.
+inline float golemNavX(size_t count, int i, float scale) {
+    return golemButtonX(count + i, scale) + GOLEM_NAV_GAP * scale;
 }
 
 /// What a bar-local logical point is ON: a button (by index), one of the two
@@ -277,10 +318,10 @@ inline float golemCardX(double barWidth, float scale) {
 ///    safer miss;
 ///  · otherwise the button columns (`golemButtonColumn`), then the strip.
 struct SGolemBarZone {
-    enum eKind : uint8_t { NONE = 0, STRIP, BUTTON, CORNER_LEFT, CORNER_RIGHT, CARD } kind = NONE;
-    int button = -1; // for BUTTON
+    enum eKind : uint8_t { NONE = 0, STRIP, BUTTON, CORNER_LEFT, CORNER_RIGHT, CARD, NAV, PIN } kind = NONE;
+    int button = -1; // for BUTTON; for NAV, 0 = back, 1 = forward
 };
-inline SGolemBarZone golemBarZone(const Vector2D& p, size_t count, double barWidth, double barHeight, float border) {
+inline SGolemBarZone golemBarZone(const Vector2D& p, size_t count, double barWidth, double barHeight, float border, int navMask = 0) {
     if (p.x < 0 || p.y < 0 || p.x >= barWidth || p.y >= barHeight)
         return {};
     // The card button's disc (one px generous), ahead of the grip it shares
@@ -293,6 +334,13 @@ inline SGolemBarZone golemBarZone(const Vector2D& p, size_t count, double barWid
     }
     if (p.x >= barWidth - GOLEM_BAR_CORNER_GRAB)
         return {SGolemBarZone::CORNER_RIGHT, -1};
+    // The pin button: a full-height column, its glyph plus half the gap on
+    // either side.
+    if (barWidth >= GOLEM_PIN_MIN_BAR) {
+        const double x0 = golemPinX(barWidth, 1.F) - GOLEM_BUTTON_PADDING / 2.0;
+        if (p.x >= x0 && p.x < x0 + GOLEM_CARD_SIZE + GOLEM_BUTTON_PADDING)
+            return {SGolemBarZone::PIN, -1};
+    }
     const int col = golemButtonColumn(p, count, barHeight);
     if (col == 0 && p.x < GOLEM_BAR_CORNER_GRAB) {
         const double cx = golemButtonX(0, 1.F) + GOLEM_BUTTON_SIZE / 2.0, cy = golemButtonY(barHeight, border, GOLEM_BUTTON_SIZE) + GOLEM_BUTTON_SIZE / 2.0;
@@ -302,6 +350,19 @@ inline SGolemBarZone golemBarZone(const Vector2D& p, size_t count, double barWid
     }
     if (col >= 0)
         return {SGolemBarZone::BUTTON, col};
+    // Back and forward: full-height columns like the discs' own.
+    // (`navMask`: bit 0 back, bit 1 forward — only the ones showing; the
+    // other's spot is the strip's, and drags.)
+    if (navMask && barWidth >= GOLEM_NAV_MIN_BAR) {
+        const double half = GOLEM_BUTTON_PADDING / 2.0;
+        for (int i = 0; i < 2; ++i) {
+            if (!((navMask >> i) & 1))
+                continue;
+            const double x0 = golemNavX(count, i, 1.F) - half;
+            if (p.x >= x0 && p.x < x0 + GOLEM_BUTTON_SIZE + GOLEM_BUTTON_PADDING)
+                return {SGolemBarZone::NAV, i};
+        }
+    }
     return {SGolemBarZone::STRIP, -1};
 }
 
@@ -362,6 +423,11 @@ void golemBarCursorTimerDrop();
 /// windows whose surfaces committed since their bar last looked.
 void golemBarSampleTimerInit();
 void golemBarSampleTimerDrop();
+void golemNavWatchInit();
+void golemNavWatchDrop();
+void golemNavForget(PHLWINDOW w);
+void golemUnpin(PHLWINDOW w); // the minimize unpins first (main.cpp)
+void golemPin(PHLWINDOW w);   // …and the map pins back what it unpinned (main.cpp)
 
 /// The resize hand: while ANY resize drag runs — from the bar's corner grip
 /// or from a window edge — the pointer is the closed hand, held by the same
@@ -417,6 +483,8 @@ class CGolemBar : public IHyprWindowDecoration {
     /// The card is on (or off) for this window: the button's look. Told by
     /// waverunner, which owns the answer (`Bars::setCard`).
     void         setCard(bool on);
+    /// Seam said a webapp's history changed (see `navMask`).
+    void         navChanged();
     PHLWINDOW    window() { return m_pWindow.lock(); }
 
     WP<CGolemBar> m_self;
@@ -565,6 +633,16 @@ class CGolemBar : public IHyprWindowDecoration {
     /// The card button: on for this window, and under the pointer.
     bool         m_cardOn    = false;
     bool         m_cardHover = false;
+    bool         m_pinHover  = false; // the pin button, under the pointer (its state is the window's own `m_pinned`)
+    /// Back and forward (webapps only — `hasNav`): which one is under the
+    /// pointer (-1 = neither), and their glyphs in this bar's ink.
+    bool                 hasNav();
+    int                  navMask(); // which are showing: bit 0 back, bit 1 forward
+    int                  m_navHover = -1;
+    SP<Render::ITexture> m_navTex[2];
+    Vector2D             m_navInkOffset[2];
+    CHyprColor           m_navInk;
+    float                m_navScale = 0.F;
 
     size_t       getVisibleButtonCount(const Vector2D& bufferSize, const float scale);
 

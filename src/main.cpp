@@ -156,6 +156,7 @@ static CHyprSignalListener g_swipeEndListener;
 static CHyprSignalListener g_axisListener; // wheel while open scrolls the 3x6 grid (see onMouseAxis)
 static CHyprSignalListener g_windowOpenListener; // gives each new window its (floating-only) titlebar — see src/hyprbars/
 static CHyprSignalListener g_windowDestroyListener; // a window dying while MINIMIZED must leave the dock (see PLUGIN_INIT)
+static CHyprSignalListener g_windowPinListener;     // a pin from anywhere (the OPTIONS pin pill, a keybind) repaints the title bar's pushpin
 static CHyprSignalListener g_windowTitleListener;   // a title change repaints the bar in the tile (dirty-driven capture)
 // 🔬 THE SWIPE-BOUNCE HUNT (Max, 2026-09-26: *"i swipe, it shows the content of
 // the next WS but lands on this one"* — twice in one night, both right after
@@ -447,6 +448,7 @@ static LiveCommit      g_pending;       // last seen hover signature
 static Time::steady_tp g_pendingSince{};
 static int             g_origWS = -1;   // cancel restores these
 static Vector2D        g_origHome{};
+static Vector2D        g_origMonPos{};  // …and the origin of the monitor it stood on (see `seatAtOrigin`)
 static bool            g_origFloating = false; // float state at gesture start
 static uint32_t        g_dirtyTiles   = 0;     // tiles touched since the last full capture
 // The commit machinery warps the cursor (beginRealDrag / endRealDrag seed
@@ -3125,6 +3127,167 @@ static void checkFloatWatch() {
         g_watchWin.reset(); // clean for 3s = no leak this gesture
 }
 
+// A FLOATING window carried to another workspace stands THERE where it stood
+// HERE (Max, 2026-10-12: *"i want the windows to remember their position in
+// the other workspace and be on the new space on the same position… right
+// now… it just randomly fall into that new workspace"*) — but NOT YET while
+// the map is up (same day, of the first cut, which seated it at the drop:
+// *"viaja mucho… en overview: agarrarla, dejarla en otro WS, y que quede donde
+// la dejo, y cuando entro al WS la ventana esta en su lugar"*). So there are
+// two places:
+//  · ON THE MAP it lies where it was dropped — centred under the pointer,
+//    put there outright (`seatFloat` warps: a float sprung in from its old
+//    spot is the travel he was objecting to);
+//  · ITS OWN PLACE — where it stood when it was first picked up
+//    (`g_origHome`), carried over by the offset between the two monitors'
+//    origins — is owed (`g_seatLater`) and paid when the map closes
+//    (`seatOwed`, first thing in `startClose`), under the map and before the
+//    zoom, so the desktop he lands on already has it.
+// A float has no slot to be inserted into, which is why neither the split
+// insert the tiles use (`placeAt`) nor the pointer says where it belongs.
+// The debt is per window and keeps the FIRST origin: carried on from B to C
+// in the same visit to the map, it still goes to the place it had on A.
+// Dropped back on the workspace it came from, it owes nothing — there the
+// drop itself is the move.
+// NO WINDOW IS PINNED WHILE THE MAP IS UP (Max, 2026-10-13: *"disable pin
+// windows on overview, and pin them back when i close the overview"*). A
+// pinned window is on every workspace and drawn on the showing one, which on
+// a map of workspaces is a window that can be in two tiles at once and taken
+// to none. So the map unpins what it finds pinned as it opens — each stays on
+// the workspace it was showing on, an ordinary window to pick up and carry —
+// and pins the same windows back as it closes (`startClose`: under the map,
+// before the zoom), whichever workspace they were left on: pinned, they are
+// on the one being landed on, as they always are.
+static std::vector<PHLWINDOWREF> g_mapUnpinned;
+
+static void unpinForMap() {
+    for (auto& w : g_pCompositor->m_windows) {
+        if (!w || !w->m_isMapped || !w->m_pinned)
+            continue;
+        golemUnpin(w);
+        if (!w->m_pinned) {
+            g_mapUnpinned.emplace_back(w);
+            trace("map unpin ws=%d", (int)w->workspaceID());
+        }
+    }
+}
+
+// `photograph`: re-capture the tiles that changed (the close's own call);
+// false on the paths that are tearing the map down anyway.
+static void repinAfterMap(bool photograph) {
+    if (g_mapUnpinned.empty())
+        return;
+    uint32_t changed = 0;
+    for (auto& ref : g_mapUnpinned) {
+        const auto w = ref.lock();
+        if (!w || !w->m_isMapped || w->m_pinned || !w->m_isFloating || w->isFullscreen())
+            continue; // closed, tiled or made fullscreen meanwhile: it is no longer a window that can be pinned
+        const int was = waveview_tile_for_workspace(w->workspaceID());
+        golemPin(w);
+        const int now = waveview_tile_for_workspace(w->workspaceID());
+        trace("map repin ws=%d pinned=%d", (int)w->workspaceID(), (int)w->m_pinned);
+        for (const int t : {was, now})
+            if (t >= 0) {
+                changed |= 1u << t;
+                g_dirtyTiles |= 1u << t;
+            }
+    }
+    g_mapUnpinned.clear();
+    if (photograph && changed)
+        if (const auto m = g_captureMon.lock())
+            captureWorkspaces(m, changed);
+}
+
+struct SSeatLater {
+    PHLWINDOWREF win;
+    Vector2D     centre; // of the window's main surface, where it was first picked up
+    Vector2D     monPos; // that monitor's origin
+    int          ws = -1; // the workspace it was first picked up on
+};
+static std::vector<SSeatLater> g_seatLater;
+
+static SSeatLater* seatDebt(const PHLWINDOW& dw) {
+    for (auto& e : g_seatLater)
+        if (e.win.lock() == dw)
+            return &e;
+    return nullptr;
+}
+
+// Put a float's main surface centred on `centre`, outright (no spring).
+// False for anything it does not apply to: a tile, a fullscreen window, a
+// window outside the layout.
+static bool seatFloat(PHLWINDOW dw, const Vector2D& centre) {
+    if (!dw || !dw->m_isMapped || !dw->m_isFloating || dw->isFullscreen() || !inLayoutSpace(dw))
+        return false;
+    const SBusyScope busy;
+    const CBox       wb = dw->getWindowMainSurfaceBox();
+    g_layoutManager->setTargetGeom(CBox{centre.x - wb.w / 2.0, centre.y - wb.h / 2.0, wb.w, wb.h}, dw->layoutTarget());
+    dw->m_realPosition->warp();
+    dw->m_realSize->warp();
+    return true;
+}
+
+// Where a float let go with the pointer at `c` (draw space) on tile `t` is
+// seated: HELD BY THE POINT IT WAS GRABBED BY, as the ghost is. The ghost
+// hangs from the pointer at the grab's fraction of its box (`g_grabFracX/Y`),
+// so a window seated CENTRED under the pointer jumped by its distance from
+// that point the moment it was let go — nothing, grabbed by the middle; half
+// a window, grabbed by a corner.
+static Vector2D deskAt(PHLMONITOR m, const Rect& t, const Vector2D& c); // below, with the drop signatures
+//
+// …and kept ON the screen: a tile is a third of the desktop, so a pointer a
+// few pixels from its edge is a window half out of sight, and one dropped at
+// the top of a tile stood above the screen with nothing left to take it by
+// (2026-10-13: a picture-in-picture let go there landed at y = −144). The
+// whole window stays inside the usable area when it fits; its top-left
+// corner does when it does not.
+static Vector2D floatDropCentre(PHLMONITOR m, const Rect& t, const Vector2D& c, PHLWINDOW dw) {
+    const CBox    fb = dw->getWindowMainSurfaceBox();
+    const SUsable u  = usableArea(m);
+    Vector2D      tl = deskAt(m, t, c) - Vector2D{g_grabFracX * fb.w, g_grabFracY * fb.h};
+    double top = 0.0, side = 0.0;
+    cardExtents(dw, top, side); // its title bar stands above the surface box and must stay in reach too
+    tl.x = std::max(u.x + side, std::min(tl.x, u.x + u.w - fb.w - side));
+    tl.y = std::max(u.y + top, std::min(tl.y, u.y + u.h - fb.h - side));
+    return tl + Vector2D{fb.w / 2.0, fb.h / 2.0};
+}
+
+// The place the gesture's window had at its start (for a cancel).
+static bool seatAtOrigin(PHLWINDOW dw) {
+    if (!dw || !g_origFloating)
+        return false;
+    const auto     mon = dw->m_monitor.lock();
+    const Vector2D off = mon ? mon->m_position - g_origMonPos : Vector2D{};
+    return seatFloat(dw, g_origHome + off);
+}
+
+// Pay every debt: each float still away from the workspace it was first
+// picked up on goes to the place it had there. Called as the map starts to
+// close; re-photographs what moved so the zoom flies into the real desktop.
+static void seatOwed() {
+    if (g_seatLater.empty())
+        return;
+    uint32_t moved = 0;
+    for (auto& e : g_seatLater) {
+        const auto w = e.win.lock();
+        if (!w || !w->m_isMapped || w->workspaceID() == e.ws)
+            continue;
+        const auto     mon = w->m_monitor.lock();
+        const Vector2D to  = e.centre + (mon ? mon->m_position - e.monPos : Vector2D{});
+        if (!seatFloat(w, to))
+            continue;
+        trace("seat-owed ws=%d (from ws %d) centre=(%.0f,%.0f)", (int)w->workspaceID(), e.ws, to.x, to.y);
+        markDirty(w->workspaceID());
+        const int t = waveview_tile_for_workspace((int)w->workspaceID());
+        if (t >= 0)
+            moved |= 1u << t;
+    }
+    g_seatLater.clear();
+    if (moved)
+        if (const auto m = g_captureMon.lock())
+            captureWorkspaces(m, moved);
+}
+
 // A clean synthetic re-place: begin+end a whole drag around a KNOWN static
 // window state, splitting `under` at `desk` (dwindle insert). Used after a
 // cross-workspace move — running the positional insert while the original
@@ -3320,6 +3483,42 @@ static bool landAt(PHLMONITOR m, const Vector2D& c, PHLWINDOW dw, const LiveComm
           (int)dw->workspaceID(), desk.x, desk.y);
     markDirty(dw->workspaceID());
     g_dirtyTiles |= (1u << sig.tile);
+    // A FLOAT lies where it is dropped while the map is up, and owes its own
+    // place on any workspace but the one it was first picked up on — see
+    // `g_seatLater`. (Every landing on a tile comes through here: the live
+    // commit when the pointer dwells, each re-commit as it crosses onto
+    // another thumbnail, and the release itself.)
+    if (g_origFloating) {
+        const Vector2D here = floatDropCentre(m, tiles[sig.tile], c, dw);
+        const auto     debt = seatDebt(dw);
+        const int      from = debt ? debt->ws : g_origWS;
+        // A PINNED window is not given to a workspace: it is on all of
+        // them, and belongs to whichever is showing. Moved to another one it
+        // was on two at once — its own, and the showing one it is drawn on
+        // for being pinned (Max, 2026-10-13, of a picture-in-picture: *"is on
+        // the WS 5 and 6 at the same time"*). Dropped on any tile it only
+        // takes the place the pointer shows, and stays where it lives.
+        const bool pinned = dw->m_pinned;
+        if (pinned || dw->workspaceID() == sig.tile + 1)
+            endRealDrag(here, nullptr);
+        else {
+            endRealDrag(std::nullopt);
+            auto ws = g_pCompositor->getWorkspaceByID(sig.tile + 1);
+            if (!ws)
+                ws = g_pCompositor->createNewWorkspace(sig.tile + 1, m->m_id);
+            if (!ws)
+                return false;
+            g_pCompositor->moveWindowToWorkspaceSafe(dw, ws);
+            dw->m_alpha.warp(); // no arrival-fade blink in the captures
+        }
+        seatFloat(dw, here);
+        if (pinned || sig.tile + 1 == from)
+            std::erase_if(g_seatLater, [&](const SSeatLater& e) { return e.win.lock() == dw; });
+        else if (!debt)
+            g_seatLater.push_back(SSeatLater{dw, g_origHome, g_origMonPos, g_origWS});
+        trace("land float ws=%d at=(%.0f,%.0f) owes=%d", (int)dw->workspaceID(), here.x, here.y, (int)(sig.tile + 1 != from));
+        return true;
+    }
     if (dw->workspaceID() == sig.tile + 1)
         endRealDrag(desk, under);
     else {
@@ -3444,7 +3643,8 @@ static void restoreOriginal() {
         if (const auto ws = g_pCompositor->getWorkspaceByID(g_origWS)) {
             g_pCompositor->moveWindowToWorkspaceSafe(dw, ws);
             dw->m_alpha.warp(); // no arrival-fade blink in the captures
-            placeAt(dw, g_origHome, nullptr);
+            if (!seatAtOrigin(dw)) // a float goes back to its exact place
+                placeAt(dw, g_origHome, nullptr);
         }
     } else
         endRealDrag(g_origHome, nullptr);
@@ -3648,6 +3848,8 @@ static void updateHoverAt(PHLMONITOR m, const Vector2D& c) {
             g_origFloating   = dw->m_isFloating;
             const CBox wb    = dw->getWindowMainSurfaceBox();
             g_origHome       = {wb.x + wb.w / 2.0, wb.y + wb.h / 2.0};
+            const auto omon  = dw->m_monitor.lock();
+            g_origMonPos     = omon ? omon->m_position : Vector2D{};
             g_pending        = {};
             g_pendingSince   = Time::steadyNow();
             beginRealDrag(dw);
@@ -3944,6 +4146,27 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
         // (the cursor sits on the live hole, or on the committed target):
         // reveal the window in place — nothing to end, move, or fake.
         if (g_commit.active && (winAt(c).lock() == dw || sameCommit(signatureAt(m, c, dw), g_commit))) {
+            // A FLOAT is let go where the pointer IS, not where it was when
+            // the commit landed it. A tile's insert is fully said by its
+            // signature (which tile, under which window, which side), so the
+            // pointer wandering on within one signature changes nothing; a
+            // float's place IS the pointer, and the commit had seated it at
+            // the first point of the tile the pointer dwelt on. Carried on
+            // across the tile and let go, the ghost vanished there and the
+            // window appeared back where it had entered (Max, 2026-10-13:
+            // *"the windows jump a little when i drop them"*).
+            if (g_origFloating) {
+                Rect      tiles[N_TILES];
+                // (The tile it was let go on: for a pinned window that is not
+                // its workspace's — see `landAt`.)
+                const int t = g_commit.tile >= 0 ? g_commit.tile : waveview_tile_for_workspace(dw->workspaceID());
+                if (t >= 0 && computeTiles(m, tiles) == N_TILES && CBox{tiles[t].x, tiles[t].y, tiles[t].w, tiles[t].h}.containsPoint(c) &&
+                    seatFloat(dw, floatDropCentre(m, tiles[t], c, dw))) {
+                    markDirty(dw->workspaceID());
+                    boostCaptures();
+                    captureWorkspaces(m, g_dirtyTiles);
+                }
+            }
             // The one gesture end with NO net of its own (the commit's
             // endRealDrag already netted) — watch it extra closely.
             trace("release REVEAL ws=%d float=%d", (int)dw->workspaceID(), (int)dw->m_isFloating);
@@ -4073,14 +4296,22 @@ static void drawSpread(PHLMONITOR m, float p) {
     g_spreadWasSettled        = settled;
     bool       moving  = false;
 
-    // Two passes: everyone, then the picked card — it ends on top of the real
-    // stack, so it glides home on top of the cards too.
-    for (int pass = 0; pass < 2; ++pass) {
+    // In passes, bottom to top: everyone, then the picked card — it ends on
+    // top of the real stack, so it glides home on top of the cards too — and
+    // then the PINNED windows, above even that: on the desktop a pinned
+    // window is drawn over every other, focused or not, so a picked card
+    // gliding home over it was a card that the landing then put back UNDER
+    // it (Max, 2026-10-13: the focused window *"viene adelante"* and the
+    // pinned one *"salta adelante después… la ventana piñada siempre queda
+    // al frente, nunca pase adelante la enfocada"*). A pinned window that is
+    // itself the pick goes last of all.
+    const auto rankOf = [&](const PHLWINDOW& w) { return (w->m_pinned ? 2 : 0) + (pickW && w == pickW ? 1 : 0); };
+    for (int pass = 0; pass < 4; ++pass) {
         for (auto& sw : g_spreadWins) {
             const auto w = sw.win.lock();
             if (!w)
                 continue;
-            if ((pass == 1) != (pickW && w == pickW))
+            if (rankOf(w) != pass)
                 continue;
             const auto tex = sw.fb ? sw.fb->getTexture() : nullptr;
             if (!tex)
@@ -4392,6 +4623,7 @@ static void onRender(eRenderStage stage) {
             return;
         }
         trace("close DISENGAGE");
+        repinAfterMap(false); // a net: every close comes through `startClose`, which has done it
         g_ovPick.reset();
         g_ownedButtons.clear(); // a release still to come pairs with a press the compositor never saw: it drops it itself
         g_ownedKeys.clear();
@@ -4834,6 +5066,8 @@ static void beginStageCloseZoom() {
 // Call it with the pick's focus already applied: waverunner stages whatever the
 // map left focused.
 static void startClose() {
+    seatOwed(); // floats carried to another workspace take their own place now, under the map
+    repinAfterMap(true); // …and what the map unpinned is pinned again
     if (g_stageMode) {
         g_stageClosePending = true;
         g_stageCloseAt      = Time::steadyNow();
@@ -4941,6 +5175,7 @@ static void toggle() {
     g_animLastT  = Time::steadyNow();
     {
         g_active         = true;
+        unpinForMap(); // see `g_mapUnpinned`
         const auto m     = g_pCompositor->getMonitorFromCursor();
         const int  at    = waveview_tile_for_workspace(m ? m->activeWorkspaceID() : -1);
         g_zoomTile       = at >= 0 ? at : 0;
@@ -5968,6 +6203,9 @@ void golemMinimize(PHLWINDOW w) {
     for (const auto& r : g_minimized)
         if (r.addr == addr)
             return;
+    // A PINNED window cannot be parked (the compositor refuses to move one to
+    // a special workspace): the minimize unpins it, and it comes back unpinned.
+    golemUnpin(w);
     const std::string dir  = minThumbDir();
     mkdir(dir.c_str(), 0700);
     // Capture the dock thumbnail at the window's OWN aspect: blitAndRead
@@ -5984,6 +6222,7 @@ void golemMinimize(PHLWINDOW w) {
     const CBox to = dockTargetBox(m, aspect);
 
     const int64_t     ws  = w->workspaceID(); // the return ws (recorded pre-move)
+    const bool        hadFocus = Desktop::focusState()->window() == w; // …and whether the keyboard was on it
     const std::string cls = w->fetchClass();
 
     // PARK FIRST, then VERIFY — the dock tile is only committed once the
@@ -6007,6 +6246,41 @@ void golemMinimize(PHLWINDOW w) {
     // never a scratchpad the user opened.
     if (const auto sw = m->m_activeSpecialWorkspace; sw && sw->m_name == "special:minimized")
         m->setSpecialWorkspace(nullptr);
+    // THE LAST WINDOW OF ITS WORKSPACE takes nobody's place. The silent move
+    // hands the keyboard to another window of the workspace when there is
+    // one; when there is none it can leave it ON THE WINDOW JUST PARKED (it
+    // does whenever the pointer is on a layer — the bar's minimize pill, the
+    // dock — rather than over the bare desktop): typing went to a window in
+    // the dock, no focus event was sent, and the OPTIONS bar kept naming the
+    // window, its controls and all (Max, 2026-10-12: *"when i minimize all
+    // the windows on a WS the pills stay stuck on the last minimized one.
+    // they should disapear. (nothing focused"*). Nothing is focused then —
+    // said through the compositor, so the event goes out.
+    //
+    // …and "none" is decided HERE, not assumed: the same silent move that
+    // leaves the keyboard on the parked window does so whether or not the
+    // workspace has another window to take it. Clearing it outright blanked
+    // the bar with a window standing right there (Max, 2026-10-13, minimizing
+    // the window beside a picture-in-picture: *"the picture in picture does
+    // not gets focuces, the task pill hides"*). The successor is the window
+    // the workspace last had focused before this one, else its topmost.
+    // (Asked whenever the window had the keyboard and no OTHER window has it
+    // now: left on the parked one, or dropped altogether — which is what the
+    // compositor does when the only other window there is a pinned one.)
+    if (const auto f = Desktop::focusState()->window(); hadFocus && (!f || f == w)) {
+        PHLWINDOW  next;
+        const auto alive = [&](const PHLWINDOW& o) { return o && o != w && o->m_isMapped && !o->isHidden() && o->workspaceID() == ws; };
+        if (const auto wsp = g_pCompositor->getWorkspaceByID(ws)) {
+            if (const auto last = wsp->getLastFocusedWindow(); alive(last))
+                next = last;
+        }
+        if (!next)
+            for (auto& o : g_pCompositor->m_windows) // bottom to top: the last one standing is the topmost
+                if (alive(o))
+                    next = o;
+        trace("minimize: the keyboard had no window to go to (%s) -> %s", f ? "left on the parked one" : "dropped", next ? windowAddr(next).c_str() : "none");
+        Desktop::focusState()->fullWindowFocus(next, Desktop::FOCUS_REASON_DESKTOP_STATE_CHANGE);
+    }
 
     // The app's class rides along so the daemon can badge the tile with the
     // small app icon — resolved by class, like running apps match .desktop.
@@ -6482,6 +6756,19 @@ static int luaDebugState(lua_State*) {
           (int)g_swipeFired, (int)g_swipeFingers, g_minFlies.size(), g_minimized.size(), (int)g_freePending, (int)g_resizeDragSent,
           (int)(bool)g_captureMon.lock(), (int)(bool)dc->target(), (int)dc->mode(), foc ? windowAddr(foc).c_str() : "none",
           foc ? (int)foc->workspaceID() : 0);
+    // The map's tiles in GLOBAL LOGICAL coordinates (what `hl.dsp.cursor.move`
+    // takes), so a test can aim at a tile instead of guessing the grid.
+    if (const auto m = g_captureMon.lock()) {
+        Rect        tiles[N_TILES];
+        const int   n = computeTiles(m, tiles);
+        std::string out;
+        for (int i = 0; i < n && i < N_TILES; ++i) {
+            const Vector2D tl = drawSpaceToGlobal(m, Vector2D{tiles[i].x, tiles[i].y});
+            const Vector2D br = drawSpaceToGlobal(m, Vector2D{tiles[i].x + tiles[i].w, tiles[i].y + tiles[i].h});
+            out += std::format("{}:{:.0f},{:.0f},{:.0f},{:.0f} ", i + 1, tl.x, tl.y, br.x - tl.x, br.y - tl.y);
+        }
+        trace("STATE tiles: %s", out.c_str());
+    }
     trace("STATE bars: %s", Bars::debugState().c_str());
     trace("STATE keyboard: %s (focused window %s)", keyboardHolder().c_str(),
           Desktop::focusState()->window() ? windowAddr(Desktop::focusState()->window()).c_str() : "none");
@@ -6558,6 +6845,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     // this a reloaded plugin's card buttons all read "off".
     sendWaverunner("card bars\n");
     g_windowOpenListener = Event::bus()->m_events.window.open.listen([](PHLWINDOW w) {
+        golemNavForget(w); // a new webapp window starts with no arrows (golemBar.cpp)
         Bars::onWindowOpen(w);
         watchWindowCommits(w);
         if (w)
@@ -6565,6 +6853,12 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     });
     for (auto& w : g_pCompositor->m_windows) // the windows that were here before us
         watchWindowCommits(w);
+    g_windowPinListener = Event::bus()->m_events.window.pin.listen([](PHLWINDOW w) {
+        // The bar draws its pushpin from the window's own state, so all a
+        // pin from elsewhere needs is a repaint.
+        if (w)
+            g_pHyprRenderer->damageWindow(w);
+    });
     g_windowTitleListener = Event::bus()->m_events.window.title.listen([](PHLWINDOW w) {
         if (w)
             markDirty(w->workspaceID());
@@ -6603,7 +6897,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "1.97"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "2.17"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
@@ -6625,6 +6919,7 @@ APICALL EXPORT void PLUGIN_EXIT() {
     g_warpWin.reset();
     endWarpHide();
     g_active     = false;
+    repinAfterMap(false); // unloaded with the map up: nothing may stay unpinned behind us
     g_animTarget = 0.0f;
     g_landAnim   = 0.0f;
     g_closeLinger = 0;
@@ -6647,6 +6942,7 @@ APICALL EXPORT void PLUGIN_EXIT() {
     // flushed above.
     g_windowOpenListener.reset();
     g_windowDestroyListener.reset();
+    g_windowPinListener.reset();
     g_windowTitleListener.reset();
     g_commitListeners.clear();
     g_winSigs.clear();

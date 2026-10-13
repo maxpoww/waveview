@@ -39,6 +39,10 @@
 #include "bars.hpp"
 
 #include <chrono>
+#include <fstream>
+#include <sstream>
+#include <unordered_map>
+#include <sys/stat.h>
 #include <climits>
 #include <algorithm>
 #include <cmath>
@@ -940,8 +944,10 @@ CGolemBar::eBarHover CGolemBar::hoverZone() {
         return HOVER_NONE;
 
     // One map for the hand, the lift and the press — see `golemBarZone`.
-    switch (golemBarZone(COORDS, g_pBarsState->buttons.size(), assignedBoxGlobal().w, GOLEM_BAR_HEIGHT, borderBelow()).kind) {
+    switch (golemBarZone(COORDS, g_pBarsState->buttons.size(), assignedBoxGlobal().w, GOLEM_BAR_HEIGHT, borderBelow(), navMask()).kind) {
         case SGolemBarZone::BUTTON:
+        case SGolemBarZone::NAV:
+        case SGolemBarZone::PIN:
         case SGolemBarZone::CARD: return HOVER_BUTTON;
         case SGolemBarZone::CORNER_LEFT: return HOVER_CORNER_LEFT;
         case SGolemBarZone::CORNER_RIGHT: return HOVER_CORNER_RIGHT;
@@ -1078,7 +1084,7 @@ void CGolemBar::handleDownEvent(Event::SCallbackInfo& info, uint32_t button) {
 
     m_bDragPending      = true;
     {
-        const auto ZONE     = golemBarZone(COORDS, g_pBarsState->buttons.size(), assignedBoxGlobal().w, GOLEM_BAR_HEIGHT, borderBelow()).kind;
+        const auto ZONE     = golemBarZone(COORDS, g_pBarsState->buttons.size(), assignedBoxGlobal().w, GOLEM_BAR_HEIGHT, borderBelow(), navMask()).kind;
         m_bResizeFromCorner = ZONE == SGolemBarZone::CORNER_LEFT || ZONE == SGolemBarZone::CORNER_RIGHT;
     }
     // The hand closes ON THE PRESS, not when motion starts: taking hold is
@@ -1143,13 +1149,27 @@ void CGolemBar::handleMovement() {
 bool CGolemBar::doButtonPress(Vector2D COORDS) {
     // A press anywhere in a button's spot is that button's — the same spot
     // the hand and the hover lift answer to (`golemBarZone`).
-    const auto ZONE = golemBarZone(COORDS, g_pBarsState->buttons.size(), assignedBoxGlobal().w, GOLEM_BAR_HEIGHT, borderBelow());
+    const auto ZONE = golemBarZone(COORDS, g_pBarsState->buttons.size(), assignedBoxGlobal().w, GOLEM_BAR_HEIGHT, borderBelow(), navMask());
     const auto PWINDOW = m_pWindow.lock();
     // The card button: waverunner owns the card and which windows it is on
     // for; it answers with `hl.plugin.waveview.card(addr, on)`, which is what
     // turns the button orange (`Bars::setCard`).
     if (ZONE.kind == SGolemBarZone::CARD) {
         sendWaverunner(std::format("card toggle 0x{:x}\n", (uintptr_t)PWINDOW.get()));
+        return true;
+    }
+    // The pin button: the compositor's own pin, on THIS window (above every
+    // other window, and on whichever workspace is showing).
+    if (ZONE.kind == SGolemBarZone::PIN) {
+        Config::Actions::pinWindow(Config::Actions::TOGGLE_ACTION_TOGGLE, PWINDOW);
+        damageEntire();
+        return true;
+    }
+    // Back and forward: the browser's own keys, sent to THIS window (the
+    // compositor's key pass — press and release, the keyboard focus put back
+    // after). 113 / 114 = Left / Right as xkb keycodes.
+    if (ZONE.kind == SGolemBarZone::NAV) {
+        Config::Actions::pass(HL_MODIFIER_ALT, ZONE.button == 0 ? 113 : 114, PWINDOW);
         return true;
     }
     if (ZONE.kind != SGolemBarZone::BUTTON)
@@ -1193,7 +1213,9 @@ bool CGolemBar::doButtonPress(Vector2D COORDS) {
 /// the centre of the title is the centre of the BAR, not of the leftovers.
 void CGolemBar::renderBarTitle(const Vector2D& bufferSize, const float scale) {
     const int scaledSize = static_cast<int>(std::round(GOLEM_TITLE_SIZE * scale));
-    const int side       = static_cast<int>(std::round(std::max(golemButtonX(g_pBarsState->buttons.size(), scale), GOLEM_BAR_PADDING * scale)));
+    const bool nav       = hasNav() && bufferSize.x >= GOLEM_NAV_MIN_BAR * scale;
+    const auto rowEnd    = nav ? golemNavX(g_pBarsState->buttons.size(), 2, scale) : golemButtonX(g_pBarsState->buttons.size(), scale);
+    const int side       = static_cast<int>(std::round(std::max(rowEnd, GOLEM_BAR_PADDING * scale)));
     const int maxWidth   = static_cast<int>(bufferSize.x) - 2 * side;
 
     if (m_szLastTitle.empty() || maxWidth < 1) {
@@ -1232,6 +1254,127 @@ static CBox golemDiscBox(const CBox& barBox, size_t i, float border, float scale
     CBox       box = {barBox.x + golemButtonX(i, scale), barBox.y + golemButtonY(barBox.h, border * scale, scaledButtonSize), scaledButtonSize, scaledButtonSize};
     box.round();
     return box;
+}
+
+/// The `i`th nav button's box as drawn (0 = back, 1 = forward) — the discs'
+/// own size and line, rounded the same way.
+static CBox golemNavBox(const CBox& barBox, int i, float border, float scale) {
+    const auto size = GOLEM_BUTTON_SIZE * scale;
+    CBox       box  = {barBox.x + golemNavX(g_pBarsState->buttons.size(), i, scale), barBox.y + golemButtonY(barBox.h, border * scale, size), size, size};
+    box.round();
+    return box;
+}
+
+// Back and forward exist on a webapp's bar only: Seam gives each one the
+// class `webapp-<slug>` (the dock's launcher id).
+bool CGolemBar::hasNav() {
+    const auto W = m_pWindow.lock();
+    return W && (W->m_class.starts_with("webapp-") || W->m_initialClass.starts_with("webapp-"));
+}
+
+// ONLY WHEN THEY HAVE SOMEWHERE TO GO (Max, 2026-10-12: *"i want the arrows to
+// show up only when needed… when i open a webapp, there is no arrow, the back
+// arrow appears only when i moved foward, and the foward arrow appears only
+// after i went back"*). The bar cannot see a page's history; Seam can, and
+// says so in $XDG_RUNTIME_DIR/seam/nav — one line per webapp window,
+// `<slug> <can go back 0|1> <can go forward 0|1>`, rewritten (tmp + rename)
+// on every navigation (golem-chrome.js, WEBAPPS). A timer stats the file and
+// reads it again when it is a new one.
+//
+// No file at all is a Seam from before this (it never writes one): both
+// arrows then, as they were, rather than none for good. A file without the
+// window's slug is a webapp that has not reported yet: none.
+static std::unordered_map<std::string, int> g_navState; // slug → bit 0 back, bit 1 forward
+static bool                                 g_navFileSeen = false;
+static std::pair<ino_t, int64_t>            g_navFileId{0, 0};
+static SP<CEventLoopTimer>                  g_navWatchTimer;
+
+int CGolemBar::navMask() {
+    const auto W = m_pWindow.lock();
+    if (!W)
+        return 0;
+    const std::string& cls = W->m_class.starts_with("webapp-") ? W->m_class : W->m_initialClass;
+    if (!cls.starts_with("webapp-"))
+        return 0;
+    if (!g_navFileSeen)
+        return 3;
+    const auto it = g_navState.find(cls.substr(7));
+    return it == g_navState.end() ? 0 : it->second;
+}
+
+// A webapp window that has JUST OPENED knows nothing yet: what the file says
+// for its slug is the last window's history (Seam cannot rewrite the file
+// once its last window has closed), and a stale arrow would stand on the new
+// bar until the page's first report. Forgotten here, unless another window
+// of the same webapp is up; the report brings it back.
+void golemNavForget(PHLWINDOW w) {
+    if (!w)
+        return;
+    const std::string& cls = w->m_class.starts_with("webapp-") ? w->m_class : w->m_initialClass;
+    if (!cls.starts_with("webapp-"))
+        return;
+    for (auto& o : g_pCompositor->m_windows)
+        if (o && o != w && o->m_isMapped && (o->m_class == cls || o->m_initialClass == cls)) {
+            golemTrace(std::format("nav-forget {}: kept, another window {:x} mapped", cls, (uintptr_t)o.get()));
+            return;
+        }
+    golemTrace(std::format("nav-forget {}: erased {}", cls, g_navState.erase(cls.substr(7))));
+}
+
+void CGolemBar::navChanged() {
+    m_navHover = -1; // the next motion says which one is under the hand now
+    damageEntire();
+}
+
+static void navWatchTick() {
+    const char* rt = getenv("XDG_RUNTIME_DIR");
+    if (!rt)
+        return;
+    const std::string path = std::string(rt) + "/seam/nav";
+    struct stat       st{};
+    if (stat(path.c_str(), &st) != 0)
+        return; // none yet (or an older Seam): what was read last stands
+    const std::pair<ino_t, int64_t> id{st.st_ino, (int64_t)st.st_mtim.tv_sec * 1000000000LL + st.st_mtim.tv_nsec};
+    if (g_navFileSeen && id == g_navFileId)
+        return;
+    std::unordered_map<std::string, int> now;
+    std::ifstream                        f(path);
+    std::string                          line;
+    while (std::getline(f, line)) {
+        std::istringstream ls(line);
+        std::string        slug;
+        int                back = 0, fwd = 0;
+        if (ls >> slug >> back >> fwd)
+            now[slug] = (back ? 1 : 0) | (fwd ? 2 : 0);
+    }
+    const bool changed = !g_navFileSeen || now != g_navState;
+    g_navFileId   = id;
+    g_navFileSeen = true;
+    if (!changed)
+        return;
+    g_navState = std::move(now);
+    for (auto& b : g_pBarsState->bars)
+        if (b.valid())
+            b.get()->navChanged();
+}
+
+void golemNavWatchInit() {
+    g_navWatchTimer = makeShared<CEventLoopTimer>(
+        std::chrono::milliseconds(150),
+        [](SP<CEventLoopTimer> self, void*) {
+            if (g_barsShuttingDown || !g_pBarsState)
+                return;
+            navWatchTick();
+            self->updateTimeout(std::chrono::milliseconds(150));
+        },
+        nullptr);
+    g_pEventLoopManager->addTimer(g_navWatchTimer);
+}
+void golemNavWatchDrop() {
+    // The callback's code lives in this .so — same as the other timers.
+    if (g_navWatchTimer && g_pEventLoopManager)
+        g_pEventLoopManager->removeTimer(g_navWatchTimer);
+    g_navWatchTimer.reset();
 }
 
 void CGolemBar::renderBarButtons(CBox* barBox, const float scale, const float a) {
@@ -1310,24 +1453,16 @@ void CGolemBar::renderBarButtons(CBox* barBox, const float scale, const float a)
     const auto scaledSize = GOLEM_CARD_SIZE * scale;
     CBox       box = {barBox->x + golemCardX(barBox->w, scale), barBox->y + golemButtonY(barBox->h, BORDER * scale, scaledSize), scaledSize, scaledSize};
     box.round();
-    // ON, IT IS GREY (Max, 2026-10-12: *"lets keep the button toggled on
-    // grey"* — it was orange, then for an hour the window's accent): a disc
-    // of the bar's own ink, faint, a little stronger under the hand; its
-    // glyph in that ink, whole. Off: only the glyph, dimmer, and the faint
-    // disc under the hand alone.
-    CHyprColor disc = m_lastInk;
-    CHyprColor ink  = m_lastInk;
-    if (m_cardOn) {
-        disc.a = m_cardHover ? GOLEM_CARD_ON_HOVER : GOLEM_CARD_ON_BG;
-        ink.a  = 1.F;
-    } else {
-        disc.a = m_cardHover ? GOLEM_CARD_HOVER_BG : 0.F;
-        ink.a  = m_cardHover ? 1.F : GOLEM_CARD_OFF_INK;
-    }
-    disc.a *= a;
-    ink.a *= a;
-    if (disc.a > 0.F)
-        g_pHyprOpenGL->renderRect(box, disc, {.round = static_cast<int>(std::ceil(box.w / 2.0)), .roundingPower = 2.F});
+    // THE GLYPH ALONE, like the webapps' arrows: grey while the card is off,
+    // the bar's full ink — black on a light bar, white on a dark one — while
+    // it is on, and no disc behind it, under the hand or not (Max,
+    // 2026-10-12: *"do the same with the card button… get rid of the hover
+    // circle, make it grey and black/white when clicled (toggled)"*; it had
+    // been an orange disc, the window's accent, then a grey disc when on).
+    // The hand lights it the same way, and the click is what makes it stay
+    // (*"hover should turn it black/white, clicking make it stay like that"*).
+    CHyprColor ink = m_lastInk;
+    ink.a          = (m_cardOn || m_cardHover ? 1.F : GOLEM_CARD_OFF_INK) * a;
     // The glyph: A WINDOW WITH ITS SIDE PANEL — a frame whose right part is
     // filled, where the card stands on the window (Max, 2026-10-12: *"i
     // dont like that symbol"* of the frame with two dividers). Drawn — whole
@@ -1341,14 +1476,50 @@ void CGolemBar::renderBarButtons(CBox* barBox, const float scale, const float a)
         gh += 1.0;
     const double stroke = std::max(1.0, std::round(GOLEM_GLYPH_STROKE * scale));
     const double gx = box.x + (w - gw) / 2.0, gy = box.y + (w - gh) / 2.0;
-    // Four sides, then the panel: nothing has to be cut back out in the
-    // disc's colour (off, there is no disc to cut with).
+    // Four sides, then the panel: strokes and a fill, nothing cut back out
+    // (there is no disc to cut with).
     g_pHyprOpenGL->renderRect(CBox{gx, gy, gw, stroke}, ink, {});
     g_pHyprOpenGL->renderRect(CBox{gx, gy + gh - stroke, gw, stroke}, ink, {});
     g_pHyprOpenGL->renderRect(CBox{gx, gy + stroke, stroke, gh - 2.0 * stroke}, ink, {});
     g_pHyprOpenGL->renderRect(CBox{gx + gw - stroke, gy + stroke, stroke, gh - 2.0 * stroke}, ink, {});
     const double panel = std::max(stroke + 1.0, std::round(gw * 0.40));
     g_pHyprOpenGL->renderRect(CBox{gx + gw - panel, gy + stroke, panel - stroke, gh - 2.0 * stroke}, ink, {});
+
+    // The pin button, one spot further in (see GOLEM_PIN_MIN_BAR): the same
+    // conduct — grey, the bar's full ink under the hand and while the window
+    // is pinned. Its glyph is a PUSHPIN standing up: cap, body, flange,
+    // needle — four rectangles on one axis, each of the box's parity so the
+    // axis is the box's centre to the pixel.
+    if (barBox->w < GOLEM_PIN_MIN_BAR * scale)
+        return;
+    CBox pbox = {barBox->x + golemPinX(barBox->w, scale), barBox->y + golemButtonY(barBox->h, BORDER * scale, scaledSize), scaledSize, scaledSize};
+    pbox.round();
+    const auto PWINDOW = m_pWindow.lock();
+    CHyprColor pink    = m_lastInk;
+    pink.a             = ((PWINDOW && PWINDOW->m_pinned) || m_pinHover ? 1.F : GOLEM_CARD_OFF_INK) * a;
+    const double pw    = pbox.w;
+    const auto   even  = [pw](double v) { return std::fmod(v, 2.0) != std::fmod(pw, 2.0) ? v + 1.0 : v; };
+    const double capW = even(std::round(pw * 0.38)), bodyW = even(std::round(pw * 0.23)), flangeW = even(std::round(pw * 0.54)), needleW = even(stroke);
+    const double capH = std::max(1.0, std::round(pw * 0.115)), bodyH = std::round(pw * 0.23), needleH = std::round(pw * 0.23);
+    const double cx   = pbox.x + pw / 2.0;
+    double       y    = pbox.y + std::round((pw - (2.0 * capH + bodyH + needleH)) / 2.0);
+    g_pHyprOpenGL->renderRect(CBox{cx - capW / 2.0, y, capW, capH}, pink, {});
+    y += capH;
+    g_pHyprOpenGL->renderRect(CBox{cx - bodyW / 2.0, y, bodyW, bodyH}, pink, {});
+    y += bodyH;
+    g_pHyprOpenGL->renderRect(CBox{cx - flangeW / 2.0, y, flangeW, capH}, pink, {});
+    y += capH;
+    g_pHyprOpenGL->renderRect(CBox{cx - needleW / 2.0, y, needleW, needleH}, pink, {});
+}
+
+void golemUnpin(PHLWINDOW w) {
+    if (w && w->m_pinned)
+        Config::Actions::pinWindow(Config::Actions::TOGGLE_ACTION_DISABLE, w);
+}
+
+void golemPin(PHLWINDOW w) {
+    if (w && !w->m_pinned)
+        Config::Actions::pinWindow(Config::Actions::TOGGLE_ACTION_ENABLE, w);
 }
 
 void CGolemBar::setCard(bool on) {
@@ -1439,6 +1610,33 @@ void CGolemBar::renderBarButtonsText(CBox* barBox, const float scale, const floa
         // strength (Max, 2026-09-25: *"the title bars buttons should not be
         // dimmed"*), same rule as their opacity above.
         g_pHyprOpenGL->renderTexture(button.iconTex, pos, {.a = a, .allowDim = false});
+    }
+
+    // Back and forward (webapps): chevrons in the bar's own ink — grey at rest
+    // (GOLEM_NAV_REST_INK), the full ink under the hand, nothing behind them —
+    // re-rendered when the ink flips or the scale changes, centred by their
+    // ink like the ×.
+    if (!hasNav() || barBox->w < GOLEM_NAV_MIN_BAR * scale)
+        return;
+    if (m_navInk != m_lastInk || m_navScale != scale || !m_navTex[0] || m_navTex[0]->m_texID == 0) {
+        static const char* const GLYPHS[2] = {"‹", "›"};
+        for (int i = 0; i < 2; ++i) {
+            m_navTex[i]       = g_pHyprRenderer->renderText(GLYPHS[i], m_lastInk, std::round(GOLEM_BUTTON_SIZE * GOLEM_NAV_GLYPH * scale), false, GOLEM_BAR_FONT, 0);
+            m_navInkOffset[i] = {};
+            measureInkOffset(m_navTex[i], m_navInkOffset[i]);
+        }
+        m_navInk   = m_lastInk;
+        m_navScale = scale;
+    }
+    const int MASK = navMask();
+    for (int i = 0; i < 2; ++i) {
+        const auto& tex = m_navTex[i];
+        if (!tex || tex->m_texID == 0 || !((MASK >> i) & 1))
+            continue;
+        const CBox box = golemNavBox(*barBox, i, BORDER, scale);
+        CBox       pos = {std::round(box.x + box.w / 2.0 - tex->m_size.x / 2.0 - m_navInkOffset[i].x), std::round(box.y + box.h / 2.0 - tex->m_size.y / 2.0 - m_navInkOffset[i].y),
+                          tex->m_size.x, tex->m_size.y};
+        g_pHyprOpenGL->renderTexture(tex, pos, {.a = a * (m_navHover == i ? 1.F : GOLEM_NAV_REST_INK), .allowDim = false});
     }
 }
 
@@ -1819,18 +2017,25 @@ void CGolemBar::damageOnButtonHover() {
     // Hidden or unhoverable, nothing may stay lit.
     unsigned int mask = 0;
     bool         card = false;
+    bool         pin  = false;
+    int          nav  = -1;
     if (!m_hidden && inputIsValid()) {
         const auto COORDS = cursorRelativeToBar();
         // The whole column lights its disc (`golemButtonColumn`), so the lift
         // answers the hand as it arrives, not only once it is on the disc.
-        const auto ZONE = golemBarZone(COORDS, g_pBarsState->buttons.size(), assignedBoxGlobal().w, GOLEM_BAR_HEIGHT, borderBelow());
+        const auto ZONE = golemBarZone(COORDS, g_pBarsState->buttons.size(), assignedBoxGlobal().w, GOLEM_BAR_HEIGHT, borderBelow(), navMask());
         if (ZONE.kind == SGolemBarZone::BUTTON)
             mask = 1u << ZONE.button;
         card = ZONE.kind == SGolemBarZone::CARD;
+        pin  = ZONE.kind == SGolemBarZone::PIN;
+        if (ZONE.kind == SGolemBarZone::NAV)
+            nav = ZONE.button;
     }
-    if (mask != m_iButtonHoverState || card != m_cardHover) {
+    if (mask != m_iButtonHoverState || card != m_cardHover || nav != m_navHover || pin != m_pinHover) {
         m_iButtonHoverState = mask;
         m_cardHover         = card;
+        m_pinHover          = pin;
+        m_navHover          = nav;
         damageEntire();
     }
 }
