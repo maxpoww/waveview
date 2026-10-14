@@ -6768,6 +6768,37 @@ static int luaMoveSnapped(lua_State* L) {
     return 2;
 }
 
+// `hl.plugin.waveview.resize_snapped("0x…", x, y, w, h)` — set a floating
+// window's box (global logical px) THROUGH THE COMPOSITOR'S OWN SNAP, as a
+// border resize does (DragController: clamp to the window's limits,
+// `performSnap` in resize mode, clamp again, set, warp). The dock's pinch
+// grows a window about its centre, so all four corners are moving and each
+// edge may stick (Max, 2026-10-14: "make pinch resize snap like the border
+// resize").
+static int luaResizeSnapped(lua_State* L) {
+    const char* a = lua_tostring(L, 1);
+    const auto  w = a && *a ? windowByAddr(a) : nullptr;
+    const auto  t = w && w->m_isMapped ? w->layoutTarget() : nullptr;
+    if (!t)
+        return 0;
+    static auto    SNAPENABLED = CConfigValue<Config::INTEGER>("general:snap:enabled");
+    const Vector2D MINSIZE     = t->minSize().value_or(Vector2D{MIN_WINDOW_SIZE, MIN_WINDOW_SIZE});
+    const Vector2D MAXSIZE     = t->maxSize().value_or(Math::VECTOR2D_MAX);
+    const Vector2D begin       = t->position().size();
+    Vector2D       newSize     = Vector2D{lua_tonumber(L, 4), lua_tonumber(L, 5)}.clamp(MINSIZE, MAXSIZE);
+    // Centred on what was asked, whatever size the limits allowed.
+    Vector2D newPos = Vector2D{lua_tonumber(L, 2), lua_tonumber(L, 3)} + (Vector2D{lua_tonumber(L, 4), lua_tonumber(L, 5)} - newSize) / 2.0;
+    if (*SNAPENABLED && w->m_isFloating) {
+        g_layoutManager->performSnap(newPos, newSize, t, MBIND_RESIZE, CORNER_TOPLEFT | CORNER_TOPRIGHT | CORNER_BOTTOMLEFT | CORNER_BOTTOMRIGHT, begin);
+        newSize = newSize.clamp(MINSIZE, MAXSIZE);
+    }
+    CBox wb = {newPos, newSize};
+    wb.round();
+    t->setPositionGlobal(wb);
+    t->warpPositionSize();
+    return 0;
+}
+
 // `hl.plugin.waveview.debug_state()` — every sticky flag, to the trace. For the
 // moment something feels stuck (a swipe that bounces back, a pointer that stays
 // hidden): dump it BEFORE reloading — a reload throws the evidence away (the
@@ -6851,6 +6882,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     HyprlandAPI::addLuaFunction(handle, "waveview", "debug_state", luaDebugState);
     HyprlandAPI::addLuaFunction(handle, "waveview", "kb_focus", luaKbFocus);
     HyprlandAPI::addLuaFunction(handle, "waveview", "move_snapped", luaMoveSnapped);
+    HyprlandAPI::addLuaFunction(handle, "waveview", "resize_snapped", luaResizeSnapped);
     HyprlandAPI::addLuaFunction(handle, "waveview", "spread", luaSpread);
     HyprlandAPI::addLuaFunction(handle, "waveview", "cycle", luaCycle);
     HyprlandAPI::addLuaFunction(handle, "waveview", "minimize", luaMinimize);
@@ -6929,7 +6961,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "2.20"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "2.21"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
