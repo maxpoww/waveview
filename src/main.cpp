@@ -6737,6 +6737,37 @@ static int luaKbFocus(lua_State* L) {
     return 0;
 }
 
+// `hl.plugin.waveview.move_snapped("0x…", x, y)` — move a floating window to
+// (x, y) (its box's top-left, global logical px) THROUGH THE COMPOSITOR'S OWN
+// SNAP, exactly as a pointer drag of its title bar does (DragController: the
+// new position, `performSnap`, set, warp). The dock's pill drags the window by
+// steps of its own; with a snap of its own it was not the same magnetism —
+// 24 px, screen edges only, the title bar tucked under the top bar (Max,
+// 2026-10-14: "it is not the same when i drag a window from the pill than
+// from the titlebar"). Returns the position it landed on.
+static int luaMoveSnapped(lua_State* L) {
+    const char* a = lua_tostring(L, 1);
+    const double x = luaL_checknumber(L, 2);
+    const double y = luaL_checknumber(L, 3);
+    const auto w = a && *a ? windowByAddr(a) : nullptr;
+    const auto t = w && w->m_isMapped ? w->layoutTarget() : nullptr;
+    if (!t) {
+        lua_pushnil(L);
+        return 1;
+    }
+    static auto SNAPENABLED = CConfigValue<Config::INTEGER>("general:snap:enabled");
+    Vector2D    newPos{x, y};
+    Vector2D    newSize = t->position().size();
+    if (*SNAPENABLED && w->m_isFloating)
+        g_layoutManager->performSnap(newPos, newSize, t, MBIND_MOVE, -1, newSize);
+    newPos = newPos.round();
+    t->setPositionGlobal({newPos, newSize});
+    t->warpPositionSize();
+    lua_pushnumber(L, newPos.x);
+    lua_pushnumber(L, newPos.y);
+    return 2;
+}
+
 // `hl.plugin.waveview.debug_state()` — every sticky flag, to the trace. For the
 // moment something feels stuck (a swipe that bounces back, a pointer that stays
 // hidden): dump it BEFORE reloading — a reload throws the evidence away (the
@@ -6819,6 +6850,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     HyprlandAPI::addLuaFunction(handle, "waveview", "recapture", luaRecapture);
     HyprlandAPI::addLuaFunction(handle, "waveview", "debug_state", luaDebugState);
     HyprlandAPI::addLuaFunction(handle, "waveview", "kb_focus", luaKbFocus);
+    HyprlandAPI::addLuaFunction(handle, "waveview", "move_snapped", luaMoveSnapped);
     HyprlandAPI::addLuaFunction(handle, "waveview", "spread", luaSpread);
     HyprlandAPI::addLuaFunction(handle, "waveview", "cycle", luaCycle);
     HyprlandAPI::addLuaFunction(handle, "waveview", "minimize", luaMinimize);
@@ -6897,7 +6929,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "2.19"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "2.20"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
