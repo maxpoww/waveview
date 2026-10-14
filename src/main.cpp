@@ -6747,8 +6747,8 @@ static int luaKbFocus(lua_State* L) {
 // from the titlebar"). Returns the position it landed on.
 static int luaMoveSnapped(lua_State* L) {
     const char* a = lua_tostring(L, 1);
-    const double x = luaL_checknumber(L, 2);
-    const double y = luaL_checknumber(L, 3);
+    const double x = lua_tonumber(L, 2);
+    const double y = lua_tonumber(L, 3);
     const auto w = a && *a ? windowByAddr(a) : nullptr;
     const auto t = w && w->m_isMapped ? w->layoutTarget() : nullptr;
     if (!t) {
