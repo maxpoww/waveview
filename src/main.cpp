@@ -6789,7 +6789,7 @@ static int luaResizeSnapped(lua_State* L) {
     // Centred on what was asked, whatever size the limits allowed.
     Vector2D newPos = Vector2D{lua_tonumber(L, 2), lua_tonumber(L, 3)} + (Vector2D{lua_tonumber(L, 4), lua_tonumber(L, 5)} - newSize) / 2.0;
     if (*SNAPENABLED && w->m_isFloating) {
-        g_layoutManager->performSnap(newPos, newSize, t, MBIND_RESIZE, CORNER_TOPLEFT | CORNER_TOPRIGHT | CORNER_BOTTOMLEFT | CORNER_BOTTOMRIGHT, begin);
+        g_layoutManager->performSnap(newPos, newSize, t, MBIND_RESIZE, Layout::CORNER_TOPLEFT | Layout::CORNER_TOPRIGHT | Layout::CORNER_BOTTOMLEFT | Layout::CORNER_BOTTOMRIGHT, begin);
         newSize = newSize.clamp(MINSIZE, MAXSIZE);
     }
     CBox wb = {newPos, newSize};
