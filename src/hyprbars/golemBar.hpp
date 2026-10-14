@@ -287,7 +287,7 @@ inline float golemPinX(double barWidth, float scale) {
 /// a foward buttons on the titlebars only on the webapps"*). A webapp is a
 /// page with no browser around it (`webapp-<slug>`, Seam's Taskbar Tabs
 /// window), so the bar is the one place its history can be reached by hand.
-/// Two more spots after the three discs, one GOLEM_NAV_GAP further in so they
+/// Two more spots after the three discs, GOLEM_NAV_LEAD further in so they
 /// read as their own pair. The chevron alone, big, and NOTHING behind it:
 /// grey at rest, the bar's full ink — black on a light bar, white on a dark
 /// one — under the hand (Max, 2026-10-12, after always-there discs and then
@@ -295,14 +295,34 @@ inline float golemPinX(double barWidth, float scale) {
 /// the arrows grey and hover turn them on black or white depending on the
 /// title bar color"*). A press sends the window the browser's own keys
 /// (Alt+Left / Alt+Right). A bar narrower than GOLEM_NAV_MIN_BAR has none.
-inline constexpr int    GOLEM_NAV_GAP      = 8;
-inline constexpr int    GOLEM_NAV_MIN_BAR  = 240;
-inline constexpr double GOLEM_NAV_GLYPH    = 1.8;   // the chevron's pt, of the disc (1.3 → 1.8: *"still too small"*; 2.35, as tall as the discs, was tried and rolled back: *"i like it better as it was"*)
-inline constexpr float  GOLEM_NAV_REST_INK = 0.45F; // the resting chevron's grey: this much of the bar's ink
-/// The `i`th nav button's left edge (0 = back, 1 = forward; 2 = one past the
+///
+/// SEAM'S OWN BUTTONS (Max, 2026-10-14: *"los quiero fijos, que estén grises
+/// cuando no se pueden usar, y el icono que sea el mismo que usa SEAM… idénticos
+/// en look and feel a los botones de atrás y adelante de SEAM"*), replacing the
+/// chevrons that came and went with the history. Both are ALWAYS there; one
+/// with nowhere to go is Seam's disabled button — its arrow at 0.4 of the ink,
+/// no hover, a press does nothing. The arrow is Firefox's Proton back.svg
+/// (`golemNavArrow`), 16 px as in Seam's toolbar; under the hand the square of
+/// Seam's toolbar buttons comes up behind it — the ink at 17 %, 30 % while
+/// pressed — and the button acts on the RELEASE, over itself, as Seam's does.
+/// Seam's square is 28 px with 8 px corners on a 40 px toolbar; the bar is 25,
+/// so the square is GOLEM_NAV_BOX with the same share of corner.
+inline constexpr int    GOLEM_NAV_MIN_BAR       = 240;
+inline constexpr float  GOLEM_NAV_ICON          = 16.F;  // Seam's toolbar icon
+inline constexpr float  GOLEM_NAV_BOX           = 22.F;  // the hover square
+inline constexpr float  GOLEM_NAV_RADIUS        = 6.F;   // 8 of 28, at 22
+inline constexpr float  GOLEM_NAV_SPACE         = 3.F;   // between the two squares
+inline constexpr float  GOLEM_NAV_LEAD          = 10.F;  // from the last disc's edge to the first square
+inline constexpr float  GOLEM_NAV_DISABLED      = 0.4F;  // --toolbarbutton-opacity-disabled
+inline constexpr float  GOLEM_NAV_HOVER_FILL    = 0.17F; // --toolbarbutton-background-color-hover
+inline constexpr float  GOLEM_NAV_ACTIVE_FILL   = 0.30F; // --toolbarbutton-background-color-active
+/// `navMask` bit saying the window HAS the pair (bits 0 and 1 say which of
+/// them can be used).
+inline constexpr int    GOLEM_NAV_SHOWN = 4;
+/// The `i`th nav square's left edge (0 = back, 1 = forward; 2 = one past the
 /// pair, which is where the title's room starts), after `count` discs.
 inline float golemNavX(size_t count, int i, float scale) {
-    return golemButtonX(count + i, scale) + GOLEM_NAV_GAP * scale;
+    return (golemButtonX(count, 1.F) - GOLEM_BUTTON_PADDING + GOLEM_NAV_LEAD + i * (GOLEM_NAV_BOX + GOLEM_NAV_SPACE)) * scale;
 }
 
 /// What a bar-local logical point is ON: a button (by index), one of the two
@@ -350,16 +370,14 @@ inline SGolemBarZone golemBarZone(const Vector2D& p, size_t count, double barWid
     }
     if (col >= 0)
         return {SGolemBarZone::BUTTON, col};
-    // Back and forward: full-height columns like the discs' own.
-    // (`navMask`: bit 0 back, bit 1 forward — only the ones showing; the
-    // other's spot is the strip's, and drags.)
-    if (navMask && barWidth >= GOLEM_NAV_MIN_BAR) {
-        const double half = GOLEM_BUTTON_PADDING / 2.0;
+    // Back and forward: full-height columns, the square plus half the space
+    // on either side — BOTH whenever the window has them (`GOLEM_NAV_SHOWN`),
+    // a disabled one included: its spot is a dead button, not the strip.
+    if ((navMask & GOLEM_NAV_SHOWN) && barWidth >= GOLEM_NAV_MIN_BAR) {
+        const double half = GOLEM_NAV_SPACE / 2.0;
         for (int i = 0; i < 2; ++i) {
-            if (!((navMask >> i) & 1))
-                continue;
             const double x0 = golemNavX(count, i, 1.F) - half;
-            if (p.x >= x0 && p.x < x0 + GOLEM_BUTTON_SIZE + GOLEM_BUTTON_PADDING)
+            if (p.x >= x0 && p.x < x0 + GOLEM_NAV_BOX + GOLEM_NAV_SPACE)
                 return {SGolemBarZone::NAV, i};
         }
     }
@@ -588,6 +606,7 @@ class CGolemBar : public IHyprWindowDecoration {
         HOVER_BUTTON,
         HOVER_CORNER_LEFT,  // the top-left resize grip (GOLEM_BAR_CORNER_GRAB, minus the red disc)
         HOVER_CORNER_RIGHT, // the top-right resize grip
+        HOVER_DEAD,         // a back/forward with nowhere to go: the plain arrow, as on Seam's disabled button
     };
     eBarHover hoverZone();
 
@@ -637,10 +656,10 @@ class CGolemBar : public IHyprWindowDecoration {
     /// Back and forward (webapps only — `hasNav`): which one is under the
     /// pointer (-1 = neither), and their glyphs in this bar's ink.
     bool                 hasNav();
-    int                  navMask(); // which are showing: bit 0 back, bit 1 forward
+    int                  navMask(); // bit 0 back, bit 1 forward can be used; GOLEM_NAV_SHOWN the pair is there
+    int                  m_navDown = -1; // the nav button held down (it acts on the release over itself)
     int                  m_navHover = -1;
     SP<Render::ITexture> m_navTex[2];
-    Vector2D             m_navInkOffset[2];
     CHyprColor           m_navInk;
     float                m_navScale = 0.F;
 

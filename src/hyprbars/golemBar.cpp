@@ -23,6 +23,7 @@
 #include <hyprland/src/managers/input/InputManager.hpp>
 #include <hyprland/src/managers/KeybindManager.hpp>
 #include <hyprland/src/render/Renderer.hpp>
+#include <cairo/cairo.h>
 #include <hyprland/src/config/ConfigManager.hpp>
 #include <hyprland/src/config/shared/animation/AnimationTree.hpp>
 #include <hyprland/src/config/shared/actions/ConfigActions.hpp>
@@ -944,7 +945,11 @@ CGolemBar::eBarHover CGolemBar::hoverZone() {
         return HOVER_NONE;
 
     // One map for the hand, the lift and the press — see `golemBarZone`.
-    switch (golemBarZone(COORDS, g_pBarsState->buttons.size(), assignedBoxGlobal().w, GOLEM_BAR_HEIGHT, borderBelow(), navMask()).kind) {
+    const int  NAVMASK = navMask();
+    const auto HOVER   = golemBarZone(COORDS, g_pBarsState->buttons.size(), assignedBoxGlobal().w, GOLEM_BAR_HEIGHT, borderBelow(), NAVMASK);
+    if (HOVER.kind == SGolemBarZone::NAV && !((NAVMASK >> HOVER.button) & 1))
+        return HOVER_DEAD;
+    switch (HOVER.kind) {
         case SGolemBarZone::BUTTON:
         case SGolemBarZone::NAV:
         case SGolemBarZone::PIN:
@@ -1005,6 +1010,10 @@ void CGolemBar::onMouseMove(Vector2D coords) {
             case HOVER_CORNER_RIGHT:
                 g_barCursorOwner = this;
                 setBarCursor("ne-resize");
+                break;
+            case HOVER_DEAD:
+                g_barCursorOwner = this;
+                setBarCursor("default");
                 break;
             case HOVER_NONE:
                 if (g_barCursorOwner == this) {
@@ -1108,6 +1117,20 @@ void CGolemBar::handleUpEvent(Event::SCallbackInfo& info, uint32_t button, bool 
     info.cancelled   = true;
     m_bCancelledDown = false;
 
+    // A back/forward held down acts if let go over itself, and only if it can
+    // still go there: the browser's own keys, sent to THIS window (the
+    // compositor's key pass — press and release, the keyboard focus put back
+    // after). 113 / 114 = Left / Right as xkb keycodes.
+    if (m_navDown >= 0) {
+        const int DOWN = m_navDown;
+        m_navDown      = -1;
+        damageEntire();
+        const int  MASK = navMask();
+        const auto ZONE = golemBarZone(cursorRelativeToBar(), g_pBarsState->buttons.size(), assignedBoxGlobal().w, GOLEM_BAR_HEIGHT, borderBelow(), MASK);
+        if (const auto PWINDOW = m_pWindow.lock(); valid && PWINDOW && ZONE.kind == SGolemBarZone::NAV && ZONE.button == DOWN && ((MASK >> DOWN) & 1))
+            Config::Actions::pass(HL_MODIFIER_ALT, DOWN == 0 ? 113 : 114, PWINDOW);
+    }
+
     if (m_bDraggingThis) {
         g_pKeybindManager->changeMouseBindMode(MBIND_INVALID);
         m_bDraggingThis = false;
@@ -1130,6 +1153,7 @@ void CGolemBar::handleUpEvent(Event::SCallbackInfo& info, uint32_t button, bool 
         case HOVER_BUTTON: setBarCursor("pointer"); break;
         case HOVER_CORNER_LEFT: setBarCursor("nw-resize"); break;
         case HOVER_CORNER_RIGHT: setBarCursor("ne-resize"); break;
+        case HOVER_DEAD: setBarCursor("default"); break;
         case HOVER_NONE:
             g_barCursorOwner = nullptr;
             setBarCursor(nullptr);
@@ -1165,11 +1189,14 @@ bool CGolemBar::doButtonPress(Vector2D COORDS) {
         damageEntire();
         return true;
     }
-    // Back and forward: the browser's own keys, sent to THIS window (the
-    // compositor's key pass — press and release, the keyboard focus put back
-    // after). 113 / 114 = Left / Right as xkb keycodes.
+    // Back and forward: held down here (the square goes to the pressed ink),
+    // done on the release over the same button (`handleUpEvent`) — Seam's
+    // way. One with nowhere to go takes the press and does nothing.
     if (ZONE.kind == SGolemBarZone::NAV) {
-        Config::Actions::pass(HL_MODIFIER_ALT, ZONE.button == 0 ? 113 : 114, PWINDOW);
+        if ((navMask() >> ZONE.button) & 1) {
+            m_navDown = ZONE.button;
+            damageEntire();
+        }
         return true;
     }
     if (ZONE.kind != SGolemBarZone::BUTTON)
@@ -1256,13 +1283,46 @@ static CBox golemDiscBox(const CBox& barBox, size_t i, float border, float scale
     return box;
 }
 
-/// The `i`th nav button's box as drawn (0 = back, 1 = forward) — the discs'
-/// own size and line, rounded the same way.
+/// The `i`th nav button's hover square as drawn (0 = back, 1 = forward),
+/// centred on the discs' line like them, rounded the same way.
 static CBox golemNavBox(const CBox& barBox, int i, float border, float scale) {
-    const auto size = GOLEM_BUTTON_SIZE * scale;
+    const auto size = GOLEM_NAV_BOX * scale;
     CBox       box  = {barBox.x + golemNavX(g_pBarsState->buttons.size(), i, scale), barBox.y + golemButtonY(barBox.h, border * scale, size), size, size};
     box.round();
     return box;
+}
+
+/// Seam's arrow — Firefox's Proton `browser/skin/back.svg`, its one path on
+/// the 16-unit box, point for point (`a.75.75` is the tip's round) — filled
+/// in `ink` on a `px`-square texture; forward is the same arrow mirrored
+/// (forward.svg is back.svg mirrored, to the hundredth).
+static SP<Render::ITexture> golemNavArrow(bool forward, const CHyprColor& ink, int px) {
+    auto* const surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, px, px);
+    auto* const cr      = cairo_create(surface);
+    cairo_scale(cr, px / 16.0, px / 16.0);
+    if (forward) {
+        cairo_translate(cr, 16.0, 0.0);
+        cairo_scale(cr, -1.0, 1.0);
+    }
+    cairo_move_to(cr, 6.69, 2.25);
+    cairo_line_to(cr, 1.22, 7.72);
+    // The tip: a quarter-ish turn of radius .75 round the point's left end.
+    cairo_arc_negative(cr, 1.22 + std::sqrt(0.75 * 0.75 - 0.53 * 0.53), 8.25, 0.75, 1.25 * M_PI, 0.75 * M_PI);
+    cairo_line_to(cr, 6.69, 14.25);
+    cairo_line_to(cr, 7.75, 13.189);
+    cairo_line_to(cr, 3.56, 9.0);
+    cairo_line_to(cr, 15.0, 9.0);
+    cairo_line_to(cr, 15.0, 7.5);
+    cairo_line_to(cr, 3.56, 7.5);
+    cairo_line_to(cr, 7.75, 3.31);
+    cairo_close_path(cr);
+    cairo_set_source_rgba(cr, ink.r, ink.g, ink.b, ink.a);
+    cairo_fill(cr);
+    cairo_surface_flush(surface);
+    auto tex = g_pHyprRenderer->createTexture(surface);
+    cairo_destroy(cr);
+    cairo_surface_destroy(surface);
+    return tex;
 }
 
 // Back and forward exist on a webapp's bar (Seam gives each one the class
@@ -1281,18 +1341,17 @@ bool CGolemBar::hasNav() {
     return W && (W->m_class.starts_with("webapp-") || W->m_initialClass.starts_with("webapp-") || !golemFilesTag(W).empty());
 }
 
-// ONLY WHEN THEY HAVE SOMEWHERE TO GO (Max, 2026-10-12: *"i want the arrows to
-// show up only when needed… when i open a webapp, there is no arrow, the back
-// arrow appears only when i moved foward, and the foward arrow appears only
-// after i went back"*). The bar cannot see a page's history; Seam can, and
+// WHICH ONE CAN GO (2026-10-12 they showed only then; since 2026-10-14 both
+// are always there and one that cannot go is greyed, as in Seam — see
+// GOLEM_NAV_SHOWN). The bar cannot see a page's history; Seam can, and
 // says so in $XDG_RUNTIME_DIR/seam/nav — one line per webapp window,
 // `<slug> <can go back 0|1> <can go forward 0|1>`, rewritten (tmp + rename)
 // on every navigation (golem-chrome.js, WEBAPPS). A timer stats the file and
 // reads it again when it is a new one.
 //
 // No file at all is a Seam from before this (it never writes one): both
-// arrows then, as they were, rather than none for good. A file without the
-// window's slug is a webapp that has not reported yet: none.
+// usable then, rather than none for good. A file without the window's slug
+// is a webapp that has not reported yet: both greyed.
 static std::unordered_map<std::string, int> g_navState; // slug → bit 0 back, bit 1 forward
 static bool                                 g_navFileSeen = false;
 static std::pair<ino_t, int64_t>            g_navFileId{0, 0};
@@ -1309,15 +1368,15 @@ int CGolemBar::navMask() {
         return 0;
     if (const auto tag = golemFilesTag(W); !tag.empty()) {
         const auto it = g_filesNav.find(tag);
-        return it == g_filesNav.end() ? 0 : it->second;
+        return GOLEM_NAV_SHOWN | (it == g_filesNav.end() ? 0 : it->second);
     }
     const std::string& cls = W->m_class.starts_with("webapp-") ? W->m_class : W->m_initialClass;
     if (!cls.starts_with("webapp-"))
         return 0;
     if (!g_navFileSeen)
-        return 3;
+        return GOLEM_NAV_SHOWN | 3;
     const auto it = g_navState.find(cls.substr(7));
-    return it == g_navState.end() ? 0 : it->second;
+    return GOLEM_NAV_SHOWN | (it == g_navState.end() ? 0 : it->second);
 }
 
 // A webapp window that has JUST OPENED knows nothing yet: what the file says
@@ -1661,31 +1720,33 @@ void CGolemBar::renderBarButtonsText(CBox* barBox, const float scale, const floa
         g_pHyprOpenGL->renderTexture(button.iconTex, pos, {.a = a, .allowDim = false});
     }
 
-    // Back and forward (webapps): chevrons in the bar's own ink — grey at rest
-    // (GOLEM_NAV_REST_INK), the full ink under the hand, nothing behind them —
-    // re-rendered when the ink flips or the scale changes, centred by their
-    // ink like the ×.
+    // Back and forward (webapps, Golem Files): Seam's buttons — both always,
+    // the arrow in the bar's own ink (0.4 of it when it cannot go), the
+    // square behind it only under the hand (deeper while held). The arrows
+    // are re-drawn when the ink flips or the scale changes.
     if (!hasNav() || barBox->w < GOLEM_NAV_MIN_BAR * scale)
         return;
     if (m_navInk != m_lastInk || m_navScale != scale || !m_navTex[0] || m_navTex[0]->m_texID == 0) {
-        static const char* const GLYPHS[2] = {"‹", "›"};
-        for (int i = 0; i < 2; ++i) {
-            m_navTex[i]       = g_pHyprRenderer->renderText(GLYPHS[i], m_lastInk, std::round(GOLEM_BUTTON_SIZE * GOLEM_NAV_GLYPH * scale), false, GOLEM_BAR_FONT, 0);
-            m_navInkOffset[i] = {};
-            measureInkOffset(m_navTex[i], m_navInkOffset[i]);
-        }
+        const int px = std::max(1, static_cast<int>(std::round(GOLEM_NAV_ICON * scale)));
+        for (int i = 0; i < 2; ++i)
+            m_navTex[i] = golemNavArrow(i == 1, m_lastInk, px);
         m_navInk   = m_lastInk;
         m_navScale = scale;
     }
     const int MASK = navMask();
     for (int i = 0; i < 2; ++i) {
-        const auto& tex = m_navTex[i];
-        if (!tex || tex->m_texID == 0 || !((MASK >> i) & 1))
-            continue;
+        const bool CAN = (MASK >> i) & 1;
         const CBox box = golemNavBox(*barBox, i, BORDER, scale);
-        CBox       pos = {std::round(box.x + box.w / 2.0 - tex->m_size.x / 2.0 - m_navInkOffset[i].x), std::round(box.y + box.h / 2.0 - tex->m_size.y / 2.0 - m_navInkOffset[i].y),
-                          tex->m_size.x, tex->m_size.y};
-        g_pHyprOpenGL->renderTexture(tex, pos, {.a = a * (m_navHover == i ? 1.F : GOLEM_NAV_REST_INK), .allowDim = false});
+        if (CAN && m_navHover == i) {
+            const float fill = m_navDown == i ? GOLEM_NAV_ACTIVE_FILL : GOLEM_NAV_HOVER_FILL;
+            g_pHyprOpenGL->renderRect(box, CHyprColor{m_lastInk.r, m_lastInk.g, m_lastInk.b, m_lastInk.a * fill * a},
+                                      {.round = static_cast<int>(std::round(GOLEM_NAV_RADIUS * scale)), .roundingPower = 2.F});
+        }
+        const auto& tex = m_navTex[i];
+        if (!tex || tex->m_texID == 0)
+            continue;
+        CBox pos = {std::round(box.x + (box.w - tex->m_size.x) / 2.0), std::round(box.y + (box.h - tex->m_size.y) / 2.0), tex->m_size.x, tex->m_size.y};
+        g_pHyprOpenGL->renderTexture(tex, pos, {.a = a * (CAN ? 1.F : GOLEM_NAV_DISABLED), .allowDim = false});
     }
 }
 
@@ -2077,7 +2138,7 @@ void CGolemBar::damageOnButtonHover() {
             mask = 1u << ZONE.button;
         card = ZONE.kind == SGolemBarZone::CARD;
         pin  = ZONE.kind == SGolemBarZone::PIN;
-        if (ZONE.kind == SGolemBarZone::NAV)
+        if (ZONE.kind == SGolemBarZone::NAV && ((navMask() >> ZONE.button) & 1))
             nav = ZONE.button;
     }
     if (mask != m_iButtonHoverState || card != m_cardHover || nav != m_navHover || pin != m_pinHover) {
