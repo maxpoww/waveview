@@ -1265,11 +1265,20 @@ static CBox golemNavBox(const CBox& barBox, int i, float border, float scale) {
     return box;
 }
 
-// Back and forward exist on a webapp's bar only: Seam gives each one the
-// class `webapp-<slug>` (the dock's launcher id).
+// Back and forward exist on a webapp's bar (Seam gives each one the class
+// `webapp-<slug>`, the dock's launcher id) and on a window of Golem Files,
+// the dock's file manager (Max, 2026-10-14), which tags each of its windows
+// `golem-files-<n>` (xdg-toplevel-tag).
+static std::string golemFilesTag(const PHLWINDOW& w) {
+    if (!w)
+        return {};
+    const auto tag = w->xdgTag();
+    return tag && tag->starts_with("golem-files-") ? *tag : std::string{};
+}
+
 bool CGolemBar::hasNav() {
     const auto W = m_pWindow.lock();
-    return W && (W->m_class.starts_with("webapp-") || W->m_initialClass.starts_with("webapp-"));
+    return W && (W->m_class.starts_with("webapp-") || W->m_initialClass.starts_with("webapp-") || !golemFilesTag(W).empty());
 }
 
 // ONLY WHEN THEY HAVE SOMEWHERE TO GO (Max, 2026-10-12: *"i want the arrows to
@@ -1288,11 +1297,20 @@ static std::unordered_map<std::string, int> g_navState; // slug → bit 0 back, 
 static bool                                 g_navFileSeen = false;
 static std::pair<ino_t, int64_t>            g_navFileId{0, 0};
 static SP<CEventLoopTimer>                  g_navWatchTimer;
+// Golem Files says the same of each of its windows, by tag, in
+// $XDG_RUNTIME_DIR/waverunner-files-nav (the same format). No line for a
+// window: no arrows (a new window has no history).
+static std::unordered_map<std::string, int> g_filesNav; // tag → bits
+static std::pair<ino_t, int64_t>            g_filesNavId{0, 0};
 
 int CGolemBar::navMask() {
     const auto W = m_pWindow.lock();
     if (!W)
         return 0;
+    if (const auto tag = golemFilesTag(W); !tag.empty()) {
+        const auto it = g_filesNav.find(tag);
+        return it == g_filesNav.end() ? 0 : it->second;
+    }
     const std::string& cls = W->m_class.starts_with("webapp-") ? W->m_class : W->m_initialClass;
     if (!cls.starts_with("webapp-"))
         return 0;
@@ -1326,10 +1344,41 @@ void CGolemBar::navChanged() {
     damageEntire();
 }
 
+// One `<key> <back 0|1> <forward 0|1>` file into `into`, when it is a new
+// one (inode or mtime changed since `id`); whether what it says changed.
+static bool readNavFile(const std::string& path, std::pair<ino_t, int64_t>& id, std::unordered_map<std::string, int>& into) {
+    struct stat st{};
+    if (stat(path.c_str(), &st) != 0)
+        return false;
+    const std::pair<ino_t, int64_t> now{st.st_ino, (int64_t)st.st_mtim.tv_sec * 1000000000LL + st.st_mtim.tv_nsec};
+    if (now == id)
+        return false;
+    id = now;
+    std::unordered_map<std::string, int> read;
+    std::ifstream                        f(path);
+    std::string                          line;
+    while (std::getline(f, line)) {
+        std::istringstream ls(line);
+        std::string        key;
+        int                back = 0, fwd = 0;
+        if (ls >> key >> back >> fwd)
+            read[key] = (back ? 1 : 0) | (fwd ? 2 : 0);
+    }
+    if (read == into)
+        return false;
+    into = std::move(read);
+    return true;
+}
+
 static void navWatchTick() {
     const char* rt = getenv("XDG_RUNTIME_DIR");
     if (!rt)
         return;
+    // Golem Files' windows first: their own file, their own map.
+    if (readNavFile(std::string(rt) + "/waverunner-files-nav", g_filesNavId, g_filesNav))
+        for (auto& b : g_pBarsState->bars)
+            if (b.valid())
+                b.get()->navChanged();
     const std::string path = std::string(rt) + "/seam/nav";
     struct stat       st{};
     if (stat(path.c_str(), &st) != 0)
