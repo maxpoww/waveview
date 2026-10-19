@@ -207,6 +207,11 @@ static PHLMONITORREF            g_captureMon;
 // The single wallpaper-only backdrop (no windows, no bars) drawn behind
 // everything, replacing the old per-tile repeated wallpapers.
 static SP<Render::IFramebuffer> g_bgFB;
+// waverunner's Lighting veil (0..1, `set_veil`): how dark the wallpaper is
+// made. The backdrop below is the background layer alone, so without it the
+// overview showed the wallpaper in its full light (Max, 2026-10-18: "the
+// darkness on the BG does not apply on overview").
+static float g_veil = 0.0f;
 
 // One cropped thumbnail per live window: just that window's pixels, sliced out of
 // its workspace snapshot. Drawn as an individually rounded, shrunk rect floating
@@ -1149,6 +1154,10 @@ static void captureBackdrop(PHLMONITOR m, const CBox& monbox) {
     for (auto& ref : m->m_layerSurfaceLayers[0]) // background layer: hyprpaper & friends draw here
         if (const auto ls = ref.lock())
             g_pHyprRenderer->renderLayer(ls, m, now);
+    // The veil over it, as the desktop draws it (oversized: whatever space the
+    // box is read in, it covers the whole picture).
+    if (g_veil > 0.0f)
+        renderRect(CBox{-monbox.w, -monbox.h, monbox.w * 3.0, monbox.h * 3.0}, CHyprColor(0.0, 0.0, 0.0, g_veil));
 
     g_pHyprRenderer->m_renderData.blockScreenShader = true;
     g_pHyprRenderer->endRender();
@@ -6552,6 +6561,13 @@ static int luaClose(lua_State* L) {
 // waverunner answers whether or not it actually had a stage to rebuild, so the
 // ordinary paths (the daemon shutting the map as it opens the stage) cost one
 // socket round-trip and not the fallback wait.
+// `hl.plugin.waveview.set_veil(a)` — the Lighting veil's strength (0..1),
+// laid over the wallpaper the overview floats on (see `g_veil`).
+static int luaSetVeil(lua_State* L) {
+    g_veil = std::clamp(static_cast<float>(lua_tonumber(L, 1)), 0.0f, 0.9f);
+    return 0;
+}
+
 // `hl.plugin.waveview.recapture()` — waverunner has just changed the desktop
 // under an OPEN map and wants it photographed NOW.
 //
@@ -6879,6 +6895,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     HyprlandAPI::addLuaFunction(handle, "waveview", "close", luaClose);
     HyprlandAPI::addLuaFunction(handle, "waveview", "stage_ready", luaStageReady);
     HyprlandAPI::addLuaFunction(handle, "waveview", "recapture", luaRecapture);
+    HyprlandAPI::addLuaFunction(handle, "waveview", "set_veil", luaSetVeil);
     HyprlandAPI::addLuaFunction(handle, "waveview", "debug_state", luaDebugState);
     HyprlandAPI::addLuaFunction(handle, "waveview", "kb_focus", luaKbFocus);
     HyprlandAPI::addLuaFunction(handle, "waveview", "move_snapped", luaMoveSnapped);
