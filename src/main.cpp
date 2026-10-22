@@ -913,6 +913,12 @@ static bool                     g_spreadWasSettled = false; // arrival detection
 static float                    g_spreadAnim = 0.0f, g_spreadTarget = 0.0f;
 static Time::steady_tp          g_spreadLastT;
 static int64_t                  g_spreadWs = -1; // the workspace the spread belongs to
+// THE SPREAD OF ONE APP (Max, 2026-10-22: waverunner's lone-app "Show all"
+// — "mostrar todas las ventanas abiertas como haría SPREAD"): while this is
+// a class (lowercased), the spread is that app's windows from EVERY workspace
+// of the monitor, one or more, instead of this workspace's hidden ones; a
+// pick on another workspace switches there. `hl.plugin.waveview.spread_app`.
+static std::string              g_spreadApp;
 static PHLMONITORREF            g_spreadMon;
 static PHLWINDOWREF             g_spreadHover; // card under the pointer (gets the ring)
 static PHLWINDOWREF             g_spreadPick;  // clicked card — glides home on top of the rest
@@ -1636,10 +1642,34 @@ static void freeCaptures() {
 // own stacking), the fullscreen window last — it covers everything out there,
 // so its card rides on top in here. Pinned floats show on every workspace and
 // join the cast.
+// Whether `w` is one of the app the spread of one app shows (its class or
+// the class it opened with, as the dock knows it).
+static bool spreadAppWindow(PHLWINDOW w) {
+    auto lower = [](std::string s) {
+        std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+        return s;
+    };
+    return lower(w->m_initialClass) == g_spreadApp || lower(w->fetchClass()) == g_spreadApp;
+}
+
 static std::vector<PHLWINDOW> spreadPopulation(PHLMONITOR m) {
     std::vector<PHLWINDOW> tiled, floating;
     PHLWINDOW              fs;
     const auto             wsid = m->activeWorkspaceID();
+    if (!g_spreadApp.empty()) {
+        // One app's windows, this workspace's first, then the others' —
+        // never a special workspace's (the stage's park, the minimized).
+        std::vector<PHLWINDOW> here, away;
+        for (auto& w : g_pCompositor->m_windows) {
+            if (!w || !w->m_isMapped || w->isHidden() || w->m_fadingOut || w->monitorID() != m->m_id)
+                continue;
+            if (!w->m_workspace || w->onSpecialWorkspace() || !spreadAppWindow(w))
+                continue;
+            (w->workspaceID() == wsid ? here : away).push_back(w);
+        }
+        here.insert(here.end(), away.begin(), away.end());
+        return here;
+    }
     for (auto& w : g_pCompositor->m_windows) {
         if (!w || !w->m_isMapped || w->isHidden() || w->m_fadingOut || w->monitorID() != m->m_id)
             continue;
@@ -1981,6 +2011,17 @@ static void captureSpreadTextures(PHLMONITOR m, bool alsoBackdrop) {
         // they still appear (the overview's covered-window fix, same class).
         const bool covered = w->effectiveAlpha() <= 0.001F;
         CRegion    fakeDamage{0, 0, INT16_MAX, INT16_MAX};
+        // A window of ANOTHER workspace (the spread of one app): that
+        // workspace is made the shown one for its render, its windows snapped
+        // on screen — the overview's own juggling (captureWorkspaces) — and
+        // put back right after.
+        const auto   realActive = m->m_activeWorkspace;
+        PHLWORKSPACE away       = (w->m_workspace && w->m_workspace != realActive) ? w->m_workspace : nullptr;
+        if (away) {
+            m->m_activeWorkspace = away;
+            g_pDesktopAnimationManager->startAnimation(away, CDesktopAnimationManager::ANIMATION_TYPE_IN, true, true);
+            away->m_visible = true;
+        }
         g_pHyprRenderer->beginRender(m, fakeDamage, Render::RENDER_MODE_FULL_FAKE, nullptr, g_spreadSrcFB);
         glClearColor(0.0F, 0.0F, 0.0F, 0.0F);
         glClear(GL_COLOR_BUFFER_BIT);
@@ -1994,6 +2035,11 @@ static void captureSpreadTextures(PHLMONITOR m, bool alsoBackdrop) {
         g_pHyprRenderer->m_renderData.blockScreenShader = true;
         g_pHyprRenderer->endRender();
         endWindowCrop(w, crop);
+        if (away) {
+            away->m_visible = false;
+            g_pDesktopAnimationManager->startAnimation(away, CDesktopAnimationManager::ANIMATION_TYPE_OUT, false, true);
+            m->m_activeWorkspace = realActive;
+        }
         const CBox cc = crop.box;
 
         const double u0 = std::clamp((cc.x - m->m_position.x) / m->m_size.x, 0.0, 1.0);
@@ -2034,9 +2080,18 @@ static void captureSpreadTextures(PHLMONITOR m, bool alsoBackdrop) {
     g_pHyprRenderer->m_bBlockSurfaceFeedback = false;
 
     // Buried clients only keep painting if someone asks for frames — the
-    // whole point of the spread is watching them come out alive.
-    if (const auto ws = g_pCompositor->getWorkspaceByID(g_spreadWs))
+    // whole point of the spread is watching them come out alive (one app's
+    // spread: every workspace its windows are on).
+    std::vector<int64_t> asked;
+    if (const auto ws = g_pCompositor->getWorkspaceByID(g_spreadWs)) {
         g_pHyprRenderer->sendFrameEventsToWorkspace(m, ws, Time::steadyNow());
+        asked.push_back(g_spreadWs);
+    }
+    for (auto& sw : g_spreadWins)
+        if (const auto w = sw.win.lock(); w && w->m_workspace && std::find(asked.begin(), asked.end(), w->workspaceID()) == asked.end()) {
+            g_pHyprRenderer->sendFrameEventsToWorkspace(m, w->m_workspace, Time::steadyNow());
+            asked.push_back(w->workspaceID());
+        }
 }
 
 // Release everything the spread holds. Its VRAM lifetime mirrors the
@@ -2079,6 +2134,7 @@ static void finishSpreadClose(bool tellDaemon = true) {
     g_ownedButtons.clear();
     g_ownedKeys.clear();
     g_spreadWs     = -1;
+    g_spreadApp.clear();
     g_spreadHover.reset();
     g_spreadPick.reset();
     g_spreadMon.reset();
@@ -2093,7 +2149,8 @@ static void openSpread(PHLMONITOR m) {
     if (g_spreadActive || g_active || g_stageMode || !m)
         return;
     const auto pop = spreadPopulation(m);
-    if (pop.empty() || (pop.size() < 2 && !wsNeedsSpread(m))) // a lone window: only if it is put away
+    // A lone window: only if it is put away (one app's spread shows even one).
+    if (pop.empty() || (g_spreadApp.empty() && pop.size() < 2 && !wsNeedsSpread(m)))
         return;
     g_spreadWs  = m->activeWorkspaceID();
     g_spreadMon = m;
@@ -2178,6 +2235,14 @@ static void pickSpread(PHLWINDOW w) {
             g_pCompositor->setWindowFullscreenInternal(o, FSMODE_NONE);
             sw.home = spreadHome(o); // its box just changed; glide home to the new one
         }
+    // One app's spread: a window on another workspace takes us there (the
+    // spread now belongs to it, so the switch does not fold it away).
+    if (const auto m = g_spreadMon.lock(); m && w->workspaceID() != m->activeWorkspaceID() && g_pKeybindManager) {
+        g_spreadWs    = w->workspaceID();
+        const auto it = g_pKeybindManager->m_dispatchers.find("workspace");
+        if (it != g_pKeybindManager->m_dispatchers.end())
+            it->second(std::to_string(w->workspaceID()));
+    }
     g_pCompositor->changeWindowZOrder(w, true);
     Desktop::focusState()->fullWindowFocus(w, Desktop::FOCUS_REASON_CLICK);
     // LAND FOCUSED, as the overview's pick does: settle the fades under the
@@ -2201,7 +2266,7 @@ static void refreshSpread(PHLMONITOR m) {
         return;
     }
     const auto pop = spreadPopulation(m);
-    if (pop.empty() || (pop.size() < 2 && !wsNeedsSpread(m))) {
+    if (pop.empty() || (g_spreadApp.empty() && pop.size() < 2 && !wsNeedsSpread(m))) {
         closeSpread(); // a lone window on screen hides nothing; nothing left to hold open
         return;
     }
@@ -6672,6 +6737,25 @@ static int luaCycle(lua_State*) {
 // same idiom as the toggle dispatch trick). Walks the ladder exactly like the
 // gesture: spread when this workspace hides windows, escalate when the spread
 // is up, the overview otherwise.
+// `hl.plugin.waveview.spread_app("<class>")`: the spread of ONE app's
+// windows, from every workspace (waverunner's lone-app "Show all"). An open
+// spread gives way to it; over the overview or the stage it does nothing.
+static int luaSpreadApp(lua_State* L) {
+    const char* cls = lua_tostring(L, 1);
+    if (!cls || !*cls || g_active || g_stageMode)
+        return 0;
+    if (g_spreadActive)
+        snapCloseSpread(false);
+    std::string c = cls;
+    std::transform(c.begin(), c.end(), c.begin(), [](unsigned char ch) { return (char)std::tolower(ch); });
+    g_spreadApp = c;
+    openSpread(g_pCompositor->getMonitorFromCursor());
+    trace("spread_app class=%s open=%d wins=%zu", c.c_str(), (int)g_spreadActive, g_spreadWins.size());
+    if (!g_spreadActive)
+        g_spreadApp.clear();
+    return 0;
+}
+
 static int luaSpread(lua_State*) {
     if (!g_active && !g_spreadActive && g_animTarget < 0.5f) {
         const auto m = g_pCompositor->getMonitorFromCursor();
@@ -6901,6 +6985,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     HyprlandAPI::addLuaFunction(handle, "waveview", "move_snapped", luaMoveSnapped);
     HyprlandAPI::addLuaFunction(handle, "waveview", "resize_snapped", luaResizeSnapped);
     HyprlandAPI::addLuaFunction(handle, "waveview", "spread", luaSpread);
+    HyprlandAPI::addLuaFunction(handle, "waveview", "spread_app", luaSpreadApp);
     HyprlandAPI::addLuaFunction(handle, "waveview", "cycle", luaCycle);
     HyprlandAPI::addLuaFunction(handle, "waveview", "minimize", luaMinimize);
     HyprlandAPI::addLuaFunction(handle, "waveview", "restore_min", luaRestoreMin);
@@ -6978,7 +7063,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "2.21"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "2.22"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
