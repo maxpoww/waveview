@@ -1120,15 +1120,20 @@ void CGolemBar::handleUpEvent(Event::SCallbackInfo& info, uint32_t button, bool 
     // A back/forward held down acts if let go over itself, and only if it can
     // still go there: the browser's own keys, sent to THIS window (the
     // compositor's key pass — press and release, the keyboard focus put back
-    // after). 113 / 114 = Left / Right as xkb keycodes.
+    // after). 113 / 114 = Left / Right as xkb keycodes; the translate square's
+    // Ctrl+Alt+Shift+T is Seam's own key (28 = T).
     if (m_navDown >= 0) {
         const int DOWN = m_navDown;
         m_navDown      = -1;
         damageEntire();
         const int  MASK = navMask();
         const auto ZONE = golemBarZone(cursorRelativeToBar(), g_pBarsState->buttons.size(), assignedBoxGlobal().w, GOLEM_BAR_HEIGHT, borderBelow(), MASK);
-        if (const auto PWINDOW = m_pWindow.lock(); valid && PWINDOW && ZONE.kind == SGolemBarZone::NAV && ZONE.button == DOWN && ((MASK >> DOWN) & 1))
-            Config::Actions::pass(HL_MODIFIER_ALT, DOWN == 0 ? 113 : 114, PWINDOW);
+        if (const auto PWINDOW = m_pWindow.lock(); valid && PWINDOW && ZONE.kind == SGolemBarZone::NAV && ZONE.button == DOWN && golemNavCan(MASK, DOWN)) {
+            if (DOWN == 2)
+                Config::Actions::pass(HL_MODIFIER_CTRL | HL_MODIFIER_ALT | HL_MODIFIER_SHIFT, 28, PWINDOW);
+            else
+                Config::Actions::pass(HL_MODIFIER_ALT, DOWN == 0 ? 113 : 114, PWINDOW);
+        }
     }
 
     if (m_bDraggingThis) {
@@ -1193,7 +1198,7 @@ bool CGolemBar::doButtonPress(Vector2D COORDS) {
     // done on the release over the same button (`handleUpEvent`) — Seam's
     // way. One with nowhere to go takes the press and does nothing.
     if (ZONE.kind == SGolemBarZone::NAV) {
-        if ((navMask() >> ZONE.button) & 1) {
+        if (golemNavCan(navMask(), ZONE.button)) {
             m_navDown = ZONE.button;
             damageEntire();
         }
@@ -1241,7 +1246,7 @@ bool CGolemBar::doButtonPress(Vector2D COORDS) {
 void CGolemBar::renderBarTitle(const Vector2D& bufferSize, const float scale) {
     const int scaledSize = static_cast<int>(std::round(GOLEM_TITLE_SIZE * scale));
     const bool nav       = hasNav() && bufferSize.x >= GOLEM_NAV_MIN_BAR * scale;
-    const auto rowEnd    = nav ? golemNavX(g_pBarsState->buttons.size(), 2, scale) : golemButtonX(g_pBarsState->buttons.size(), scale);
+    const auto rowEnd    = nav ? golemNavX(g_pBarsState->buttons.size(), golemNavCount(navMask()), scale) : golemButtonX(g_pBarsState->buttons.size(), scale);
     const int side       = static_cast<int>(std::round(std::max(rowEnd, GOLEM_BAR_PADDING * scale)));
     const int maxWidth   = static_cast<int>(bufferSize.x) - 2 * side;
 
@@ -1316,6 +1321,68 @@ static SP<Render::ITexture> golemNavArrow(bool forward, const CHyprColor& ink, i
     cairo_line_to(cr, 3.56, 7.5);
     cairo_line_to(cr, 7.75, 3.31);
     cairo_close_path(cr);
+    cairo_set_source_rgba(cr, ink.r, ink.g, ink.b, ink.a);
+    cairo_fill(cr);
+    cairo_surface_flush(surface);
+    auto tex = g_pHyprRenderer->createTexture(surface);
+    cairo_destroy(cr);
+    cairo_surface_destroy(surface);
+    return tex;
+}
+
+/// Firefox's translations icon — Proton `browser/skin/translations.svg`, its one
+/// path on the 17×16 box, point for point (the arcs as Béziers, written out from
+/// the SVG by a converter and checked against it rasterized: 4 bytes of 435 520 off,
+/// rounding), filled in `ink`, the box fitted to the `px` square's width and
+/// centred in its height.
+static SP<Render::ITexture> golemTranslateIcon(const CHyprColor& ink, int px) {
+    auto* const surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, px, px);
+    auto* const cr      = cairo_create(surface);
+    const double s      = px / 17.0;
+    cairo_translate(cr, 0.0, (px - 16.0 * s) / 2.0);
+    cairo_scale(cr, s, s);
+    cairo_move_to(cr, 15.37, 15);
+    cairo_line_to(cr, 17, 15);
+    cairo_line_to(cr, 13.37, 6.46);
+    cairo_curve_to(cr, 13.253, 6.182, 12.982, 6.001, 12.68, 6);
+    cairo_line_to(cr, 11.86, 6);
+    cairo_curve_to(cr, 11.56, 6, 11.28, 6.18, 11.16, 6.46);
+    cairo_line_to(cr, 9.32, 10.8);
+    cairo_line_to(cr, 9.31, 10.79);
+    cairo_curve_to(cr, 8.094, 10.263, 6.986, 9.518, 6.04, 8.59);
+    cairo_curve_to(cr, 7.156, 7.379, 8.02, 5.958, 8.58, 4.41);
+    cairo_line_to(cr, 9.08, 3);
+    cairo_line_to(cr, 10, 3);
+    cairo_line_to(cr, 10, 1.5);
+    cairo_line_to(cr, 5.75, 1.5);
+    cairo_line_to(cr, 5.75, 0);
+    cairo_line_to(cr, 4.25, 0);
+    cairo_line_to(cr, 4.25, 1.5);
+    cairo_line_to(cr, 0, 1.5);
+    cairo_line_to(cr, 0, 3);
+    cairo_line_to(cr, 7.5, 3);
+    cairo_line_to(cr, 7.17, 3.91);
+    cairo_curve_to(cr, 6.7, 5.22, 5.97, 6.43, 5.04, 7.47);
+    cairo_curve_to(cr, 4.34, 6.57, 3.79, 5.57, 3.41, 4.5);
+    cairo_line_to(cr, 1.8, 4.5);
+    cairo_line_to(cr, 1.98, 4.98);
+    cairo_curve_to(cr, 2.437, 6.267, 3.102, 7.47, 3.95, 8.54);
+    cairo_curve_to(cr, 3.05, 9.29, 2.06, 9.89, 0.99, 10.32);
+    cairo_line_to(cr, 0.99, 11.9);
+    cairo_curve_to(cr, 2.439, 11.4, 3.782, 10.634, 4.95, 9.64);
+    cairo_curve_to(cr, 6.038, 10.713, 7.317, 11.575, 8.72, 12.18);
+    cairo_line_to(cr, 7.53, 15);
+    cairo_line_to(cr, 9.17, 15);
+    cairo_line_to(cr, 10.23, 12.5);
+    cairo_line_to(cr, 14.31, 12.5);
+    cairo_line_to(cr, 15.37, 15);
+    cairo_close_path(cr);
+    cairo_move_to(cr, 10.87, 11);
+    cairo_line_to(cr, 12.27, 7.7);
+    cairo_line_to(cr, 13.67, 11);
+    cairo_line_to(cr, 10.87, 11);
+    cairo_close_path(cr);
+    cairo_set_fill_rule(cr, CAIRO_FILL_RULE_WINDING);
     cairo_set_source_rgba(cr, ink.r, ink.g, ink.b, ink.a);
     cairo_fill(cr);
     cairo_surface_flush(surface);
@@ -1451,9 +1518,11 @@ static void navWatchTick() {
     while (std::getline(f, line)) {
         std::istringstream ls(line);
         std::string        slug;
-        int                back = 0, fwd = 0;
-        if (ls >> slug >> back >> fwd)
-            now[slug] = (back ? 1 : 0) | (fwd ? 2 : 0);
+        int                back = 0, fwd = 0, tr = 0;
+        if (ls >> slug >> back >> fwd) {
+            ls >> tr; // (a Seam from before the translate button writes three)
+            now[slug] = (back ? 1 : 0) | (fwd ? 2 : 0) | (tr == 1 ? GOLEM_NAV_TRANSLATE : tr == 2 ? GOLEM_NAV_TRANSLATED : 0);
+        }
     }
     const bool changed = !g_navFileSeen || now != g_navState;
     g_navFileId   = id;
@@ -1726,18 +1795,20 @@ void CGolemBar::renderBarButtonsText(CBox* barBox, const float scale, const floa
     // are re-drawn when the ink flips or the scale changes.
     if (!hasNav() || barBox->w < GOLEM_NAV_MIN_BAR * scale)
         return;
-    if (m_navInk != m_lastInk || m_navScale != scale || !m_navTex[0] || m_navTex[0]->m_texID == 0) {
+    if (m_navInk != m_lastInk || m_navScale != scale || !m_navTex[0] || m_navTex[0]->m_texID == 0 || !m_navTex[2]) {
         const int px = std::max(1, static_cast<int>(std::round(GOLEM_NAV_ICON * scale)));
         for (int i = 0; i < 2; ++i)
             m_navTex[i] = golemNavArrow(i == 1, m_lastInk, px);
-        m_navInk   = m_lastInk;
-        m_navScale = scale;
+        m_navTex[2] = golemTranslateIcon(m_lastInk, px);
+        m_navInk    = m_lastInk;
+        m_navScale  = scale;
     }
     const int MASK = navMask();
-    for (int i = 0; i < 2; ++i) {
-        const bool CAN = (MASK >> i) & 1;
+    for (int i = 0; i < golemNavCount(MASK); ++i) {
+        const bool CAN = golemNavCan(MASK, i);
+        const bool ON  = i == 2 && (MASK & GOLEM_NAV_TRANSLATED); // a translated page: the square stays up
         const CBox box = golemNavBox(*barBox, i, BORDER, scale);
-        if (CAN && m_navHover == i) {
+        if (CAN && (m_navHover == i || ON)) {
             const float fill = m_navDown == i ? GOLEM_NAV_ACTIVE_FILL : GOLEM_NAV_HOVER_FILL;
             g_pHyprOpenGL->renderRect(box, CHyprColor{m_lastInk.r, m_lastInk.g, m_lastInk.b, m_lastInk.a * fill * a},
                                       {.round = static_cast<int>(std::round(GOLEM_NAV_RADIUS * scale)), .roundingPower = 2.F});
@@ -1990,10 +2061,12 @@ void CGolemBar::renderPass(PHLMONITOR pMonitor, const float& a) {
     // its old seat was the LEFT). Re-rendered only when what it shows or the
     // room it has changes: the name, the ink (the bar colour animates with
     // focus, and the ink flips at its threshold), or the bar's width.
-    if (m_szLastTitle != PWINDOW->m_title || !m_pTextTex || m_pTextTex->m_texID == 0 || inkOn(color) != m_lastInk || m_lastBarW != static_cast<int>(BARBUF.x)) {
-        m_szLastTitle = PWINDOW->m_title;
-        m_lastInk     = inkOn(color);
-        m_lastBarW    = static_cast<int>(BARBUF.x);
+    if (m_szLastTitle != PWINDOW->m_title || !m_pTextTex || m_pTextTex->m_texID == 0 || inkOn(color) != m_lastInk || m_lastBarW != static_cast<int>(BARBUF.x) ||
+        m_lastNavCount != golemNavCount(navMask())) {
+        m_szLastTitle  = PWINDOW->m_title;
+        m_lastInk      = inkOn(color);
+        m_lastBarW     = static_cast<int>(BARBUF.x);
+        m_lastNavCount = golemNavCount(navMask());
         renderBarTitle(BARBUF, pMonitor->m_scale);
     }
 
@@ -2138,7 +2211,7 @@ void CGolemBar::damageOnButtonHover() {
             mask = 1u << ZONE.button;
         card = ZONE.kind == SGolemBarZone::CARD;
         pin  = ZONE.kind == SGolemBarZone::PIN;
-        if (ZONE.kind == SGolemBarZone::NAV && ((navMask() >> ZONE.button) & 1))
+        if (ZONE.kind == SGolemBarZone::NAV && golemNavCan(navMask(), ZONE.button))
             nav = ZONE.button;
     }
     if (mask != m_iButtonHoverState || card != m_cardHover || nav != m_navHover || pin != m_pinHover) {

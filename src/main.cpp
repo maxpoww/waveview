@@ -7063,7 +7063,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                  CHyprColor(0.3, 1.0, 0.5, 1.0), 3000);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "2.22"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "2.23"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {

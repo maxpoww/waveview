@@ -319,6 +319,26 @@ inline constexpr float  GOLEM_NAV_ACTIVE_FILL   = 0.30F; // --toolbarbutton-back
 /// `navMask` bit saying the window HAS the pair (bits 0 and 1 say which of
 /// them can be used).
 inline constexpr int    GOLEM_NAV_SHOWN = 4;
+/// THE TRANSLATE BUTTON (Max, 2026-10-29: *"i want it, maybe on the title bar?"*): a
+/// third square after forward, on a webapp's bar only while its page can be translated —
+/// Seam's fourth number in `seam/nav`: 1, the page is in a language other than the
+/// owner's (GOLEM_NAV_TRANSLATE); 2, it is translated (GOLEM_NAV_TRANSLATED). The icon is
+/// Firefox's own translations.svg (`golemTranslateIcon`), Seam's button in its address
+/// bar, which a webapp hides; a press sends Ctrl+Alt+Shift+T, Seam's key for it (translate
+/// into the owner's language, or back as it was). While translated its square stays up
+/// (the hover's ink), a button that is on.
+inline constexpr int    GOLEM_NAV_TRANSLATE  = 8;
+inline constexpr int    GOLEM_NAV_TRANSLATED = 16;
+/// How many nav squares a window's bar has: the pair, and the translate one when its page
+/// can be translated or is.
+inline int golemNavCount(int navMask) {
+    return (navMask & (GOLEM_NAV_TRANSLATE | GOLEM_NAV_TRANSLATED)) ? 3 : 2;
+}
+/// Whether the `i`th nav square can be pressed (0 back, 1 forward: Seam's history; 2
+/// translate: there only when it can).
+inline bool golemNavCan(int navMask, int i) {
+    return i < 2 ? ((navMask >> i) & 1) != 0 : (navMask & (GOLEM_NAV_TRANSLATE | GOLEM_NAV_TRANSLATED)) != 0;
+}
 /// The `i`th nav square's left edge (0 = back, 1 = forward; 2 = one past the
 /// pair, which is where the title's room starts), after `count` discs.
 inline float golemNavX(size_t count, int i, float scale) {
@@ -339,7 +359,7 @@ inline float golemNavX(size_t count, int i, float scale) {
 ///  · otherwise the button columns (`golemButtonColumn`), then the strip.
 struct SGolemBarZone {
     enum eKind : uint8_t { NONE = 0, STRIP, BUTTON, CORNER_LEFT, CORNER_RIGHT, CARD, NAV, PIN } kind = NONE;
-    int button = -1; // for BUTTON; for NAV, 0 = back, 1 = forward
+    int button = -1; // for BUTTON; for NAV, 0 = back, 1 = forward, 2 = translate
 };
 inline SGolemBarZone golemBarZone(const Vector2D& p, size_t count, double barWidth, double barHeight, float border, int navMask = 0) {
     if (p.x < 0 || p.y < 0 || p.x >= barWidth || p.y >= barHeight)
@@ -375,7 +395,7 @@ inline SGolemBarZone golemBarZone(const Vector2D& p, size_t count, double barWid
     // a disabled one included: its spot is a dead button, not the strip.
     if ((navMask & GOLEM_NAV_SHOWN) && barWidth >= GOLEM_NAV_MIN_BAR) {
         const double half = GOLEM_NAV_SPACE / 2.0;
-        for (int i = 0; i < 2; ++i) {
+        for (int i = 0; i < golemNavCount(navMask); ++i) {
             const double x0 = golemNavX(count, i, 1.F) - half;
             if (p.x >= x0 && p.x < x0 + GOLEM_NAV_BOX + GOLEM_NAV_SPACE)
                 return {SGolemBarZone::NAV, i};
@@ -522,6 +542,7 @@ class CGolemBar : public IHyprWindowDecoration {
     std::string          m_szLastTitle;
     CHyprColor           m_lastInk  = CHyprColor{0ULL};
     int                  m_lastBarW = -1;
+    int                  m_lastNavCount = 2; // the nav squares the title made room for (the translate one comes and goes)
 
     PHLANIMVAR<CHyprColor> m_cRealBarColor;
 
@@ -659,7 +680,7 @@ class CGolemBar : public IHyprWindowDecoration {
     int                  navMask(); // bit 0 back, bit 1 forward can be used; GOLEM_NAV_SHOWN the pair is there
     int                  m_navDown = -1; // the nav button held down (it acts on the release over itself)
     int                  m_navHover = -1;
-    SP<Render::ITexture> m_navTex[2];
+    SP<Render::ITexture> m_navTex[3]; // back, forward, translate
     CHyprColor           m_navInk;
     float                m_navScale = 0.F;
 
