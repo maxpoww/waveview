@@ -1,5 +1,12 @@
 { pkgs ? import <nixpkgs> {
-    overlays = [
+    # Build against the SAME Hyprland the system actually runs: Golem's own
+    # overlay (its patches IN ITS ORDER) when the Golem tree is here — the
+    # dev box's /etc/nixos takes Hyprland from exactly that file. The patch
+    # directory below, applied in name order, stopped building on 2026-10-29:
+    # hyprland-vfr-hold-share.patch sorts BEFORE the vfr-hold patch it sits on.
+    overlays = if builtins.pathExists /home/max/Golem/system/Modular/desktop/hyprland-overlay.nix
+      then [ (import /home/max/Golem/system/Modular/desktop/hyprland-overlay.nix) ]
+      else [
       # Build against the SAME Hyprland the system actually runs. /etc/nixos
       # overlays patch it, and a patch that touches a header changes struct
       # layout: vfr-hold (2026-09-10) added a CMonitor member, every member
