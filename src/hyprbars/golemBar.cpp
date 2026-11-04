@@ -1762,23 +1762,29 @@ void CGolemBar::renderBarButtonsText(CBox* barBox, const float scale, const floa
         if (button.glyph != GOLEM_GLYPH_TEXT)
             continue; // drawn with its disc (renderBarButtons)
 
-        if ((!button.iconTex || button.iconTex->m_texID == 0) && !button.icon.empty()) {
-            button.iconTex     = g_pHyprRenderer->renderText(button.icon, button.fgcol, std::round(GOLEM_BUTTON_SIZE * GOLEM_BUTTON_GLYPH * scale), false, GOLEM_BAR_FONT, scaledButtonSize);
-            button.inkOffset   = {};
-            button.inkMeasured = measureInkOffset(button.iconTex, button.inkOffset);
+        if (button.icon.empty())
+            continue;
+        auto glyph = std::ranges::find_if(button.glyphs, [scale](const SGolemGlyphTex& g) { return std::abs(g.scale - scale) < 0.001F; });
+        if (glyph == button.glyphs.end())
+            glyph = button.glyphs.insert(button.glyphs.end(), SGolemGlyphTex{.scale = scale});
+        if (!glyph->tex || glyph->tex->m_texID == 0) {
+            glyph->tex         = g_pHyprRenderer->renderText(button.icon, button.fgcol, std::round(GOLEM_BUTTON_SIZE * GOLEM_BUTTON_GLYPH * scale), false, GOLEM_BAR_FONT, scaledButtonSize);
+            glyph->inkOffset   = {};
+            glyph->inkMeasured = measureInkOffset(glyph->tex, glyph->inkOffset);
         }
 
-        if (!button.iconTex || button.iconTex->m_texID == 0)
+        if (!glyph->tex || glyph->tex->m_texID == 0)
             continue;
 
         // Centred on the disc AS DRAWN (`golemDiscBox`, rounded) — and by its
         // INK, not its texture: the offset measured above moves the texture
         // so the glyph's own centre lands on the disc's centre (see
-        // `SGolemButton::inkOffset`).
-        const CBox disc  = golemDiscBox(*barBox, i, BORDER, scale);
-        const auto iconX = disc.x + disc.w / 2.0 - button.iconTex->m_size.x / 2.0 - button.inkOffset.x;
-        const auto iconY = disc.y + disc.h / 2.0 - button.iconTex->m_size.y / 2.0 - button.inkOffset.y;
-        CBox       pos   = {std::round(iconX), std::round(iconY), button.iconTex->m_size.x, button.iconTex->m_size.y};
+        // `SGolemGlyphTex::inkOffset`).
+        const auto& tex   = glyph->tex;
+        const CBox  disc  = golemDiscBox(*barBox, i, BORDER, scale);
+        const auto  iconX = disc.x + disc.w / 2.0 - tex->m_size.x / 2.0 - glyph->inkOffset.x;
+        const auto  iconY = disc.y + disc.h / 2.0 - tex->m_size.y / 2.0 - glyph->inkOffset.y;
+        CBox        pos   = {std::round(iconX), std::round(iconY), tex->m_size.x, tex->m_size.y};
 
         // Never DIMMED: `decoration:dim_inactive` tints every texture drawn
         // for an unfocused window (`allowDim` defaults on), which greyed the
@@ -1786,7 +1792,7 @@ void CGolemBar::renderBarButtonsText(CBox* barBox, const float scale, const floa
         // rects, untinted — stayed bright. The buttons are targets at full
         // strength (Max, 2026-09-25: *"the title bars buttons should not be
         // dimmed"*), same rule as their opacity above.
-        g_pHyprOpenGL->renderTexture(button.iconTex, pos, {.a = a, .allowDim = false});
+        g_pHyprOpenGL->renderTexture(tex, pos, {.a = a, .allowDim = false});
     }
 
     // Back and forward (webapps, Golem Files): Seam's buttons — both always,

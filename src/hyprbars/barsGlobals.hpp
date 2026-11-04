@@ -40,16 +40,11 @@ enum eGolemGlyph : uint8_t {
     GOLEM_GLYPH_DASH,
 };
 
-/// One button: what it does, what it looks like, and the glyph texture once it
-/// has been rendered.
-struct SGolemButton {
-    eGolemBarButton      action;
-    CHyprColor           bgcol;
-    CHyprColor           fgcol;
-    std::string          icon;
-    eGolemGlyph          glyph = GOLEM_GLYPH_TEXT;
-    SP<Render::ITexture> iconTex;
-    /// Where the glyph's INK sits in `iconTex`: its centre relative to the
+/// A button's glyph rendered for one screen scale.
+struct SGolemGlyphTex {
+    float                scale = 0.F;
+    SP<Render::ITexture> tex;
+    /// Where the glyph's INK sits in `tex`: its centre relative to the
     /// texture's centre, in texture px. A text texture carries the font's
     /// ascent, descent and side bearings around the glyph, so centring the
     /// texture on the disc left every glyph a little off (Max, 2026-09-26:
@@ -57,6 +52,21 @@ struct SGolemButton {
     /// the texture's alpha after it is rendered.
     Vector2D             inkOffset;
     bool                 inkMeasured = false;
+};
+
+/// One button: what it does, what it looks like, and the glyph texture once it
+/// has been rendered.
+struct SGolemButton {
+    eGolemBarButton             action;
+    CHyprColor                  bgcol;
+    CHyprColor                  fgcol;
+    std::string                 icon;
+    eGolemGlyph                 glyph = GOLEM_GLYPH_TEXT;
+    /// One per screen scale it has been drawn at: the buttons are shared by
+    /// every bar on every screen, and ONE texture made at the first screen's
+    /// scale drew the × 1.6 times too big on a TV at 1.0, out of its disc
+    /// (Max, 2026-11-03: *"the x goes out of the circle"*).
+    std::vector<SGolemGlyphTex> glyphs;
 };
 
 class CGolemBar;
