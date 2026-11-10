@@ -3,6 +3,7 @@
 // macro can't rewrite libstdc++ access specifiers.
 #include <algorithm>
 #include <any>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstdarg>
@@ -56,6 +57,7 @@
 #include <hyprland/src/devices/IKeyboard.hpp>
 #include <hyprland/src/devices/IPointer.hpp>
 #include <hyprland/src/event/EventBus.hpp>
+#include <hyprland/src/config/shared/workspace/WorkspaceRuleManager.hpp>
 #include <hyprland/src/helpers/Color.hpp>
 #include <hyprland/src/helpers/time/Time.hpp>
 #undef private
@@ -154,6 +156,7 @@ static CHyprSignalListener g_swipeBeginListener;  // 3-finger swipe up/down togg
 static CHyprSignalListener g_swipeUpdateListener;
 static CHyprSignalListener g_swipeEndListener;
 static CHyprSignalListener g_axisListener; // wheel while open scrolls the 3x6 grid (see onMouseAxis)
+static CHyprSignalListener g_monitorAddedListener; // a screen arrives: its page word is learned (see PAGES)
 static CHyprSignalListener g_windowOpenListener; // gives each new window its (floating-only) titlebar — see src/hyprbars/
 static CHyprSignalListener g_windowDestroyListener; // a window dying while MINIMIZED must leave the dock (see PLUGIN_INIT)
 static CHyprSignalListener g_windowPinListener;     // a pin from anywhere (the OPTIONS pin pill, a keybind) repaints the title bar's pushpin
@@ -203,6 +206,43 @@ static SP<Render::IFramebuffer> g_fbs[N_TILES];
 /// tile has no snapshot (only solos), so `g_fbs[i]` alone cannot say.
 static bool                     g_tileCaptured[N_TILES] = {};
 static PHLMONITORREF            g_captureMon;
+
+// ---- SCREENS: every screen its own workspaces (Golem's hyprland.lua) ----
+// A screen's workspaces are a BLOCK: the screen's default workspace rule
+// names the block's first one and the other 17 follow it (the laptop's
+// 1..18, a TV's 101..118). The grid shows one block at a time — its 18
+// tiles are that block's workspaces — so every tile <-> workspace conversion
+// goes through g_base. Without such rules every base is 0: tiles 1..18, as
+// before. A block's base is read from the rules, never assumed: the config
+// owns the numbering.
+static int64_t g_base = 0; // the block on the grid: tile t is workspace g_base + t + 1
+static int     tileFor(int64_t wsId) {
+    return waveview_tile_for_workspace(wsId - g_base);
+}
+static int64_t wsFor(int tile) {
+    return g_base + tile + 1;
+}
+// The base of the block whose first workspace `wsString` names, or 0.
+static int64_t baseOfDefault(const std::string& wsString) {
+    int64_t    id = 0;
+    const auto r  = std::from_chars(wsString.data(), wsString.data() + wsString.size(), id);
+    return (r.ec == std::errc{} && id >= 1) ? id - 1 : 0;
+}
+// Screen `m`'s own block.
+static int64_t screenBase(PHLMONITOR m) {
+    return m ? baseOfDefault(Config::workspaceRuleMgr()->getDefaultWorkspaceFor(m->m_name)) : 0;
+}
+// The block workspace `wsId` belongs to: that of the screen its rule binds
+// it to, connected or not (a gone screen's workspaces keep their block).
+static int64_t blockOf(int64_t wsId) {
+    const auto bound = Config::workspaceRuleMgr()->getBoundMonitorStringForWS(std::to_string(wsId));
+    if (bound.empty())
+        return 0;
+    for (const auto& r : Config::workspaceRuleMgr()->getAllWorkspaceRules())
+        if (r.m_enabled && r.m_isDefault.value_or(false) && r.m_monitor == bound)
+            return baseOfDefault(r.m_workspaceString);
+    return 0;
+}
 
 // The single wallpaper-only backdrop (no windows, no bars) drawn behind
 // everything, replacing the old per-tile repeated wallpapers.
@@ -476,7 +516,7 @@ static Time::steady_tp g_boostUntil{};  // fast recapture while a real re-tile s
 
 // Mark the workspace's tile for the next partial capture; no-op off-grid.
 static void markDirty(int64_t wsId) {
-    if (const int t = waveview_tile_for_workspace(wsId); t >= 0)
+    if (const int t = tileFor(wsId); t >= 0)
         g_dirtyTiles |= (1u << t);
 }
 // Capture at ~20fps for the next BOOST_MS — a real re-tile is springing
@@ -544,7 +584,7 @@ static uint32_t scanWindowChanges(PHLMONITOR m) {
         if (!w || !w->m_isMapped || w->isHidden() || w->monitorID() != m->m_id)
             continue;
         const CBox    b = w->getWindowMainSurfaceBox();
-        const SWinSig sig{waveview_tile_for_workspace(w->workspaceID()), b.x, b.y, b.w, b.h, w->m_dimPercent->value(),
+        const SWinSig sig{tileFor(w->workspaceID()), b.x, b.y, b.w, b.h, w->m_dimPercent->value(),
                           w->m_borderFadeAnimationProgress->value(), w->effectiveAlpha(), w->m_isFloating, w->isFullscreen()};
         seen.insert(w.get());
         const auto it = g_winSigs.find(w.get());
@@ -572,7 +612,7 @@ static uint32_t scanWindowChanges(PHLMONITOR m) {
 // background apps awake while the overview is open. Every tick, captured or not.
 static void keepClientsPainting(PHLMONITOR m) {
     for (int i = 0; i < N_TILES; ++i)
-        if (const auto ws = g_pCompositor->getWorkspaceByID(i + 1))
+        if (const auto ws = g_pCompositor->getWorkspaceByID(wsFor(i)))
             g_pHyprRenderer->sendFrameEventsToWorkspace(m, ws, Time::steadyNow());
 }
 // Float-leak watch (diagnosis, v0.21): every gesture end arms this; the live
@@ -1209,7 +1249,7 @@ static void captureWindows(PHLMONITOR m, uint32_t mask = ALL_TILES) {
             g_wins.push_back(*stashDragged); // parked offscreen — reuse its capture
             continue;
         }
-        const int tile = waveview_tile_for_workspace(w->workspaceID());
+        const int tile = tileFor(w->workspaceID());
         if (tile < 0)
             continue;
         const CBox wb = w->getWindowMainSurfaceBox(); // logical coords, CURRENT (pixels live here)
@@ -1495,7 +1535,7 @@ static void captureWorkspaces(PHLMONITOR m, uint32_t mask = ALL_TILES) {
     for (auto& w : g_pCompositor->m_windows) {
         if (!w || !w->m_isMapped || w->isHidden() || w->monitorID() != m->m_id)
             continue;
-        if (const int t = waveview_tile_for_workspace(w->workspaceID()); t >= 0)
+        if (const int t = tileFor(w->workspaceID()); t >= 0)
             occupied |= (1u << t);
     }
 
@@ -1539,7 +1579,7 @@ static void captureWorkspaces(PHLMONITOR m, uint32_t mask = ALL_TILES) {
             glClearColor(0.0F, 0.0F, 0.0F, 1.0F);
             glClear(GL_COLOR_BUFFER_BIT);
 
-            if (const auto ws = g_pCompositor->getWorkspaceByID(i + 1)) {
+            if (const auto ws = g_pCompositor->getWorkspaceByID(wsFor(i))) {
                 m->m_activeWorkspace = ws; // renderWorkspace draws the monitor's active ws
                 // Snap this workspace's windows to their on-screen positions (non-active
                 // workspaces are parked offscreen), else renderWorkspace captures nothing
@@ -1560,7 +1600,7 @@ static void captureWorkspaces(PHLMONITOR m, uint32_t mask = ALL_TILES) {
         // juggling as a snapshot, one render pass per window — never nested
         // (nesting render passes corrupts GL).
         if (collage)
-            if (const auto ws = g_pCompositor->getWorkspaceByID(i + 1)) {
+            if (const auto ws = g_pCompositor->getWorkspaceByID(wsFor(i))) {
                 m->m_activeWorkspace = ws;
                 g_pDesktopAnimationManager->startAnimation(ws, CDesktopAnimationManager::ANIMATION_TYPE_IN, true, true);
                 ws->m_visible = true;
@@ -1751,7 +1791,7 @@ static void computeTileSpreads(PHLMONITOR m, uint32_t mask, uint32_t occupied) {
         for (auto& w : g_pCompositor->m_windows) {
             if (!w || !w->m_isMapped || w->isHidden() || w->m_fadingOut || w->monitorID() != m->m_id)
                 continue;
-            if (waveview_tile_for_workspace(w->workspaceID()) != i)
+            if (tileFor(w->workspaceID()) != i)
                 continue;
             if (g_dragReal && w == g_dragWin.lock())
                 continue;
@@ -2286,14 +2326,243 @@ static void refreshSpread(PHLMONITOR m) {
 // tile (focused window highlighted). Used on monitors we haven't captured
 // thumbnails for. Tiles are pixel-space; window boxes are logical — the brain
 // reconciles the two.
+// ---- PAGES: one block of workspaces at a time ----
+// The overview's screen has its own block (its page), and each screen that
+// is GONE, whose workspaces this screen now shows, has a page of its own to
+// the right, in block order: kept apart, never merged into this screen's,
+// and gone again once nothing is left on it (Max, 2026-11-07: "al
+// desenchufar quedan aparte ... la pagina deberia desaparecer si queda vacia
+// y la pantalla esta vacia"). Words along the bottom name the pages; a click
+// on one or a sideways scroll turns the page, and a window dropped on one
+// goes to that page.
+struct SPage {
+    int64_t     base = 0;
+    std::string label;
+    bool        gone = false; // its screen is not connected
+};
+struct SPageWord {
+    CBox    hit;
+    int64_t base = 0;
+};
+static std::vector<SPage>                                    g_pages;
+static std::vector<SPageWord>                                g_pageWords;   // as last drawn: what a click or a drop hits
+static std::unordered_map<std::string, std::string>          g_screenNames; // rule monitor string -> its page's word
+static std::unordered_map<std::string, SP<Render::ITexture>> g_wordTex;     // text textures, by word + ink + size
+static Time::steady_tp                                       g_pageShownAt{};
+static double                                                g_sideAcc = 0.0; // sideways finger travel toward a turn
+static constexpr double                                      PAGE_FADE_MS = 160.0;
+
+static std::string screenRuleKey(PHLMONITOR m) {
+    return m->m_description.empty() ? m->m_name : "desc:" + m->m_description;
+}
+static bool isPanelOutput(const std::string& name) {
+    return name.starts_with("eDP") || name.starts_with("LVDS") || name.starts_with("DSI");
+}
+// Every connected screen's word, remembered for when it is gone.
+static void learnScreenNames() {
+    for (const auto& mon : g_pCompositor->m_monitors) {
+        if (!mon || mon->m_name.starts_with("FALLBACK"))
+            continue;
+        const std::string model = mon->m_output ? mon->m_output->model : "";
+        g_screenNames[screenRuleKey(mon)] = isPanelOutput(mon->m_name) ? "Laptop" : !model.empty() ? model : mon->m_name;
+    }
+}
+// The rule monitor string of the screen whose block starts after `base`.
+static std::string blockScreen(int64_t base) {
+    for (const auto& r : Config::workspaceRuleMgr()->getAllWorkspaceRules())
+        if (r.m_enabled && r.m_isDefault.value_or(false) && baseOfDefault(r.m_workspaceString) == base)
+            return r.m_monitor;
+    return "";
+}
+static bool screenConnected(const std::string& key) {
+    for (const auto& mon : g_pCompositor->m_monitors)
+        if (mon && mon->m_enabled && screenRuleKey(mon) == key)
+            return true;
+    return false;
+}
+static void computePages(PHLMONITOR m) {
+    g_pages.clear();
+    if (!m)
+        return;
+    learnScreenNames();
+    const int64_t        own = screenBase(m);
+    std::vector<int64_t> others;
+    for (const auto& ws : g_pCompositor->getWorkspaces()) {
+        if (!ws || ws->m_isSpecialWorkspace || ws->m_id < 1 || ws->m_monitor != m)
+            continue;
+        const int64_t b = blockOf(ws->m_id);
+        if (b == own || std::ranges::find(others, b) != others.end())
+            continue;
+        if (ws->getWindows() > 0 || ws->m_id == m->activeWorkspaceID())
+            others.push_back(b);
+    }
+    std::ranges::sort(others);
+    auto add = [&](int64_t b) {
+        const auto  key   = blockScreen(b);
+        const auto  it    = g_screenNames.find(key);
+        std::string label = it != g_screenNames.end() ? it->second : key.starts_with("desc:") ? key.substr(5) : key;
+        if (it == g_screenNames.end() && key.starts_with("desc:")) {
+            // "<make> <model> <serial>": the model is the word before the serial
+            std::vector<std::string> words;
+            std::istringstream       in(label);
+            for (std::string w; in >> w;)
+                words.push_back(w);
+            if (words.size() > 1 && (words.back().starts_with("0x") || words.back().find_first_not_of("0123456789") == std::string::npos))
+                words.pop_back();
+            if (!words.empty())
+                label = words.back();
+        }
+        g_pages.push_back({b, label.empty() ? std::to_string(b + 1) : label, !key.empty() && !screenConnected(key)});
+    };
+    add(own);
+    for (const auto b : others)
+        add(b);
+}
+static int pageIndex(int64_t base) {
+    for (size_t i = 0; i < g_pages.size(); ++i)
+        if (g_pages[i].base == base)
+            return (int)i;
+    return -1;
+}
+
+// Put block `base` on the grid: every tile is another workspace now, so the
+// per-tile photographs and the vertical page start over.
+static void showPage(PHLMONITOR m, int64_t base) {
+    if (!m || base == g_base)
+        return;
+    trace("page %lld -> %lld", (long long)g_base, (long long)base);
+    g_base = base;
+    for (int i = 0; i < N_TILES; ++i)
+        g_tileCaptured[i] = false;
+    g_hoverWin.reset();
+    g_page       = 0;
+    g_scroll     = g_scrollTarget = g_scrollFrom = 0.0;
+    g_scrollProg = 1.0f;
+    const int at = tileFor(m->activeWorkspaceID());
+    g_zoomTile   = at >= 0 ? at : 0;
+    g_pageShownAt = Time::steadyNow();
+    captureWorkspaces(m, ALL_TILES);
+    damageAll();
+}
+
+// The page word under draw-space point `c`, as its block's base; -1 for none.
+static int64_t pageWordAt(const Vector2D& c) {
+    for (const auto& w : g_pageWords)
+        if (w.hit.containsPoint(c))
+            return w.base;
+    return -1;
+}
+
+// A window dropped on another page's word: onto the workspace that page is
+// showing, if this screen shows one of its workspaces; else its first
+// workspace with windows; else its first.
+static void sendToPage(PHLMONITOR m, PHLWINDOW w, int64_t base) {
+    if (!m || !w)
+        return;
+    int64_t    to     = -1;
+    const auto active = m->activeWorkspaceID();
+    if (active > base && active <= base + N_TILES)
+        to = active;
+    for (int i = 1; to < 0 && i <= N_TILES; ++i)
+        if (const auto ws = g_pCompositor->getWorkspaceByID(base + i); ws && ws->getWindows() > 0)
+            to = base + i;
+    if (to < 0)
+        to = base + 1;
+    auto ws = g_pCompositor->getWorkspaceByID(to);
+    if (!ws)
+        ws = g_pCompositor->createNewWorkspace(to, m->m_id);
+    if (!ws)
+        return;
+    trace("page drop ws=%d -> %lld", (int)w->workspaceID(), (long long)to);
+    g_pCompositor->moveWindowToWorkspaceSafe(w, ws);
+}
+
+static SP<Render::ITexture> wordTexture(const std::string& text, const CHyprColor& ink, int pt, bool italic) {
+    const auto key = std::format("{}|{:.2f}|{}|{}", text, ink.r, pt, italic);
+    if (const auto it = g_wordTex.find(key); it != g_wordTex.end() && it->second)
+        return it->second;
+    auto tex = g_pHyprRenderer->renderText(text, ink, pt, italic, "Sans", 0);
+    if (tex)
+        g_wordTex[key] = tex;
+    return tex;
+}
+
+// The page words, centred along the bottom margin under the grid: the page
+// on the grid underlined, a gone screen's word in italics. Drawn only with
+// more than one page and only near the full grid (they fade in with it).
+static void drawPageWords(PHLMONITOR m, float p) {
+    g_pageWords.clear();
+    if (g_pages.size() < 2 || p < 0.6f)
+        return;
+    const double sc    = m->m_scale;
+    const float  a     = std::clamp((p - 0.6f) / 0.4f, 0.0f, 1.0f);
+    const int    pt    = (int)std::lround(12.0 * sc);
+    const double gap   = 26.0 * sc;
+    const double padX  = 12.0 * sc, padY = 7.0 * sc;
+    const double mw    = m->m_transformedSize.x, mh = m->m_transformedSize.y;
+    const double baseY = mh - DSN_OUTER * sc / 2.0;
+
+    struct SW {
+        SP<Render::ITexture> tex;
+        int64_t              base;
+        bool                 on;
+    };
+    std::vector<SW> ws;
+    double          total = 0.0;
+    for (const auto& pg : g_pages) {
+        const bool on  = pg.base == g_base;
+        auto       tex = wordTexture(pg.label, on ? CHyprColor(0.94, 0.93, 0.97, 1.0) : CHyprColor(0.70, 0.69, 0.76, 1.0), pt, pg.gone);
+        if (!tex || tex->m_size.x < 1)
+            continue;
+        total += tex->m_size.x + (ws.empty() ? 0.0 : gap);
+        ws.push_back({tex, pg.base, on});
+    }
+    if (ws.size() < 2)
+        return;
+    const double th = ws.front().tex->m_size.y;
+    // a quiet plate under the words, so they read on any wallpaper
+    renderRect(CBox{(mw - total) / 2.0 - padX * 1.5, baseY - th / 2.0 - padY, total + padX * 3.0, th + padY * 2.0},
+               CHyprColor(0.0, 0.0, 0.0, 0.30 * a), (int)std::lround(th / 2.0 + padY));
+    double x = (mw - total) / 2.0;
+    for (const auto& w : ws) {
+        const CBox box{x, baseY - w.tex->m_size.y / 2.0, w.tex->m_size.x, w.tex->m_size.y};
+        CTexPassElement::SRenderData td;
+        td.tex = w.tex;
+        td.box = box;
+        td.a   = a;
+        g_pHyprRenderer->m_renderPass.add(makeUnique<CTexPassElement>(td));
+        if (w.on)
+            renderRect(CBox{box.x, box.y + box.h + 2.0 * sc, box.w, std::max(1.0, std::round(1.5 * sc))}, CHyprColor(0.94, 0.93, 0.97, 0.9 * a));
+        g_pageWords.push_back({CBox{box.x - gap / 2.0, box.y - padY, box.w + gap, box.h + padY * 2.0}, w.base});
+        x += w.tex->m_size.x + gap;
+    }
+}
+
+// A turned page fades its tiles in over the wallpaper.
+static void drawPageFade(PHLMONITOR m) {
+    const double ms = std::chrono::duration<double, std::milli>(Time::steadyNow() - g_pageShownAt).count();
+    if (ms >= PAGE_FADE_MS || !g_bgFB)
+        return;
+    if (const auto bg = g_bgFB->getTexture()) {
+        CTexPassElement::SRenderData td;
+        td.tex = bg;
+        td.box = CBox{0.0, 0.0, m->m_transformedSize.x, m->m_transformedSize.y};
+        td.a   = (float)(1.0 - ms / PAGE_FADE_MS);
+        g_pHyprRenderer->m_renderPass.add(makeUnique<CTexPassElement>(td));
+    }
+    g_pHyprRenderer->damageMonitor(m);
+    g_pCompositor->scheduleFrameForMonitor(m);
+}
+
 static void drawSchematic(PHLMONITOR m, const Rect tiles[N_TILES]) {
+    const int64_t schematicBase = screenBase(m); // not the grid's block: this screen's own
     for (int i = 0; i < N_TILES; ++i)
         renderRect(CBox{tiles[i].x, tiles[i].y, tiles[i].w, tiles[i].h}, CHyprColor(0.0, 0.0, 0.0, 0.35));
 
     for (auto& w : g_pCompositor->m_windows) {
         if (!w || !w->m_isMapped || w->isHidden() || w->monitorID() != m->m_id)
             continue;
-        const int ti = waveview_tile_for_workspace(w->workspaceID());
+        const int ti = waveview_tile_for_workspace(w->workspaceID() - schematicBase);
         if (ti < 0)
             continue;
 
@@ -2850,6 +3119,9 @@ static void drawOverview(PHLMONITOR m, float p, float pl, int zoomTile) {
         band(std::min(mw, x1), std::max(0.0, y0), std::max(0.0, mw - x1),
              std::max(0.0, std::min(mh, y1) - std::max(0.0, y0)));  // right
     }
+
+    drawPageFade(m);
+    drawPageWords(m, p);
 }
 
 // While the overview is open, re-capture thumbnails on a timer so they stay live.
@@ -2909,6 +3181,14 @@ static void onLiveTimer(SP<CEventLoopTimer> self, void*) {
         const bool full = !boosting && ++g_ticksSinceFullPass >= FULL_PASS_EVERY;
         if (full)
             g_ticksSinceFullPass = 0;
+        if (full && !g_dragWin.lock()) {
+            computePages(m);
+            if (pageIndex(g_base) < 0) { // emptied from elsewhere: the page goes, ours comes back
+                showPage(m, screenBase(m));
+                self->updateTimeout(REFRESH_MS);
+                return;
+            }
+        }
         const uint32_t mask = full ? ALL_TILES : g_dirtyTiles;
         if (mask)
             captureWorkspaces(m, mask);
@@ -3256,9 +3536,9 @@ static void repinAfterMap(bool photograph) {
         const auto w = ref.lock();
         if (!w || !w->m_isMapped || w->m_pinned || !w->m_isFloating || w->isFullscreen())
             continue; // closed, tiled or made fullscreen meanwhile: it is no longer a window that can be pinned
-        const int was = waveview_tile_for_workspace(w->workspaceID());
+        const int was = tileFor(w->workspaceID());
         golemPin(w);
-        const int now = waveview_tile_for_workspace(w->workspaceID());
+        const int now = tileFor(w->workspaceID());
         trace("map repin ws=%d pinned=%d", (int)w->workspaceID(), (int)w->m_pinned);
         for (const int t : {was, now})
             if (t >= 0) {
@@ -3352,7 +3632,7 @@ static void seatOwed() {
             continue;
         trace("seat-owed ws=%d (from ws %d) centre=(%.0f,%.0f)", (int)w->workspaceID(), e.ws, to.x, to.y);
         markDirty(w->workspaceID());
-        const int t = waveview_tile_for_workspace((int)w->workspaceID());
+        const int t = tileFor((int)w->workspaceID());
         if (t >= 0)
             moved |= 1u << t;
     }
@@ -3573,33 +3853,33 @@ static bool landAt(PHLMONITOR m, const Vector2D& c, PHLWINDOW dw, const LiveComm
         // the WS 5 and 6 at the same time"*). Dropped on any tile it only
         // takes the place the pointer shows, and stays where it lives.
         const bool pinned = dw->m_pinned;
-        if (pinned || dw->workspaceID() == sig.tile + 1)
+        if (pinned || dw->workspaceID() == wsFor(sig.tile))
             endRealDrag(here, nullptr);
         else {
             endRealDrag(std::nullopt);
-            auto ws = g_pCompositor->getWorkspaceByID(sig.tile + 1);
+            auto ws = g_pCompositor->getWorkspaceByID(wsFor(sig.tile));
             if (!ws)
-                ws = g_pCompositor->createNewWorkspace(sig.tile + 1, m->m_id);
+                ws = g_pCompositor->createNewWorkspace(wsFor(sig.tile), m->m_id);
             if (!ws)
                 return false;
             g_pCompositor->moveWindowToWorkspaceSafe(dw, ws);
             dw->m_alpha.warp(); // no arrival-fade blink in the captures
         }
         seatFloat(dw, here);
-        if (pinned || sig.tile + 1 == from)
+        if (pinned || wsFor(sig.tile) == from)
             std::erase_if(g_seatLater, [&](const SSeatLater& e) { return e.win.lock() == dw; });
         else if (!debt)
             g_seatLater.push_back(SSeatLater{dw, g_origHome, g_origMonPos, g_origWS});
-        trace("land float ws=%d at=(%.0f,%.0f) owes=%d", (int)dw->workspaceID(), here.x, here.y, (int)(sig.tile + 1 != from));
+        trace("land float ws=%d at=(%.0f,%.0f) owes=%d", (int)dw->workspaceID(), here.x, here.y, (int)(wsFor(sig.tile) != from));
         return true;
     }
-    if (dw->workspaceID() == sig.tile + 1)
+    if (dw->workspaceID() == wsFor(sig.tile))
         endRealDrag(desk, under);
     else {
         endRealDrag(std::nullopt);
-        auto ws = g_pCompositor->getWorkspaceByID(sig.tile + 1);
+        auto ws = g_pCompositor->getWorkspaceByID(wsFor(sig.tile));
         if (!ws)
-            ws = g_pCompositor->createNewWorkspace(sig.tile + 1, m->m_id);
+            ws = g_pCompositor->createNewWorkspace(wsFor(sig.tile), m->m_id);
         if (!ws)
             return false;
         g_pCompositor->moveWindowToWorkspaceSafe(dw, ws);
@@ -3664,7 +3944,7 @@ static void maybeCommit(PHLMONITOR m) {
     // Empty space in the view it already occupies isn't a new placement
     // either — re-committing there just churned the layout (and a null
     // split target falls to dwindle's stale-focus default slot).
-    if (g_commit.active && sig.active && !sig.under.lock() && sig.tile + 1 == dw->workspaceID())
+    if (g_commit.active && sig.active && !sig.under.lock() && wsFor(sig.tile) == dw->workspaceID())
         return;
     // Only a change of TARGET (tile / under-window) restarts the dwell
     // clock. The quadrant side wobbles with the cursor's slope — and with
@@ -4016,6 +4296,30 @@ static void onMouseAxis(IPointer::SAxisEvent e, Event::SCallbackInfo& info) {
     if (inTopbarStrip(m))
         return; // scrolls over the bar are the bar's (its boxes scroll)
     info.cancelled = true;
+    if (e.axis == WL_POINTER_AXIS_HORIZONTAL_SCROLL) {
+        // Sideways: the next screen's page (see PAGES). Same notch and
+        // finger rules as the vertical flip.
+        if (g_pages.size() < 2 || std::chrono::duration<double>(Time::steadyNow() - g_pageFlipAt).count() < 0.3)
+            return;
+        int side = 0;
+        if (e.source == WL_POINTER_AXIS_SOURCE_FINGER) {
+            if (e.delta * g_sideAcc < 0.0)
+                g_sideAcc = 0.0;
+            g_sideAcc += e.delta;
+            if (std::abs(g_sideAcc) < FINGER_FLIP_AT)
+                return;
+            side      = g_sideAcc > 0.0 ? 1 : -1;
+            g_sideAcc = 0.0;
+        } else
+            side = e.delta > 0.0 ? 1 : e.delta < 0.0 ? -1 : 0;
+        const int at = pageIndex(g_base), next = std::clamp(at + side, 0, (int)g_pages.size() - 1);
+        if (at < 0 || next == at)
+            return;
+        g_pageFlipAt = Time::steadyNow();
+        g_tourDone   = true;
+        showPage(m, g_pages[next].base);
+        return;
+    }
     if (e.axis != WL_POINTER_AXIS_VERTICAL_SCROLL)
         return;
     const auto now = Time::steadyNow();
@@ -4132,7 +4436,7 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
         // resizes. The interior grab below moves.
         if (const auto ew = g_edgeWin.lock(); ew && !ew->isFullscreen() && inLayoutSpace(ew) && !g_dragWin.lock()) {
             Rect      tiles[N_TILES];
-            const int t = waveview_tile_for_workspace(ew->workspaceID());
+            const int t = tileFor(ew->workspaceID());
             if (t >= 0 && computeTiles(m, tiles) == N_TILES && tiles[t].w > 0.0 && tiles[t].h > 0.0) {
                 const SUsable u = usableArea(m);
                 g_resizing     = true;
@@ -4146,6 +4450,11 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
                 boostCaptures();
                 return;
             }
+        }
+        if (const int64_t word = pageWordAt(c); word >= 0) {
+            g_tourDone = true;
+            showPage(m, word); // (its release finds no gesture and only re-hovers)
+            return;
         }
         g_pressPos  = c;
         g_dragMoved = false;
@@ -4205,7 +4514,7 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
     }
     if (!dw && !moved && pressTile >= 0) {
         g_dragWin.reset();
-        jumpTo(pressTile + 1); // click on an empty workspace → jump there, closing the overview
+        jumpTo(wsFor(pressTile)); // click on an empty workspace → jump there, closing the overview
         return;
     }
     if (!dw && moved) {
@@ -4233,7 +4542,7 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
                 Rect      tiles[N_TILES];
                 // (The tile it was let go on: for a pinned window that is not
                 // its workspace's — see `landAt`.)
-                const int t = g_commit.tile >= 0 ? g_commit.tile : waveview_tile_for_workspace(dw->workspaceID());
+                const int t = g_commit.tile >= 0 ? g_commit.tile : tileFor(dw->workspaceID());
                 if (t >= 0 && computeTiles(m, tiles) == N_TILES && CBox{tiles[t].x, tiles[t].y, tiles[t].w, tiles[t].h}.containsPoint(c) &&
                     seatFloat(dw, floatDropCentre(m, tiles[t], c, dw))) {
                     markDirty(dw->workspaceID());
@@ -4249,6 +4558,26 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
             g_commit  = {};
             g_pending = {};
             g_origWS  = -1;
+            damageAll();
+            return;
+        }
+        if (const int64_t to = pageWordAt(c); to >= 0 && to != g_base) {
+            // Onto another page's word: back where it came from first (un-
+            // parked, its own float state), then over to that page.
+            restoreOriginal();
+            sendToPage(m, dw, to);
+            g_dragWin.reset();
+            g_commit  = {};
+            g_pending = {};
+            g_origWS  = -1;
+            restoreFloatState(dw);
+            armFloatWatch(dw);
+            computePages(m);
+            if (pageIndex(g_base) < 0)
+                showPage(m, screenBase(m)); // that was its last window: the page goes with it
+            else
+                captureWorkspaces(m, ALL_TILES);
+            updateHoverAt(m, c);
             damageAll();
             return;
         }
@@ -5174,6 +5503,10 @@ static void closeOverview() {
     restoreOriginal(); // never leave a real drag dangling; a commit is undone
     g_dragWin.reset();
     g_dragMoved  = false;
+    // Turned to another screen's page and left without picking: the close
+    // zooms into the workspace we are on, so its page comes back first.
+    if (const auto m = g_captureMon.lock(); m && blockOf(m->activeWorkspaceID()) != g_base)
+        showPage(m, blockOf(m->activeWorkspaceID()));
     // Escape / gesture / toggle: nothing was picked, so the stage comes back on
     // whatever is focused — which is where it already was.
     startClose();
@@ -5251,7 +5584,11 @@ static void toggle() {
         g_active         = true;
         unpinForMap(); // see `g_mapUnpinned`
         const auto m     = g_pCompositor->getMonitorFromCursor();
-        const int  at    = waveview_tile_for_workspace(m ? m->activeWorkspaceID() : -1);
+        g_base           = m ? blockOf(m->activeWorkspaceID()) : 0; // a gone screen's workspace shown here opens ITS page
+        computePages(m);
+        g_pageShownAt = {}; // no page fade on open: the zoom is the entrance
+        g_sideAcc     = 0.0;
+        const int  at    = tileFor(m ? m->activeWorkspaceID() : -1);
         g_zoomTile       = at >= 0 ? at : 0;
         // Open on the page holding the active workspace, already settled
         // (no flip animation on open — the zoom pivots on-screen).
@@ -5514,7 +5851,7 @@ static void onSwipeEnd(IPointer::SSwipeEndEvent, Event::SCallbackInfo& info) {
 static void jumpTo(int wsId, bool startTheClose) {
     if (!g_active)
         return;
-    const int t = waveview_tile_for_workspace(wsId);
+    const int t = tileFor(wsId);
     if (t < 0)
         return;
 
@@ -5569,7 +5906,7 @@ static void jumpToWindow(PHLWINDOW w) {
     if (!g_stageMode) {
         settleFocusLook(w->workspaceID());
         if (const auto m = g_captureMon.lock(); m && g_active) {
-            const int t = waveview_tile_for_workspace(w->workspaceID());
+            const int t = tileFor(w->workspaceID());
             if (t >= 0)
                 captureWorkspaces(m, 1u << t);
         }
@@ -5619,7 +5956,7 @@ static void onKey(IKeyboard::SKeyEvent e, Event::SCallbackInfo& info) {
                 if (pressed) {
                     ownInput(g_ownedKeys, e.keycode, true);
                     info.cancelled = true;
-                    const int ws = (int)(e.keycode - EVDEV_1 + 1);
+                    const int ws = (int)(screenBase(g_spreadMon.lock()) + e.keycode - EVDEV_1 + 1);
                     snapCloseSpread();
                     if (g_pKeybindManager) {
                         const auto it = g_pKeybindManager->m_dispatchers.find("workspace");
@@ -5642,7 +5979,7 @@ static void onKey(IKeyboard::SKeyEvent e, Event::SCallbackInfo& info) {
             closeSpread(); // Escape is the back gesture's keyboard twin
         } else if (e.keycode >= EVDEV_1 && e.keycode <= EVDEV_9) {
             // Digits mean workspaces everywhere in waveview: leave for N.
-            const int ws = (int)(e.keycode - EVDEV_1 + 1);
+            const int ws = (int)(screenBase(g_spreadMon.lock()) + e.keycode - EVDEV_1 + 1);
             snapCloseSpread();
             if (g_pKeybindManager) {
                 const auto it = g_pKeybindManager->m_dispatchers.find("workspace");
@@ -5666,7 +6003,7 @@ static void onKey(IKeyboard::SKeyEvent e, Event::SCallbackInfo& info) {
             if (pressed) {
                 ownInput(g_ownedKeys, e.keycode, true);
                 info.cancelled = true;
-                jumpTo(g_page * 9 + static_cast<int>(e.keycode - EVDEV_1 + 1));
+                jumpTo(wsFor(g_page * 9 + static_cast<int>(e.keycode - EVDEV_1)));
             } else if (ownInput(g_ownedKeys, e.keycode, false))
                 info.cancelled = true;
         }
@@ -5681,7 +6018,7 @@ static void onKey(IKeyboard::SKeyEvent e, Event::SCallbackInfo& info) {
     info.cancelled = true; // plain typing never reaches the desktop while open
 
     if (e.keycode >= EVDEV_1 && e.keycode <= EVDEV_9) {
-        jumpTo(g_page * 9 + static_cast<int>(e.keycode - EVDEV_1 + 1));
+        jumpTo(wsFor(g_page * 9 + static_cast<int>(e.keycode - EVDEV_1)));
         return;
     }
     if (e.keycode == EVDEV_Q) {
@@ -6998,6 +7335,8 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     g_moveListener   = Event::bus()->m_events.input.mouse.move.listen(onMouseMove);
     g_buttonListener = Event::bus()->m_events.input.mouse.button.listen(onMouseButton);
     g_axisListener   = Event::bus()->m_events.input.mouse.axis.listen(onMouseAxis);
+    g_monitorAddedListener = Event::bus()->m_events.monitor.added.listen([](PHLMONITOR) { learnScreenNames(); });
+    learnScreenNames();
     g_swipeBeginListener  = Event::bus()->m_events.gesture.swipe.begin.listen(onSwipeBegin);
     g_swipeUpdateListener = Event::bus()->m_events.gesture.swipe.update.listen(onSwipeUpdate);
     g_swipeEndListener    = Event::bus()->m_events.gesture.swipe.end.listen(onSwipeEnd);
