@@ -5129,6 +5129,14 @@ static void onRender(eRenderStage stage) {
     const auto m = g_pHyprRenderer->m_renderData.pMonitor.lock();
     if (!m)
         return;
+    // Only the overview's own screen shows it: every other screen goes on
+    // showing its desktop, untouched. It used to get the flat schematic of
+    // its own grid (Max, 2026-11-10: "i see shades of overview on the other
+    // monitor"); its pages are on the overview's screen now. Its frames don't
+    // step the animation either, so one screen's clock drives the visit. (The
+    // overview's screen gone mid-visit: whichever is left runs it to its end.)
+    if (const auto cm = g_captureMon.lock(); cm && cm != m)
+        return;
 
     // The answer never came (waverunner gone, a daemon too old to know
     // `stage-resume`): the close was never waiting on it, so this only drops the
@@ -7608,7 +7616,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     g_pEventLoopManager->addTimer(g_dockWatchTimer);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "2.26"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "2.27"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {

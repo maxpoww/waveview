@@ -2054,7 +2054,7 @@ void CGolemBar::renderPass(PHLMONITOR pMonitor, const float& a) {
     {
         CBox card = {DECOBOX.x - pMonitor->m_position.x, DECOBOX.y - pMonitor->m_position.y, DECOBOX.w, DECOBOX.h + PWINDOW->m_realSize->value().y};
         card.translate(PWINDOW->m_floatingOffset).scale(pMonitor->m_scale).round();
-        const bool                 FOCUSED = Desktop::focusState()->window() == PWINDOW;
+        const bool                 FOCUSED = PWINDOW->looksActive(); // per screen, like the border (Golem's unfocused-look-per-screen patch)
         Config::CGradientValueData hair    = PWINDOW->m_realBorderColor; // structure only (angle, the ok cache)
         hair.m_colors.clear();
         hair.m_colors.push_back(CHyprColor{FOCUSED ? GOLEM_CARD_HAIRLINE_FOCUSED : GOLEM_CARD_HAIRLINE_UNFOCUSED});
