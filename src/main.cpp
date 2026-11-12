@@ -492,9 +492,50 @@ static double          g_scrollFrom   = 0.0; // flip start position
 static float           g_scrollProg   = 1.0; // 0..1 through the flip (1 = settled)
 static int             g_page         = 0; // 0 = workspaces 1-9, 1 = 10-18
 static Time::steady_tp g_pageFlipAt{};     // cooldown: one notch = one flip
-// True once the user has seen the other page this open (wheel or Super+R
-// tour) — the next toggle press then closes (see toggle()).
-static bool            g_tourDone     = false;
+// THE TOUR (Max, 2026-11-12: "the scrolling on the overview to happen always
+// with the same gesture that opens the overview"). Pressed again while the map
+// is up, the key or the swipe that opened it goes on to the next place holding
+// windows that this visit has not shown yet, and closes only when none is
+// left (see `tourNext`). A place is a screen's page and its half; every place
+// shown counts, however it was reached (the tour, a scroll, a word, a drag
+// held at an edge), so the tour never shows one twice.
+struct STourStop {
+    int64_t base = 0; // the block (the screen's page)
+    int     page = 0; // its half: 0 = workspaces 1-9, 1 = 10-18
+};
+static std::vector<STourStop> g_toured;
+static bool                   toured(int64_t base, int page) {
+    return std::ranges::any_of(g_toured, [&](const STourStop& s) { return s.base == base && s.page == page; });
+}
+static void noteToured() {
+    if (!toured(g_base, g_page))
+        g_toured.push_back({g_base, g_page});
+}
+
+// The carried window's picture, for a page that does not hold the window: the
+// ghost is drawn from its capture, and a page's captures are of ITS
+// workspaces only. Taken from the page it leaves (`carryDragged`); kept while
+// it travels on.
+struct SDragCarry {
+    PHLWINDOWREF             win;
+    SP<Render::IFramebuffer> fb;
+    Vector2D                 uvTL{0.0, 0.0}, uvBR{1.0, 1.0};
+};
+static SDragCarry g_dragCarry;
+
+// A dragged window held at an edge of the map's screen (see `tickEdgeHold`).
+enum eEdgeHold : uint8_t {
+    EDGE_NONE,
+    EDGE_LEFT,
+    EDGE_RIGHT,
+    EDGE_UP,
+    EDGE_DOWN
+};
+static eEdgeHold        g_edgeHold = EDGE_NONE;
+static Time::steady_tp  g_edgeHoldSince{};
+static constexpr auto   EDGE_HOLD    = std::chrono::milliseconds(450);
+static constexpr double EDGE_HOLD_PX = 2.0; // logical px from the screen's edge
+static bool             tickEdgeHold();
 // Wall-clock dt of the current frame (set in onRender), for the preview glide.
 static float           g_frameDt      = 0.016f;
 // A REAL compositor drag is running for the overview drag (begun at grab so
@@ -528,6 +569,18 @@ static Time::steady_tp g_pendingSince{};
 static int             g_origWS = -1;   // cancel restores these
 static Vector2D        g_origHome{};
 static Vector2D        g_origMonPos{};  // …and the origin of the monitor it stood on (see `seatAtOrigin`)
+static PHLMONITORREF   g_origMon;       // …that monitor
+// What every screen showed when the gesture's window was picked up. A drag in
+// the map does not change it, but the compositor's drag focuses the window it
+// holds, and focusing a window on a workspace not on show brings that
+// workspace up. So picking a window up from a workspace not shown, or landing
+// it on one for a moment on the way (every live commit), left the screen on
+// that workspace, empty once the window went on; and a cancel then lost the
+// window's own workspace (emptied and not shown, it went) and left the window
+// where it had passed. Given back as the gesture ends, however it ends
+// (`reshowOrigin`); found 2026-11-12 in v2.27, made common by carrying a
+// window over the tiles to an edge.
+static std::vector<std::pair<PHLMONITORREF, int64_t>> g_origShown;
 static bool            g_origFloating = false; // float state at gesture start
 static uint32_t        g_dirtyTiles   = 0;     // tiles touched since the last full capture
 // The commit machinery warps the cursor (beginRealDrag / endRealDrag seed
@@ -1080,6 +1133,7 @@ static void beginCloseZoom(); // put the close on its curve (see `startClose`)
 static void beginStageCloseZoom();   // the stage's way back: a short zoom
 static void jumpToWindow(PHLWINDOW w);
 static void updateHoverAt(PHLMONITOR m, const Vector2D& c);
+static void keepPointerOn(PHLMONITOR d); // a carried window stays on the map's screen (see `tickEdgeHold`)
 static void reassertOverviewCursor(); // undo the compositor's border icon (defined with the cursor owner)
 static void closeOverview();
 static void beginRealDrag(PHLWINDOW dw, bool capture = true);
@@ -1281,7 +1335,11 @@ static void captureWindows(PHLMONITOR m, uint32_t mask = ALL_TILES) {
         if (!w || !w->m_isMapped || w->isHidden() || w->monitorID() != m->m_id)
             continue;
         if (stashDragged && w == g_dragWin.lock()) {
-            g_wins.push_back(*stashDragged); // parked offscreen — reuse its capture
+            // Parked offscreen — reuse its capture. Only on its own page: one
+            // carried to another page on this screen (a gone screen's) is drawn
+            // from `g_dragCarry`, and its stale box would join that page's tile.
+            if (tileFor(w->workspaceID()) >= 0)
+                g_wins.push_back(*stashDragged);
             continue;
         }
         const int tile = tileFor(w->workspaceID());
@@ -3212,12 +3270,14 @@ static void drawOverview(PHLMONITOR rm, float p, float pl, int zoomTile) {
 
     // The dragged window rides on top, following the cursor.
     if (dragW) {
+        bool ghosted = false;
         for (auto& cw : g_wins) {
             if (cw.win.lock() != dragW)
                 continue;
             const auto tex = capTex(cw);
             if (!tex)
                 break;
+            ghosted = true;
             // Shapeshifting ghost: eased dims previewing the destination
             // slot, anchored by the grab point as a fraction of the box.
             // The WINDOW ITSELF morphs (per Max — the frosted-plate stand-in
@@ -3230,6 +3290,14 @@ static void drawOverview(PHLMONITOR rm, float p, float pl, int zoomTile) {
             drawTex(tex, b, round, 1.0f, cw.uvTL, cw.uvBR);
             break;
         }
+        // Carried onto a page that does not hold it: from the picture it
+        // brought along (see `g_dragCarry`).
+        if (!ghosted && g_dragCarry.fb && g_dragCarry.win.lock() == dragW)
+            if (const auto tex = g_dragCarry.fb->getTexture()) {
+                CBox b{g_dragCursor.x - g_grabFracX * g_ghostW, g_dragCursor.y - g_grabFracY * g_ghostH, g_ghostW, g_ghostH};
+                haloBorder(b, round);
+                drawTex(tex, b, round, 1.0f, g_dragCarry.uvTL, g_dragCarry.uvBR);
+            }
     }
 
     // ── THE STAGE'S DIM, PAINTED OVER THE MAP ────────────────────────────────
@@ -3335,6 +3403,10 @@ static void onLiveTimer(SP<CEventLoopTimer> self, void*) {
         return;
     }
     if (const auto d = g_captureMon.lock()) {
+        if (tickEdgeHold()) { // a held drag turned the page (and photographed it)
+            self->updateTimeout(std::chrono::milliseconds(50));
+            return;
+        }
         // DIRTY-DRIVEN (see scanWindowChanges): only the tiles whose windows
         // changed since their last photograph, plus a full pass every
         // FULL_PASS_EVERY ticks as the net. Nothing dirty → no photograph and
@@ -3376,7 +3448,8 @@ static void onLiveTimer(SP<CEventLoopTimer> self, void*) {
     }
     // While a live commit's real re-tile is springing, capture at ~20fps so
     // the tiles show the actual animation — that's the point of committing.
-    self->updateTimeout(Time::steadyNow() < g_boostUntil ? std::chrono::milliseconds(50) : REFRESH_MS);
+    // …and while a drag is held at an edge, so the hold turns the page on time.
+    self->updateTimeout(Time::steadyNow() < g_boostUntil || g_edgeHold != EDGE_NONE ? std::chrono::milliseconds(50) : REFRESH_MS);
 }
 
 // Global cursor position expressed in draw space (whole monitor = [0,0,transformedSize]).
@@ -3530,6 +3603,8 @@ static void onMouseMove(Vector2D, Event::SCallbackInfo& info) {
     info.cancelled   = true;
     if (g_busy)
         return; // the machinery's own cursor warps must not feed back into it
+    if (g_dragWin.lock())
+        keepPointerOn(d); // a carried window stays on the map's screen (see `tickEdgeHold`)
     // The hand is already driving: drop the open warp rather than yank the
     // pointer out from under a gesture the user has started.
     if (g_warpPending) {
@@ -4168,6 +4243,24 @@ static void maybeCommit(PHLMONITOR m) {
         commitAt(m, at, dw, sig);
 }
 
+// Every screen shows again what it showed when the gesture began (see
+// `g_origShown`). A workspace that went with nothing on it is made again.
+static void reshowOrigin() {
+    for (const auto& [ref, id] : g_origShown) {
+        const auto mon = ref.lock();
+        if (!mon || !mon->m_enabled || id < 1 || mon->activeWorkspaceID() == id)
+            continue;
+        auto ws = g_pCompositor->getWorkspaceByID(id);
+        if (!ws)
+            ws = g_pCompositor->createNewWorkspace(id, mon->m_id);
+        if (!ws || ws->m_monitor.lock() != mon)
+            continue; // it lives on another screen now: not this one's to pull over
+        trace("reshow %s ws %d -> %lld", mon->m_name.c_str(), (int)mon->activeWorkspaceID(), (long long)id);
+        mon->changeWorkspace(ws, false, true);
+    }
+    g_origShown.clear();
+}
+
 // Cancel from any state: the window goes back to the workspace and spot the
 // gesture started from.
 static void restoreOriginal() {
@@ -4182,15 +4275,22 @@ static void restoreOriginal() {
         regrab(dw); // one mechanism: a held drag we end at the original spot
     g_commit  = {};
     g_pending = {};
-    if (!g_dragReal)
+    if (!g_dragReal) {
+        reshowOrigin();
         return;
+    }
     if (!dw) {
         endRealDrag(std::nullopt);
+        reshowOrigin();
         return;
     }
     if (g_origWS >= 1 && dw->workspaceID() != g_origWS) {
         endRealDrag(std::nullopt);
-        if (const auto ws = g_pCompositor->getWorkspaceByID(g_origWS)) {
+        auto ws = g_pCompositor->getWorkspaceByID(g_origWS);
+        if (!ws) // emptied and not on show, it went: made again where it was
+            if (const auto om = g_origMon.lock(); om && om->m_enabled)
+                ws = g_pCompositor->createNewWorkspace(g_origWS, om->m_id);
+        if (ws) {
             g_pCompositor->moveWindowToWorkspaceSafe(dw, ws);
             dw->m_alpha.warp(); // no arrival-fade blink in the captures
             if (!seatAtOrigin(dw)) // a float goes back to its exact place
@@ -4198,6 +4298,7 @@ static void restoreOriginal() {
         }
     } else
         endRealDrag(g_origHome, nullptr);
+    reshowOrigin(); // after the re-place: it focuses the window too
     armFloatWatch(dw); // cancels are gesture ends too
 }
 
@@ -4378,6 +4479,147 @@ static void                                  holdGrabbingCursor() {
     setOverviewCursor("grabbing", /*force=*/true);
 }
 
+// ---- TURNING THE PAGE --------------------------------------------------------
+// One way to turn it, whatever asks (the wheel, a word, the tour, a dragged
+// window held at an edge): to another screen's page through `showPage`, to the
+// other half of this one through an eased flip. The place reached counts as
+// toured. A window being carried goes along: pulled back out of any slot it
+// was dropped into on the page going away (it would stay there, out of sight,
+// when let go elsewhere), and its picture stays on the pointer even on a page
+// that does not hold it (`g_dragCarry`).
+
+// Eased flip to `page` (the wheel, the tour, the held drag).
+static void flipToPage(int page) {
+    const auto m = ovLay();
+    if (!m || page == g_page)
+        return;
+    g_page         = page;
+    g_scrollFrom   = g_scroll;
+    g_scrollProg   = 0.0f;
+    g_scrollTarget = g_page * pageStep(m);
+    damageAll();
+}
+
+static void carryDragged(PHLWINDOW dw) {
+    for (const auto& cw : g_wins) {
+        if (cw.win.lock() != dw)
+            continue;
+        SP<Render::IFramebuffer> fb = cw.fb;
+        if (cw.spread)
+            if (auto* sc = soloFor(dw, false); sc && sc->fb)
+                fb = sc->fb;
+        if (fb)
+            g_dragCarry = {cw.win, fb, cw.uvTL, cw.uvBR};
+        return;
+    }
+}
+
+// Page `base`, half `half`.
+static void turnPage(int64_t base, int half) {
+    const bool sideways = base != g_base;
+    if (const auto dw = g_dragMoved ? g_dragWin.lock() : PHLWINDOW{}) {
+        const SBusyScope busy;
+        if (g_commit.active)
+            regrab(dw);
+        g_pending      = {}; // a dwell begun on the page going away must not land on this one
+        g_pendingSince = Time::steadyNow();
+        if (sideways)
+            carryDragged(dw);
+    }
+    if (sideways) {
+        showPage(base);
+        if (half != g_page) { // straight onto that half: the page's fade is the entrance
+            const auto m = ovLay();
+            g_page       = half;
+            g_scroll = g_scrollTarget = g_scrollFrom = m ? g_page * pageStep(m) : 0.0;
+            g_scrollProg = 1.0f;
+        }
+    } else
+        flipToPage(half);
+    g_pageFlipAt = Time::steadyNow();
+    noteToured();
+    if (g_dragMoved && g_dragWin.lock())
+        if (const auto m = ovLay())
+            g_dragCursor = cursorDrawSpace(m); // the same pointer, in the new page's space
+    damageAll();
+}
+
+// ---- A DRAGGED WINDOW HELD AT AN EDGE TURNS THE PAGE -------------------------
+// Max, 2026-11-12: *"a way to drag and drop from a monitor to another or from a
+// page to another by holding the window on the edge that takes u to the
+// monitor or page."* The pages lie like the screens, so the left and right
+// edges of the map's screen lead to the pages of the screens beside it; the
+// bottom edge leads down to this page's second half (workspaces 10-18), the
+// top edge back up. Held there for EDGE_HOLD, the page turns; held on, it
+// turns again after another EDGE_HOLD while there is more that way. While a
+// window is carried the pointer stays on the map's screen (`keepPointerOn`),
+// so the edge toward a screen beside is a wall to hold against, not a door
+// onto a desktop where the map is not drawn and the window would vanish.
+// Where edge `e` leads from the page shown: a page index (left, right) or a
+// half (up, down); -1 when nothing lies that way.
+static int edgeLeadsTo(eEdgeHold e) {
+    const int at = pageIndex(g_base);
+    switch (e) {
+        case EDGE_LEFT: return at > 0 ? at - 1 : -1;
+        case EDGE_RIGHT: return at >= 0 && at + 1 < (int)g_pages.size() ? at + 1 : -1;
+        case EDGE_UP: return g_page == 1 ? 0 : -1;
+        case EDGE_DOWN: return g_page == 0 ? 1 : -1;
+        default: return -1;
+    }
+}
+
+// The edge of the map's screen the pointer holds that leads somewhere; in a
+// corner the screens beside come first.
+static eEdgeHold edgeUnderPointer(PHLMONITOR d) {
+    const Vector2D p = g_pInputManager->getMouseCoordsInternal() - d->m_position;
+    if (p.x <= EDGE_HOLD_PX && edgeLeadsTo(EDGE_LEFT) >= 0)
+        return EDGE_LEFT;
+    if (p.x >= d->m_size.x - 1.0 - EDGE_HOLD_PX && edgeLeadsTo(EDGE_RIGHT) >= 0)
+        return EDGE_RIGHT;
+    if (p.y <= EDGE_HOLD_PX && edgeLeadsTo(EDGE_UP) >= 0)
+        return EDGE_UP;
+    if (p.y >= d->m_size.y - 1.0 - EDGE_HOLD_PX && edgeLeadsTo(EDGE_DOWN) >= 0)
+        return EDGE_DOWN;
+    return EDGE_NONE;
+}
+
+// Fed by every drag motion and by the live timer (a hold expires with the
+// pointer at rest). True when it turned the page.
+static bool tickEdgeHold() {
+    const auto      d        = g_captureMon.lock();
+    const bool      carrying = d && g_dragMoved && g_dragWin.lock() && !g_resizing && g_animTarget >= 0.5f;
+    const eEdgeHold e        = carrying ? edgeUnderPointer(d) : EDGE_NONE;
+    const auto      now      = Time::steadyNow();
+    if (e != g_edgeHold) {
+        g_edgeHold      = e;
+        g_edgeHoldSince = now;
+        return false;
+    }
+    if (e == EDGE_NONE || now - g_edgeHoldSince < EDGE_HOLD || g_scrollProg < 1.0f)
+        return false;
+    g_edgeHoldSince = now; // held on: the next turn after another full hold
+    const int to    = edgeLeadsTo(e);
+    if (to < 0)
+        return false;
+    trace("edge hold %d -> %d", (int)e, to);
+    if (e == EDGE_LEFT || e == EDGE_RIGHT)
+        turnPage(g_pages[to].base, 0);
+    else
+        turnPage(g_base, to);
+    return true;
+}
+
+// Keep the pointer on the map's screen while a window is carried (see above).
+static void keepPointerOn(PHLMONITOR d) {
+    const Vector2D g  = g_pInputManager->getMouseCoordsInternal();
+    const Vector2D lo = d->m_position, hi = d->m_position + d->m_size - Vector2D{1.0, 1.0};
+    const Vector2D c{std::clamp(g.x, lo.x, hi.x), std::clamp(g.y, lo.y, hi.y)};
+    if (c == g)
+        return;
+    const SBusyScope busy; // the warp's own motion is not the hand's
+    g_pCompositor->warpCursorTo(c, true);
+}
+
 // Shared by motion and grid-scroll: recompute hover/drag targets at cursor `c`
 // (a scroll moves the tiles under a stationary cursor, so hover must follow).
 static void updateHoverAt(PHLMONITOR m, const Vector2D& c) {
@@ -4400,6 +4642,11 @@ static void updateHoverAt(PHLMONITOR m, const Vector2D& c) {
             g_origHome       = {wb.x + wb.w / 2.0, wb.y + wb.h / 2.0};
             const auto omon  = dw->m_monitor.lock();
             g_origMonPos     = omon ? omon->m_position : Vector2D{};
+            g_origMon        = omon;
+            g_origShown.clear(); // before the grab: the grab itself can bring a workspace up
+            for (const auto& mon : g_pCompositor->m_monitors)
+                if (mon && mon->m_enabled)
+                    g_origShown.emplace_back(mon, mon->activeWorkspaceID());
             g_pending        = {};
             g_pendingSince   = Time::steadyNow();
             beginRealDrag(dw);
@@ -4409,6 +4656,7 @@ static void updateHoverAt(PHLMONITOR m, const Vector2D& c) {
     if (g_dragWin.lock()) {
         g_dragCursor = c;
         maybeCommit(m);
+        tickEdgeHold(); // held against an edge: the page that lies that way
         // AFTER the commit, and every motion: each commit ends and re-begins
         // the compositor's drag, and its dragEnd unsets the "grabbing"
         // override it set — leaving the plain arrow with nothing to restore
@@ -4511,9 +4759,7 @@ static void onMouseAxis(IPointer::SAxisEvent e, Event::SCallbackInfo& info) {
         const int at = pageIndex(g_base), next = std::clamp(at + side, 0, (int)g_pages.size() - 1);
         if (at < 0 || next == at)
             return;
-        g_pageFlipAt = Time::steadyNow();
-        g_tourDone   = true;
-        showPage(g_pages[next].base);
+        turnPage(g_pages[next].base, 0);
         return;
     }
     const auto m = ovLay();
@@ -4536,15 +4782,9 @@ static void onMouseAxis(IPointer::SAxisEvent e, Event::SCallbackInfo& info) {
         dir = e.delta > 0.0 ? 1 : e.delta < 0.0 ? -1 : 0;
     }
     const int next = std::clamp(g_page + dir, 0, 1);
-    if (next == g_page)
+    if (next == g_page || !m)
         return;
-    g_page         = next;
-    g_pageFlipAt   = now;
-    g_tourDone     = true; // wheel counts as touring — next Super+R closes
-    g_scrollFrom   = g_scroll; // retarget-safe: a mid-flight flip re-eases
-    g_scrollProg   = 0.0f;
-    g_scrollTarget = g_page * pageStep(m);
-    damageAll();
+    turnPage(g_base, next); // retarget-safe: a mid-flight flip re-eases
 }
 
 // Left-click while open: press over a window picks it up; release drops it onto the
@@ -4650,13 +4890,15 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
             }
         }
         if (const int64_t word = pageWordAt(c); word >= 0) {
-            g_tourDone = true;
-            showPage(word); // (its release finds no gesture and only re-hovers)
+            if (word != g_base)
+                turnPage(word, 0); // (its release finds no gesture and only re-hovers)
             return;
         }
         g_pressPos  = c;
         g_dragMoved = false;
         g_pressTile = -1;
+        g_dragCarry = {};
+        g_origShown.clear();
         g_watchWin.reset(); // a fresh gesture takes over: the grab's own
                             // float-out must not read as a leak
         if (const auto w = winAt(c).lock()) {
@@ -4698,6 +4940,7 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
     const auto dw        = g_dragWin.lock();
     const bool moved     = g_dragMoved;
     const int  pressTile = g_pressTile;
+    g_dragCarry          = {}; // the ghost goes with the release
     // g_dragWin stays set through the drop logic below: endRealDrag's
     // un-park and restoreOriginal's workspace-restore both read it.
     g_dragMoved = false;
@@ -4718,6 +4961,7 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
     if (!dw && moved) {
         g_dragWin.reset();
         endRealDrag(std::nullopt); // grabbed window died mid-drag: fold the grab, keep no state
+        reshowOrigin();
         g_commit  = {};
         g_pending = {};
         return;
@@ -4751,6 +4995,7 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
             // The one gesture end with NO net of its own (the commit's
             // endRealDrag already netted) — watch it extra closely.
             trace("release REVEAL ws=%d float=%d", (int)dw->workspaceID(), (int)dw->m_isFloating);
+            reshowOrigin();
             armFloatWatch(dw);
             g_dragWin.reset();
             g_commit  = {};
@@ -4764,6 +5009,7 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
             // parked, its own float state), then over to that page.
             restoreOriginal();
             sendToPage(dw, to);
+            reshowOrigin();
             g_dragWin.reset();
             g_commit  = {};
             g_pending = {};
@@ -4786,6 +5032,7 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
         // as a live commit (they used to be hand-rolled clones of each other).
         if (!landAt(m, c, dw, signatureAt(m, c, dw)))
             restoreOriginal(); // dropped outside every view: back to where it came from
+        reshowOrigin(); // a drop moves the window, never what a screen shows
         // The gesture is over: the final landing is LIVE — capture now and
         // keep capturing fast while the real windows spring into place
         // (the un-park in endRealDrag keeps the spring short).
@@ -5588,25 +5835,37 @@ static void noteInteraction(bool pointer) {
     sendWaverunner("interacted\n");
 }
 
-// Whether any window lives on `page` (0 = workspaces 1-9, 1 = 10-18),
-// judged from the open capture set.
-static bool pageHasWindows(int page) {
-    for (auto& cw : g_wins)
-        if (cw.tile / 9 == page)
+// Whether block `base`'s half `half` (0 = workspaces 1-9, 1 = 10-18) holds a
+// window, whichever screen its workspaces are on, shown or not.
+static bool blockHalfHasWindows(int64_t base, int half) {
+    for (const auto& w : g_pCompositor->m_windows) {
+        if (!w || !w->m_isMapped || w->isHidden())
+            continue;
+        const int64_t i = w->workspaceID() - base - 1 - (int64_t)half * 9;
+        if (i >= 0 && i < 9)
             return true;
+    }
     return false;
 }
 
-// Eased flip to `page` (shared by the wheel and the Super+R tour).
-static void flipToPage(int page) {
-    const auto m = ovLay();
-    if (!m || page == g_page)
-        return;
-    g_page         = page;
-    g_scrollFrom   = g_scroll;
-    g_scrollProg   = 0.0f;
-    g_scrollTarget = g_page * pageStep(m);
-    damageAll();
+// THE TOUR's next place (see `g_toured`): the first not yet shown this visit
+// that holds a window, in the order the hand would go: this page's other half
+// first, then the pages of the screens beside, rightward as they stand (round
+// to the left end), each top half first. False when none is left: the press
+// closes.
+static bool tourNext() {
+    const int n  = (int)g_pages.size();
+    const int at = std::max(0, pageIndex(g_base));
+    for (int k = 0; k < std::max(n, 1); ++k) {
+        const int64_t base = n ? g_pages[(at + k) % n].base : g_base;
+        for (int half = 0; half < 2; ++half)
+            if (!toured(base, half) && blockHalfHasWindows(base, half)) {
+                trace("tour -> page %lld half %d", (long long)base, half);
+                turnPage(base, half);
+                return true;
+            }
+    }
+    return false;
 }
 
 // Close unconditionally (Escape's path — no touring).
@@ -5718,9 +5977,10 @@ static void closeOverview() {
     endWarpHide();
     endRealResize();   // sizes applied live are final; just settle
     resetEdgeCursor(); // the desktop must not inherit a resize pointer
-    restoreOriginal(); // never leave a real drag dangling; a commit is undone
+    restoreOriginal(); // never leave a real drag dangling; a commit is undone (and the screens reshown)
     g_dragWin.reset();
     g_dragMoved  = false;
+    g_dragCarry  = {};
     // Escape / gesture / toggle: nothing was picked, so the stage comes back on
     // whatever is focused — which is where it already was.
     startClose();
@@ -5755,17 +6015,11 @@ static void toggle() {
         freeSpreadCards(); // the map allocates its own solos for these windows; the cards would idle until its close
     }
     const bool opening = g_animTarget < 0.5f; // currently closed/closing -> open
-    // The Super+R tour: pressed while open, and the other page holds
-    // windows we haven't visited → flip there instead of closing. A third
-    // press (or a second when the other page is empty) closes.
-    if (!opening && !g_tourDone) {
-        const int other = 1 - g_page;
-        if (pageHasWindows(other)) {
-            g_tourDone = true;
-            flipToPage(other);
-            return;
-        }
-    }
+    // THE TOUR: pressed while open, the next place holding windows this
+    // visit has not shown (this page's other half, then the screens beside)
+    // instead of closing. Closes when none is left. See `g_toured`.
+    if (!opening && tourNext())
+        return;
     if (!opening) {
         closeOverview(); // one close path: drag/resize/cursor cleanup included
         return;
@@ -5812,7 +6066,11 @@ static void toggle() {
         g_scroll     = g_scrollTarget = m ? g_page * pageStep(m) : 0.0;
         g_scrollFrom = g_scroll;
         g_scrollProg = 1.0f; // open lands settled — no flip animation
-        g_tourDone   = false;
+        g_toured.clear();
+        g_origShown.clear(); // nothing held: nothing to give back
+        noteToured(); // the place it opens on is shown
+        g_dragCarry = {};
+        g_edgeHold  = EDGE_NONE;
         // Remember where we were called from; the warp itself happens on the
         // first settled frame, once that window has a drawn box.
         // "The window I'm calling it from" is the one under the POINTER, not
@@ -5928,8 +6186,9 @@ static bool claimedSideways() {
 // asks for it (Max, 2026-09-12 — the direction carried both at first, and the
 // count reads better: two places, two hands, one motion):
 //
-//   3 UP    — the overview. Same ladder as Super+R: open, tour the other
-//             inhabited page, close.
+//   3 UP    — the overview. Same ladder as Super+R: open, tour every place
+//             holding windows (this page's other half, the screens beside),
+//             close.
 //   3 DOWN  — out of the overview (its long-standing Escape). Nothing when it
 //             is not up.
 //   4 UP    — Golem's STAGE. Also the way back out of it, and it works from
@@ -7261,7 +7520,8 @@ static int luaStageReady(lua_State*) {
 // three-press cycle (Max, 2026-09-29: "spread on the first touch, overview the
 // second time, close the third time"). Unlike the gesture's ladder (`spread`,
 // below), which skips the spread when nothing hides anything, and unlike
-// Super+R (`toggle`), whose second press tours the other page before closing.
+// Super+R (`toggle`), whose next presses tour the places holding windows
+// before closing (see `g_toured`).
 //   closed          → the spread (the overview when the workspace has nothing to spread)
 //   spread up       → the overview (the same escalation as the second swipe)
 //   overview up     → close
@@ -7459,12 +7719,12 @@ static int luaResizeSnapped(lua_State* L) {
 static int luaDebugState(lua_State*) {
     const auto& dc  = g_layoutManager->dragController();
     const auto  foc = Desktop::focusState()->window();
-    trace("STATE ov: active=%d anim=%.2f>%.2f land=%.2f blend=%.2f hold=%d fromStage=%d fromSpread=%d linger=%d page=%d scroll=%.2f "
+    trace("STATE ov: active=%d anim=%.2f>%.2f land=%.2f blend=%.2f hold=%d fromStage=%d fromSpread=%d linger=%d base=%lld page=%d toured=%zu edge=%d scroll=%.2f "
           "| spread=%d %.2f>%.2f | stage=%d closePending=%d stageSwipe=%d | busy=%d resizing=%d resizeWin=%d dragWin=%d dragReal=%d "
           "dragMoved=%d pressTile=%d hover=%d pick=%d warpPending=%d warpHid=%d watch=%d | swipeLive=%d fired=%d fingers=%d "
           "| flies=%zu minimized=%zu freePending=%d resizeDragSent=%d captureMon=%d | hypr: dragTarget=%d mode=%d focused=%s ws=%d",
           (int)g_active, g_anim, g_animTarget, g_landAnim, g_openBlend, (int)g_openHold, (int)g_openedFromStage,
-          (int)g_openFromSpread, g_closeLinger, g_page, g_scrollProg, (int)g_spreadActive, g_spreadAnim, g_spreadTarget,
+          (int)g_openFromSpread, g_closeLinger, (long long)g_base, g_page, g_toured.size(), (int)g_edgeHold, g_scrollProg, (int)g_spreadActive, g_spreadAnim, g_spreadTarget,
           (int)g_stageMode, (int)g_stageClosePending, (int)g_stageSwipe, (int)g_busy, (int)g_resizing, (int)(bool)g_resizeWin.lock(),
           (int)(bool)g_dragWin.lock(), (int)g_dragReal, (int)g_dragMoved, g_pressTile, (int)(bool)g_hoverWin.lock(),
           (int)(bool)g_ovPick.lock(), (int)g_warpPending, (int)g_warpHidCursor, (int)(bool)g_watchWin.lock(), (int)g_swipeLive,
@@ -7472,8 +7732,9 @@ static int luaDebugState(lua_State*) {
           (int)(bool)g_captureMon.lock(), (int)(bool)dc->target(), (int)dc->mode(), foc ? windowAddr(foc).c_str() : "none",
           foc ? (int)foc->workspaceID() : 0);
     // The map's tiles in GLOBAL LOGICAL coordinates (what `hl.dsp.cursor.move`
-    // takes), so a test can aim at a tile instead of guessing the grid.
-    if (const auto m = g_captureMon.lock()) {
+    // takes), so a test can aim at a tile instead of guessing the grid. The
+    // page shown: another screen's is fitted onto this one's.
+    if (const auto m = g_active ? ovLay() : g_captureMon.lock()) {
         Rect        tiles[N_TILES];
         const int   n = computeTiles(m, tiles);
         std::string out;
@@ -7616,7 +7877,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     g_pEventLoopManager->addTimer(g_dockWatchTimer);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "2.27"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "2.28"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
