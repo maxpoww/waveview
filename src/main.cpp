@@ -592,6 +592,7 @@ static LiveCommit      g_pending;       // last seen hover signature
 static Time::steady_tp g_pendingSince{};
 static int             g_origWS = -1;   // cancel restores these
 static Vector2D        g_origHome{};
+static Vector2D        g_origSize{};    // …its size there (a float's)
 static Vector2D        g_origMonPos{};  // …and the origin of the monitor it stood on (see `seatAtOrigin`)
 static PHLMONITORREF   g_origMon;       // …that monitor
 // What every screen showed when the gesture's window was picked up. A drag in
@@ -1168,7 +1169,10 @@ static void endRealDrag(std::optional<Vector2D> at, PHLWINDOW splitTarget = null
 static void checkFloatWatch();
 static void maybeCommit(PHLMONITOR m);
 static void restoreFloatState(PHLWINDOW dw);
-static bool seatFloat(PHLWINDOW dw, const Vector2D& centre);
+static bool seatFloat(PHLWINDOW dw, const Vector2D& centre, const Vector2D& size = {});
+static bool movableFloat(const PHLWINDOW& w);
+static void deskToScreen(PHLWORKSPACE ws, PHLMONITOR to);
+static CBox floatOnScreen(const PHLWINDOW& w, const CBox& rel, PHLMONITOR from, PHLMONITOR to, bool remember = true);
 
 static void damageAll() {
     for (auto& m : g_pCompositor->m_monitors) {
@@ -2736,7 +2740,7 @@ static int64_t pageWordAt(const Vector2D& c) {
 // A window dropped on another page's word: onto the workspace that page's
 // screen is showing, if it shows one of the page's; else the page's first
 // workspace with windows; else its first. A float crossing to another screen
-// keeps its place on the screen (the compositor's move) and stays on it.
+// takes the same share of that one (`floatOnScreen`).
 static void sendToPage(PHLWINDOW w, int64_t base) {
     const auto d = g_captureMon.lock();
     if (!d || !w)
@@ -2760,14 +2764,13 @@ static void sendToPage(PHLWINDOW w, int64_t base) {
     const auto host = ws->m_monitor.lock() ? ws->m_monitor.lock() : d;
     const auto from = w->m_monitor.lock();
     trace("page drop ws=%d -> %lld (%s)", (int)w->workspaceID(), (long long)to, host->m_name.c_str());
+    const bool    crosses = from && from != host && movableFloat(w);
+    const SUsable uf      = usableArea(from ? from : host);
+    const CBox    was     = w->getWindowMainSurfaceBox(); // (before the move: Hyprland shifts it by the screens' offset)
     g_pCompositor->moveWindowToWorkspaceSafe(w, ws);
-    if (from && from != host && w->m_isFloating) {
-        const SUsable u  = usableArea(host);
-        const CBox    wb = w->getWindowMainSurfaceBox();
-        const double  x  = std::clamp(wb.x, u.x, std::max(u.x, u.x + u.w - wb.w));
-        const double  y  = std::clamp(wb.y, u.y, std::max(u.y, u.y + u.h - wb.h));
-        if (x != wb.x || y != wb.y)
-            seatFloat(w, {x + wb.w / 2.0, y + wb.h / 2.0});
+    if (crosses && movableFloat(w)) {
+        const CBox b = floatOnScreen(w, CBox{was.x - uf.x, was.y - uf.y, was.w, was.h}, from, host);
+        seatFloat(w, {b.x + b.w / 2.0, b.y + b.h / 2.0}, {b.w, b.h});
     }
 }
 
@@ -4079,6 +4082,8 @@ struct SSeatLater {
     Vector2D     centre; // of the window's main surface, where it was first picked up
     Vector2D     monPos; // that monitor's origin
     int          ws = -1; // the workspace it was first picked up on
+    Vector2D      size;   // its size there…
+    PHLMONITORREF mon;    // …and that screen: on another one it takes the same SHARE (`floatOnScreen`)
 };
 static std::vector<SSeatLater> g_seatLater;
 
@@ -4089,14 +4094,18 @@ static SSeatLater* seatDebt(const PHLWINDOW& dw) {
     return nullptr;
 }
 
-// Put a float's main surface centred on `centre`, outright (no spring).
-// False for anything it does not apply to: a tile, a fullscreen window, a
-// window outside the layout.
-static bool seatFloat(PHLWINDOW dw, const Vector2D& centre) {
+// Put a float's main surface centred on `centre`, outright (no spring), at
+// `size` if one is given (else the size it has). False for anything it does
+// not apply to: a tile, a fullscreen window, a window outside the layout.
+static bool seatFloat(PHLWINDOW dw, const Vector2D& centre, const Vector2D& size) {
     if (!dw || !dw->m_isMapped || !dw->m_isFloating || dw->isFullscreen() || !inLayoutSpace(dw))
         return false;
     const SBusyScope busy;
-    const CBox       wb = dw->getWindowMainSurfaceBox();
+    CBox             wb = dw->getWindowMainSurfaceBox();
+    if (size.x >= 1.0 && size.y >= 1.0) {
+        wb.w = size.x;
+        wb.h = size.y;
+    }
     g_layoutManager->setTargetGeom(CBox{centre.x - wb.w / 2.0, centre.y - wb.h / 2.0, wb.w, wb.h}, dw->layoutTarget());
     dw->m_realPosition->warp();
     dw->m_realSize->warp();
@@ -4127,8 +4136,12 @@ static PHLMONITOR tileScreen(PHLMONITOR m, const Rect& t) {
 // (2026-10-13: a picture-in-picture let go there landed at y = −144). The
 // whole window stays inside the usable area when it fits; its top-left
 // corner does when it does not.
-static Vector2D floatDropCentre(PHLMONITOR m, const Rect& t, const Vector2D& c, PHLWINDOW dw) {
-    const CBox    fb = dw->getWindowMainSurfaceBox();
+static Vector2D floatDropCentre(PHLMONITOR m, const Rect& t, const Vector2D& c, PHLWINDOW dw, const Vector2D& size = {}) {
+    CBox fb = dw->getWindowMainSurfaceBox();
+    if (size.x >= 1.0 && size.y >= 1.0) { // (the size it is about to be given there)
+        fb.w = size.x;
+        fb.h = size.y;
+    }
     const SUsable u  = usableArea(tileScreen(m, t)); // (the desk's own screen: SHARED DESKS)
     Vector2D      tl = deskAt(m, t, c) - Vector2D{g_grabFracX * fb.w, g_grabFracY * fb.h};
     double top = 0.0, side = 0.0;
@@ -4138,13 +4151,21 @@ static Vector2D floatDropCentre(PHLMONITOR m, const Rect& t, const Vector2D& c, 
     return tl + Vector2D{fb.w / 2.0, fb.h / 2.0};
 }
 
-// The place the gesture's window had at its start (for a cancel).
+// The place AND SIZE the gesture's window had at its start (for a cancel: a
+// landing on another screen's desk had resized it).
 static bool seatAtOrigin(PHLWINDOW dw) {
     if (!dw || !g_origFloating)
         return false;
     const auto     mon = dw->m_monitor.lock();
     const Vector2D off = mon ? mon->m_position - g_origMonPos : Vector2D{};
-    return seatFloat(dw, g_origHome + off);
+    return seatFloat(dw, g_origHome + off, g_origSize);
+}
+
+// The box (global) a float that stood centred on `centre` at `size` on screen
+// `from` takes on screen `to`: the same share of it. `remember`: see `floatOnScreen`.
+static CBox floatShare(const PHLWINDOW& w, const Vector2D& centre, const Vector2D& size, PHLMONITOR from, PHLMONITOR to, bool remember) {
+    const SUsable uf = usableArea(from);
+    return floatOnScreen(w, CBox{centre.x - size.x / 2.0 - uf.x, centre.y - size.y / 2.0 - uf.y, size.x, size.y}, from, to, remember);
 }
 
 // Pay every debt: each float still away from the workspace it was first
@@ -4158,11 +4179,19 @@ static void seatOwed() {
         const auto w = e.win.lock();
         if (!w || !w->m_isMapped || w->workspaceID() == e.ws)
             continue;
-        const auto     mon = w->m_monitor.lock();
-        const Vector2D to  = e.centre + (mon ? mon->m_position - e.monPos : Vector2D{});
-        if (!seatFloat(w, to))
+        const auto mon  = w->m_workspace && w->m_workspace->m_monitor.lock() ? w->m_workspace->m_monitor.lock() : w->m_monitor.lock();
+        const auto home = e.mon.lock();
+        Vector2D   to   = e.centre + (mon ? mon->m_position - e.monPos : Vector2D{});
+        Vector2D   size = e.size;
+        // On another screen than the one it was picked up on: the same share of it.
+        if (mon && home && home != mon && movableFloat(w)) {
+            const CBox b = floatShare(w, e.centre, e.size, home, mon, true);
+            to           = {b.x + b.w / 2.0, b.y + b.h / 2.0};
+            size         = {b.w, b.h};
+        }
+        if (!seatFloat(w, to, size))
             continue;
-        trace("seat-owed ws=%d (from ws %d) centre=(%.0f,%.0f)", (int)w->workspaceID(), e.ws, to.x, to.y);
+        trace("seat-owed ws=%d (from ws %d) centre=(%.0f,%.0f) size=%.0fx%.0f", (int)w->workspaceID(), e.ws, to.x, to.y, size.x, size.y);
         markDirty(w->workspaceID());
         const int t = tileFor((int)w->workspaceID());
         if (t >= 0)
@@ -4383,9 +4412,19 @@ static bool landAt(PHLMONITOR m, const Vector2D& c, PHLWINDOW dw, const LiveComm
     // commit when the pointer dwells, each re-commit as it crosses onto
     // another thumbnail, and the release itself.)
     if (g_origFloating) {
-        const Vector2D here = floatDropCentre(m, tiles[sig.tile], c, dw);
-        const auto     debt = seatDebt(dw);
-        const int      from = debt ? debt->ws : g_origWS;
+        const auto debt = seatDebt(dw);
+        const int  from = debt ? debt->ws : g_origWS;
+        // Its size on that tile's screen: the same share of it as it had of
+        // the screen it was first picked up on (its own size, on that one).
+        Vector2D   size = debt ? debt->size : g_origSize;
+        const auto home = debt ? debt->mon.lock() : g_origMon.lock();
+        if (const auto ts = tileScreen(m, tiles[sig.tile]); home && ts && ts != home && !dw->m_pinned) {
+            const CBox b = floatShare(dw, debt ? debt->centre : g_origHome, size, home, ts, false);
+            size         = {b.w, b.h};
+        }
+        if (dw->m_pinned)
+            size = {};
+        const Vector2D here = floatDropCentre(m, tiles[sig.tile], c, dw, size);
         // A PINNED window is not given to a workspace: it is on all of
         // them, and belongs to whichever is showing. Moved to another one it
         // was on two at once — its own, and the showing one it is drawn on
@@ -4405,11 +4444,11 @@ static bool landAt(PHLMONITOR m, const Vector2D& c, PHLWINDOW dw, const LiveComm
             g_pCompositor->moveWindowToWorkspaceSafe(dw, ws);
             dw->m_alpha.warp(); // no arrival-fade blink in the captures
         }
-        seatFloat(dw, here);
+        seatFloat(dw, here, size);
         if (pinned || wsFor(sig.tile) == from)
             std::erase_if(g_seatLater, [&](const SSeatLater& e) { return e.win.lock() == dw; });
         else if (!debt)
-            g_seatLater.push_back(SSeatLater{dw, g_origHome, g_origMonPos, g_origWS});
+            g_seatLater.push_back(SSeatLater{dw, g_origHome, g_origMonPos, g_origWS, g_origSize, g_origMon});
         trace("land float ws=%d at=(%.0f,%.0f) owes=%d", (int)dw->workspaceID(), here.x, here.y, (int)(wsFor(sig.tile) != from));
         return true;
     }
@@ -4519,9 +4558,15 @@ static void reshowOrigin() {
         const auto mon = ref.lock();
         if (!mon || !mon->m_enabled || id < 1 || mon->activeWorkspaceID() == id)
             continue;
-        auto ws = g_pCompositor->getWorkspaceByID(id);
+        auto       ws   = g_pCompositor->getWorkspaceByID(id);
+        const bool made = !ws;
         if (!ws)
             ws = g_pCompositor->createNewWorkspace(id, mon->m_id);
+        // (made again, it is made on the screen its page is bound to: an empty
+        // desk the OTHER screen was showing came back on the wrong one, and
+        // that screen was left on the desk the grab had brought up)
+        if (ws && made && ws->m_monitor.lock() != mon)
+            deskToScreen(ws, mon);
         if (!ws || ws->m_monitor.lock() != mon)
             continue; // it lives on another screen now: not this one's to pull over
         trace("reshow %s ws %d -> %lld", mon->m_name.c_str(), (int)mon->activeWorkspaceID(), (long long)id);
@@ -4909,6 +4954,7 @@ static void updateHoverAt(PHLMONITOR m, const Vector2D& c) {
             g_origFloating   = dw->m_isFloating;
             const CBox wb    = dw->getWindowMainSurfaceBox();
             g_origHome       = {wb.x + wb.w / 2.0, wb.y + wb.h / 2.0};
+            g_origSize       = {wb.w, wb.h};
             const auto omon  = dw->m_monitor.lock();
             g_origMonPos     = omon ? omon->m_position : Vector2D{};
             g_origMon        = omon;
@@ -6730,7 +6776,8 @@ static CBox floatRel(const PHLWINDOW& w, const SUsable& u) {
     return CBox{pos.x - u.x, pos.y - u.y, size.x, size.y};
 }
 // The box (global) float `w`, which stood at `rel` on screen `from`, takes on screen `to`.
-static CBox floatOnScreen(const PHLWINDOW& w, const CBox& rel, PHLMONITOR from, PHLMONITOR to) {
+// `remember`: note the trip (false for a size only asked about, while a window is being carried).
+static CBox floatOnScreen(const PHLWINDOW& w, const CBox& rel, PHLMONITOR from, PHLMONITOR to, bool remember) {
     const SUsable     uf = usableArea(from), u = usableArea(to);
     const std::string keyFrom = screenRuleKey(from), keyTo = screenRuleKey(to);
     auto&             trip = floatTrip(w);
@@ -6749,10 +6796,12 @@ static CBox floatOnScreen(const PHLWINDOW& w, const CBox& rel, PHLMONITOR from, 
     b.h = std::clamp(b.h, 1.0, u.h);
     b.x = std::clamp(b.x, 0.0, u.w - b.w);
     b.y = std::clamp(b.y, 0.0, u.h - b.h);
-    trip.home   = keyFrom;
-    trip.atHome = rel;
-    trip.away   = keyTo;
-    trip.atAway = b;
+    if (remember) {
+        trip.home   = keyFrom;
+        trip.atHome = rel;
+        trip.away   = keyTo;
+        trip.atAway = b;
+    }
     return CBox{u.x + b.x, u.y + b.y, b.w, b.h};
 }
 // Desk `ws` to screen `to`, its windows at rest there at once (no spring from
@@ -8905,7 +8954,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     g_pEventLoopManager->addTimer(g_dockWatchTimer);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "2.34"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "2.35"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
