@@ -6775,6 +6775,11 @@ static bool bringHere(int64_t id, PHLMONITOR to) {
 // The record, read back from how things stand (the plugin just loaded: a
 // reload forgets it): a desk on a screen that is not its rule's, while its
 // rule's screen is connected, can only have been put there.
+static SP<CEventLoopTimer> g_seedTimer;
+static void                seedDeskPut();
+static void                onSeedTimer(SP<CEventLoopTimer>, void*) {
+    seedDeskPut();
+}
 static void seedDeskPut() {
     for (const auto& ws : g_pCompositor->getWorkspaces()) {
         const auto on = ws ? ws->m_monitor.lock() : nullptr;
@@ -8760,9 +8765,13 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     g_axisListener   = Event::bus()->m_events.input.mouse.axis.listen(onMouseAxis);
     // (A beat after loading: the load's own config reload is rebuilding the
     // workspace rules right now, and with none every desk looks at home.)
-    static SP<CEventLoopTimer> seedTimer;
-    seedTimer = makeShared<CEventLoopTimer>(std::chrono::milliseconds(1500), [](SP<CEventLoopTimer>, void*) { seedDeskPut(); }, nullptr);
-    g_pEventLoopManager->addTimer(seedTimer);
+    // ⛔ REMOVED IN PLUGIN_EXIT like every timer: one left with the event loop
+    // is destroyed by it AFTER this library is unmapped, and its callback's
+    // destructor lives here — that took the compositor down on 2026-11-13
+    // (the unload of the build that first had this timer, as a function-local
+    // static never removed).
+    g_seedTimer = makeShared<CEventLoopTimer>(std::chrono::milliseconds(1500), onSeedTimer, nullptr);
+    g_pEventLoopManager->addTimer(g_seedTimer);
     g_monitorAddedListener = Event::bus()->m_events.monitor.added.listen([](PHLMONITOR) {
         learnScreenNames();
         // Hyprland sends every desk to its rule's screen once the connect is
@@ -8913,6 +8922,15 @@ APICALL EXPORT void PLUGIN_EXIT() {
         g_pEventLoopManager->removeTimer(g_liveTimer);
         g_liveTimer.reset();
     }
+    if (g_seedTimer) {
+        g_pEventLoopManager->removeTimer(g_seedTimer);
+        g_seedTimer.reset();
+    }
+    // The desk swipe's and the push's state: nothing of ours may be left
+    // half-way, and no picture kept.
+    g_ds = {};
+    pushOutDrop();
+    g_dragCarry = {};
     if (g_resizeDragSent) {
         g_resizeDragSent = false;
         sendWaverunner("resize-drag-off\n");
