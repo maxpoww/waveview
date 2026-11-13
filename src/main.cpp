@@ -6405,6 +6405,7 @@ static void   deskSwipeBegin();
 static void   deskSwipeUpdate(double delta);
 static void   deskSwipeEnd();
 static bool   g_deskSwiping = false; // this gesture is walking the desks
+static bool   g_deskClaimed = false; // …for good (no swipe up can take it back)
 static double g_deskTravel  = 0.0;   // its sideways travel (the fingers')
 static bool   ownsSwipe(int fingers) {
     return g_ownSwipe && (fingers == 3 || fingers == 4);
@@ -6468,7 +6469,7 @@ static constexpr double SWIPE_CLAIM_X = 40.0;
 // Whether this gesture has already been claimed by its horizontal owner.
 // Our own desk swipe takes the gesture at this much sideways travel: the
 // desks move from the first millimetres, as Hyprland's do.
-static constexpr double DESK_SWIPE_CLAIM = 4.0;
+static constexpr double DESK_SWIPE_CLAIM = 5.0; // (Hyprland's own: the axis is read at 5 px of travel)
 static bool claimedSideways() {
     return std::abs(g_swipeAcc.x) >= SWIPE_CLAIM_X && std::abs(g_swipeAcc.x) > std::abs(g_swipeAcc.y);
 }
@@ -6540,6 +6541,7 @@ static void onSwipeUpdate(IPointer::SSwipeUpdateEvent e, Event::SCallbackInfo& i
         }
         return;
     }
+    bool vertical = false; // a desk swipe just given up for a swipe up or down
     if (ownsSwipe(g_swipeFingers)) {
         info.cancelled = true;
         // Walking the desks: the fingers' sideways travel, the way Hyprland
@@ -6547,16 +6549,33 @@ static void onSwipeUpdate(IPointer::SSwipeUpdateEvent e, Event::SCallbackInfo& i
         // follow the fingers).
         static auto PSWIPEINV = CConfigValue<Config::INTEGER>("gestures:workspace_swipe_invert");
         if (g_deskSwiping) {
+            g_swipeAcc += e.delta;
             g_deskTravel += e.delta.x;
-            deskSwipeUpdate(*PSWIPEINV ? -g_deskTravel : g_deskTravel);
-            return;
+            // A swipe UP that began a little sideways is still a swipe up, as
+            // it always was (Hyprland's slide began at 5 px, yet the overview
+            // opened when the travel turned out vertical): until the desks
+            // have it for good (`claimedSideways`), a decisive vertical takes
+            // the gesture back — the desks return at once.
+            if (!g_deskClaimed && claimedSideways())
+                g_deskClaimed = true;
+            if (!g_deskClaimed && decisiveVertical()) {
+                deskSwipeUpdate(0.0);
+                deskSwipeEnd();
+                g_deskSwiping = false;
+                g_swipeFired  = false;
+                vertical      = true; // (the travel is counted: straight to the decision below)
+            } else {
+                deskSwipeUpdate(*PSWIPEINV ? -g_deskTravel : g_deskTravel);
+                return;
+            }
         }
-        if (!g_swipeFired && !g_active && !g_spreadActive) {
+        if (!vertical && !g_swipeFired && !g_active && !g_spreadActive) {
             const Vector2D acc = g_swipeAcc + e.delta;
             if (std::abs(acc.x) >= DESK_SWIPE_CLAIM && std::abs(acc.x) > std::abs(acc.y)) {
                 g_swipeAcc    = acc;
                 g_swipeFired  = true; // this gesture's one decision: the desks
                 g_deskSwiping = true;
+                g_deskClaimed = false;
                 g_deskTravel  = acc.x;
                 deskSwipeBegin();
                 deskSwipeUpdate(*PSWIPEINV ? -g_deskTravel : g_deskTravel);
@@ -6566,13 +6585,14 @@ static void onSwipeUpdate(IPointer::SSwipeUpdateEvent e, Event::SCallbackInfo& i
     }
     if ((g_swipeFingers != 3 && g_swipeFingers != 4) || g_swipeFired)
         return;
-    g_swipeAcc += e.delta;
+    if (!vertical)
+        g_swipeAcc += e.delta;
     // The workspace swipe has it: the compositor is already sliding, and this
     // gesture is theirs to finish. Latched — NOT consumed, since they still need
     // the events — so a lift at the end cannot open the stage halfway between
     // two workspaces. (Only when the swipe was handed back to Hyprland: ours
     // is claimed above, from its first millimetres.)
-    if (claimedSideways()) {
+    if (!vertical && claimedSideways()) {
         g_swipeFired = true;
         return;
     }
@@ -7355,6 +7375,30 @@ static int luaToggle(lua_State*) {
 // the desk swipe driven by hand (a test cannot make a touchpad gesture).
 static int luaOwnSwipe(lua_State* L) {
     g_ownSwipe = lua_toboolean(L, 1);
+    return 0;
+}
+// `gesture_test("begin", fingers)` / `("update", dx, dy)` / `("end")` — a whole
+// touchpad swipe through the plugin's own handlers (the decision between the
+// desks and a swipe up or down), for tests.
+static int luaGestureTest(lua_State* L) {
+    const char* what = lua_tostring(L, 1);
+    if (!what)
+        return 0;
+    const std::string    w = what;
+    Event::SCallbackInfo info;
+    if (w == "begin") {
+        IPointer::SSwipeBeginEvent e{};
+        e.fingers = (uint32_t)lua_tointeger(L, 2);
+        onSwipeBegin(e, info);
+    } else if (w == "update") {
+        IPointer::SSwipeUpdateEvent e{};
+        e.fingers = (uint32_t)g_swipeFingers;
+        e.delta   = Vector2D{lua_tonumber(L, 2), lua_tonumber(L, 3)};
+        onSwipeUpdate(e, info);
+    } else if (w == "end") {
+        IPointer::SSwipeEndEvent e{};
+        onSwipeEnd(e, info);
+    }
     return 0;
 }
 static int luaSwipeTest(lua_State* L) {
@@ -8671,6 +8715,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     HyprlandAPI::addLuaFunction(handle, "waveview", "bring", luaBring);
     HyprlandAPI::addLuaFunction(handle, "waveview", "own_swipe", luaOwnSwipe);
     HyprlandAPI::addLuaFunction(handle, "waveview", "swipe_test", luaSwipeTest);
+    HyprlandAPI::addLuaFunction(handle, "waveview", "gesture_test", luaGestureTest);
     HyprlandAPI::addLuaFunction(handle, "waveview", "close", luaClose);
     HyprlandAPI::addLuaFunction(handle, "waveview", "stage_ready", luaStageReady);
     HyprlandAPI::addLuaFunction(handle, "waveview", "recapture", luaRecapture);
