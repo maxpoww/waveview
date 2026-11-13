@@ -6781,6 +6781,7 @@ static void seedDeskPut() {
         if (!on || ws->m_isSpecialWorkspace || ws->m_id < 1)
             continue;
         const auto bound = Config::workspaceRuleMgr()->getBoundMonitorStringForWS(std::to_string(ws->m_id));
+        trace("seed: desk %d on '%s', rule '%s' (connected %d)", (int)ws->m_id, screenRuleKey(on).c_str(), bound.c_str(), (int)screenConnected(bound));
         if (!bound.empty() && bound != screenRuleKey(on) && screenConnected(bound))
             g_deskPut[ws->m_id] = screenRuleKey(on);
     }
@@ -7387,6 +7388,10 @@ static int luaToggle(lua_State*) {
 // `hl.plugin.waveview.own_swipe(bool)` — the desk swipe ours (default) or
 // handed back to Hyprland. `swipe_test("begin" | "update" | "end", travel)` —
 // the desk swipe driven by hand (a test cannot make a touchpad gesture).
+static int luaSeed(lua_State*) {
+    seedDeskPut();
+    return 0;
+}
 static int luaOwnSwipe(lua_State* L) {
     g_ownSwipe = lua_toboolean(L, 1);
     return 0;
@@ -8728,6 +8733,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     HyprlandAPI::addLuaFunction(handle, "waveview", "toggle", luaToggle);
     HyprlandAPI::addLuaFunction(handle, "waveview", "bring", luaBring);
     HyprlandAPI::addLuaFunction(handle, "waveview", "own_swipe", luaOwnSwipe);
+    HyprlandAPI::addLuaFunction(handle, "waveview", "seed_desks", luaSeed);
     HyprlandAPI::addLuaFunction(handle, "waveview", "swipe_test", luaSwipeTest);
     HyprlandAPI::addLuaFunction(handle, "waveview", "gesture_test", luaGestureTest);
     HyprlandAPI::addLuaFunction(handle, "waveview", "close", luaClose);
