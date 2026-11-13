@@ -321,6 +321,7 @@ struct CapWin {
                                       // true↔slot, and with the slot on both sides it was a no-op — the windows
                                       // JUMPED to their resting point at the overlay drop (Max, 2026-09-16).
     int                      tile;    // grid slot 0..8 (its workspace)
+    PHLMONITORREF            mon;     // the screen its workspace is on (SHARED DESKS: not always the map's)
     bool                     active;  // currently focused window
     bool                     spread = false; // its tile shows the collage: no seam-solving, pixels from its solo
     // THE OPEN'S REVEAL FROM THE STAGE (set by `luaRecapture` only while opening):
@@ -690,7 +691,7 @@ static uint32_t scanWindowChanges(PHLMONITOR m) {
     auto     bit   = [](int t) { return t >= 0 ? (1u << t) : 0u; };
     std::unordered_set<const void*> seen;
     for (auto& w : g_pCompositor->m_windows) {
-        if (!w || !w->m_isMapped || w->isHidden() || w->monitorID() != m->m_id)
+        if (!w || !w->m_isMapped || w->isHidden() || tileFor(w->workspaceID()) < 0) // (a page's desks can be on any screen)
             continue;
         const CBox    b = w->getWindowMainSurfaceBox();
         const SWinSig sig{tileFor(w->workspaceID()), b.x, b.y, b.w, b.h, w->m_dimPercent->value(),
@@ -721,8 +722,10 @@ static uint32_t scanWindowChanges(PHLMONITOR m) {
 // background apps awake while the overview is open. Every tick, captured or not.
 static void keepClientsPainting(PHLMONITOR m) {
     for (int i = 0; i < N_TILES; ++i)
-        if (const auto ws = g_pCompositor->getWorkspaceByID(wsFor(i)))
-            g_pHyprRenderer->sendFrameEventsToWorkspace(m, ws, Time::steadyNow());
+        if (const auto ws = g_pCompositor->getWorkspaceByID(wsFor(i))) {
+            const auto wm = ws->m_monitor.lock();
+            g_pHyprRenderer->sendFrameEventsToWorkspace(wm ? wm : m, ws, Time::steadyNow());
+        }
 }
 // Float-leak watch (diagnosis, v0.21): every gesture end arms this; the live
 // timer then compares the window's float state against what the gesture
@@ -1340,7 +1343,15 @@ static void captureWindows(PHLMONITOR m, uint32_t mask = ALL_TILES) {
     // Mid-drag, the dragged window is parked offscreen — recropping it
     // would blank the cursor ghost. Stash its whole capture and reuse it.
     std::optional<CapWin> stashDragged;
+    // SHARED DESKS: the page is photographed screen by screen (see
+    // `captureWorkspaces`); this pass rebuilds the entries of screen `m` only.
+    std::vector<CapWin> others;
     for (auto& cw : g_wins) {
+        const auto cww = cw.win.lock();
+        if (cww && cw.mon.lock() != m && cww->m_monitor.lock() != m) {
+            others.push_back(cw);
+            continue;
+        }
         const bool isDragged = g_dragReal && cw.win.lock() && cw.win.lock() == g_dragWin.lock();
         // Each window's FB rides along to the rebuild: creating a fresh GL
         // framebuffer per window on EVERY capture (up to 20/s each during
@@ -1350,7 +1361,7 @@ static void captureWindows(PHLMONITOR m, uint32_t mask = ALL_TILES) {
         if (isDragged)
             stashDragged = cw; // keep its fb alive
     }
-    g_wins.clear();
+    g_wins = std::move(others);
 
     const double scale = m->m_scale;
     for (auto& w : g_pCompositor->m_windows) {
@@ -1383,6 +1394,7 @@ static void captureWindows(PHLMONITOR m, uint32_t mask = ALL_TILES) {
         cw.win     = w;
         cw.logical = Rect{wb.x + gdp.x, wb.y + gdp.y, wb.w + gds.x, wb.h + gds.y};
         cw.tile    = tile;
+        cw.mon     = m;
         cw.active  = g_pCompositor->isWindowActive(w);
 
         // The window as a CARD (bar + border around the content), and where the
@@ -1654,7 +1666,60 @@ static void trace(const char* fmt, ...) {
 // `mask`: which tiles to re-render. A commit touches at most two workspaces;
 // re-rendering all 18 at the 20fps boost (~360 workspace renders/s) is what
 // froze the drag after a few movements. Skipped tiles keep their snapshot.
-static void captureWorkspaces(PHLMONITOR m, uint32_t mask = ALL_TILES) {
+// SHARED DESKS (Max, 2026-11-12): a page's desks can be on any screen, so the
+// page is photographed screen by screen — each desk on the screen it is on,
+// at that screen's size. `g_capMine`: the tiles of the screen being done; the
+// loops that free or re-decide a tile's state keep to those.
+static uint32_t   g_capMine = ALL_TILES;
+static PHLMONITOR tileMon(int tile) {
+    if (const auto ws = g_pCompositor->getWorkspaceByID(wsFor(tile)))
+        if (const auto wm = ws->m_monitor.lock(); wm && wm->m_enabled)
+            return wm;
+    return g_captureMon.lock(); // no such desk yet: nothing to photograph, the map's screen stands in
+}
+static void captureWorkspacesOn(PHLMONITOR m, uint32_t mask);
+// The part of tile `t` (laid out for screen `lay`) that a desk living on screen
+// `tm` takes: all of it on the map's own screen, else the largest piece of it
+// in `tm`'s shape, centred — the desk keeps its shape in its tile.
+static Rect tileSeat(PHLMONITOR lay, const Rect& t, PHLMONITOR tm) {
+    if (!tm || tm == lay)
+        return t;
+    const SUsable u = usableArea(tm);
+    const double  k = std::min(t.w / u.w, t.h / u.h);
+    return Rect{t.x + (t.w - u.w * k) / 2.0, t.y + (t.h - u.h * k) / 2.0, u.w * k, u.h * k};
+}
+static void captureWorkspaces(PHLMONITOR d, uint32_t mask = ALL_TILES) {
+    if (const auto cm = g_captureMon.lock())
+        d = cm;
+    if (!d)
+        return;
+    std::vector<std::pair<PHLMONITOR, uint32_t>> screens{{d, 0u}}; // the map's own first: it photographs the backdrop
+    for (int i = 0; i < N_TILES; ++i) {
+        const auto tm = tileMon(i);
+        auto       it = std::ranges::find_if(screens, [&](const auto& e) { return e.first == tm; });
+        if (it == screens.end()) {
+            screens.emplace_back(tm, 0u);
+            it = screens.end() - 1;
+        }
+        it->second |= 1u << i;
+    }
+    for (const auto& [mon, mine] : screens) {
+        g_capMine = mine;
+        captureWorkspacesOn(mon, mask);
+    }
+    g_capMine = ALL_TILES;
+    // What no screen's pass owns any more: a window gone, off the page, or
+    // whose desk went to a screen since.
+    std::erase_if(g_wins, [](const CapWin& cw) {
+        const auto w = cw.win.lock();
+        if (!w)
+            return true;
+        if (g_dragReal && w == g_dragWin.lock())
+            return false;
+        return tileFor(w->workspaceID()) < 0 || w->m_monitor.lock() != cw.mon.lock();
+    });
+}
+static void captureWorkspacesOn(PHLMONITOR m, uint32_t mask) {
     if (!m)
         return;
 
@@ -1699,6 +1764,8 @@ static void captureWorkspaces(PHLMONITOR m, uint32_t mask = ALL_TILES) {
     sweepSolos();
 
     for (int i = 0; i < N_TILES; ++i) {
+        if (!(g_capMine & (1u << i)))
+            continue; // another screen's desk
         auto& fb = g_fbs[i];
         if (!(occupied & (1u << i))) {
             if (fb) {
@@ -1766,7 +1833,7 @@ static void captureWorkspaces(PHLMONITOR m, uint32_t mask = ALL_TILES) {
     // With the workspace snapshots ready, build the two things we actually
     // draw: the single wallpaper backdrop (skipped on partial captures —
     // wallpaper doesn't change mid-drag), and one cropped texture per window.
-    if (mask == ALL_TILES || !g_bgFB)
+    if ((mask == ALL_TILES || !g_bgFB) && m == g_captureMon.lock())
         captureBackdrop(m, monbox);
     const auto capT1 = Time::steadyNow();
     captureWindows(m, mask);
@@ -1929,6 +1996,8 @@ static Rect spreadCard(PHLWINDOW w) {
 // tile (its parked-offscreen box would poison the layout).
 static void computeTileSpreads(PHLMONITOR m, uint32_t mask, uint32_t occupied) {
     for (int i = 0; i < N_TILES; ++i) {
+        if (!(g_capMine & (1u << i)))
+            continue; // another screen's desk
         if (!(mask & (1u << i)) && g_tileCaptured[i])
             continue; // not dirty: last collage stands with the last photograph
         auto& ts = g_tileSpread[i];
@@ -2619,10 +2688,9 @@ static void showPage(int64_t base, bool force = false, bool slide = false) {
         g_slideProg     = 0.0f;
         g_slidePrevE    = 0.0;
     }
-    const int  at  = pageIndex(base);
-    PHLMONITOR lay = at >= 0 ? g_pages[at].lay.lock() : nullptr;
-    if (!lay)
-        lay = d;
+    // SHARED DESKS: the page is laid out on the map's own screen whatever
+    // screens its desks are on (each is photographed where it is).
+    PHLMONITOR lay = d;
     trace("page %lld -> %lld on %s", (long long)g_base, (long long)base, lay->m_name.c_str());
     g_base   = base;
     g_layMon = lay == d ? PHLMONITORREF{} : PHLMONITORREF{lay};
@@ -2646,14 +2714,10 @@ static bool resyncPage() {
     const auto d  = g_captureMon.lock();
     if (at < 0 || !d)
         return false;
-    auto want = g_pages[at].lay.lock();
-    if (!want || !want->m_enabled)
-        want = d;
-    const auto have = g_layMon.lock();
-    if (want == have || (want == d && !have))
-        return false;
-    showPage(g_base, true);
-    return true;
+    // SHARED DESKS: the page is always laid out on the map's own screen and
+    // each desk photographed where it is — a screen coming or going changes
+    // only where a tile's picture is taken, tick by tick.
+    return false;
 }
 
 // The page word under draw-space point `c`, as its block's base; -1 for none.
@@ -2672,14 +2736,15 @@ static int64_t pageWordAt(const Vector2D& c) {
 // workspace with windows; else its first. A float crossing to another screen
 // keeps its place on the screen (the compositor's move) and stays on it.
 static void sendToPage(PHLWINDOW w, int64_t base) {
-    const int at = pageIndex(base);
-    const auto host = at >= 0 ? g_pages[at].lay.lock() : nullptr;
-    if (!host || !w)
+    const auto d = g_captureMon.lock();
+    if (!d || !w)
         return;
-    int64_t    to     = -1;
-    const auto active = host->activeWorkspaceID();
-    if (active > base && active <= base + N_TILES)
-        to = active;
+    // SHARED DESKS: a desk of that page some screen is showing, else…
+    int64_t to = -1;
+    for (const auto& mon : g_pCompositor->m_monitors)
+        if (mon && mon->m_enabled && to < 0)
+            if (const auto a = mon->activeWorkspaceID(); a > base && a <= base + N_TILES)
+                to = a;
     for (int i = 1; to < 0 && i <= N_TILES; ++i)
         if (const auto ws = g_pCompositor->getWorkspaceByID(base + i); ws && ws->getWindows() > 0)
             to = base + i;
@@ -2687,9 +2752,10 @@ static void sendToPage(PHLWINDOW w, int64_t base) {
         to = base + 1;
     auto ws = g_pCompositor->getWorkspaceByID(to);
     if (!ws)
-        ws = g_pCompositor->createNewWorkspace(to, host->m_id);
+        ws = g_pCompositor->createNewWorkspace(to, d->m_id);
     if (!ws)
         return;
+    const auto host = ws->m_monitor.lock() ? ws->m_monitor.lock() : d;
     const auto from = w->m_monitor.lock();
     trace("page drop ws=%d -> %lld (%s)", (int)w->workspaceID(), (long long)to, host->m_name.c_str());
     g_pCompositor->moveWindowToWorkspaceSafe(w, ws);
@@ -3036,11 +3102,25 @@ static void drawOverview(PHLMONITOR rm, float p, float pl, int zoomTile) {
     };
     std::vector<MiniBox> real(g_wins.size()), tgt(g_wins.size());
     std::vector<bool>    ok(g_wins.size(), false);
-    const SUsable        u = usableArea(m);
+    // SHARED DESKS: each tile's desk is mapped from the screen it is on, into
+    // the tile's SEAT — the tile itself for the map's own screen, else the
+    // part of it that has the other screen's shape (no stretching).
+    Rect       seats[N_TILES];
+    SUsable    tus[N_TILES];
+    PHLMONITOR tmons[N_TILES];
+    for (int i = 0; i < N_TILES; ++i) {
+        tmons[i] = tileMon(i);
+        if (!tmons[i])
+            tmons[i] = m;
+        tus[i]   = usableArea(tmons[i]);
+        seats[i] = tileSeat(m, tiles[i], tmons[i]);
+    }
     for (size_t i = 0; i < g_wins.size(); ++i) {
         auto& cw = g_wins[i];
+        const SUsable&    u  = tus[cw.tile];
+        const PHLMONITOR& tm = tmons[cw.tile];
         Rect  mini;
-        waveview_map_window(tiles[cw.tile].x, tiles[cw.tile].y, tiles[cw.tile].w, tiles[cw.tile].h, u.x, u.y, u.w, u.h,
+        waveview_map_window(seats[cw.tile].x, seats[cw.tile].y, seats[cw.tile].w, seats[cw.tile].h, u.x, u.y, u.w, u.h,
                             cw.logical.x, cw.logical.y, cw.logical.w, cw.logical.h, &mini);
         if (mini.w <= 0.0 || mini.h <= 0.0) {
             cw.screen = CBox{};
@@ -3057,8 +3137,8 @@ static void drawOverview(PHLMONITOR rm, float p, float pl, int zoomTile) {
         // Opening over the stage, act 1 starts where the STAGE had it.
         const Rect& src = (cw.hasFrom && g_animTarget >= 0.5f) ? cw.from : cw.logical;
         Rect        land;
-        waveview_map_window(tiles[cw.tile].x, tiles[cw.tile].y, tiles[cw.tile].w, tiles[cw.tile].h, m->m_position.x,
-                            m->m_position.y, m->m_size.x, m->m_size.y, src.x, src.y, src.w, src.h, &land);
+        waveview_map_window(seats[cw.tile].x, seats[cw.tile].y, seats[cw.tile].w, seats[cw.tile].h, tm->m_position.x,
+                            tm->m_position.y, tm->m_size.x, tm->m_size.y, src.x, src.y, src.w, src.h, &land);
         ok[i]           = true;
         real[i]         = {land.x, land.y, land.x + land.w, land.y + land.h};
         tgt[i]          = {mini.x, mini.y, mini.x + mini.w, mini.y + mini.h};
@@ -3070,7 +3150,7 @@ static void drawOverview(PHLMONITOR rm, float p, float pl, int zoomTile) {
             // overlay drop. No bound-snapping, no seam-solving here: a
             // collage keeps its own margins and gaps.
             Rect smini;
-            waveview_map_window(tiles[cw.tile].x, tiles[cw.tile].y, tiles[cw.tile].w, tiles[cw.tile].h, u.x, u.y, u.w,
+            waveview_map_window(seats[cw.tile].x, seats[cw.tile].y, seats[cw.tile].w, seats[cw.tile].h, u.x, u.y, u.w,
                                 u.h, cw.slot.x, cw.slot.y, cw.slot.w, cw.slot.h, &smini);
             // The seat lives in the USABLE area, but at p=0 the zoom shows the
             // tile as the FULL monitor — mapped only against the usable space,
@@ -3078,8 +3158,8 @@ static void drawOverview(PHLMONITOR rm, float p, float pl, int zoomTile) {
             // seats and the escalation between them jumped. Blend the two
             // mappings with the zoom: exact full-screen at p=0, exact grid at 1.
             Rect sfull;
-            waveview_map_window(tiles[cw.tile].x, tiles[cw.tile].y, tiles[cw.tile].w, tiles[cw.tile].h,
-                                m->m_position.x, m->m_position.y, m->m_size.x, m->m_size.y, cw.slot.x, cw.slot.y,
+            waveview_map_window(seats[cw.tile].x, seats[cw.tile].y, seats[cw.tile].w, seats[cw.tile].h,
+                                tm->m_position.x, tm->m_position.y, tm->m_size.x, tm->m_size.y, cw.slot.x, cw.slot.y,
                                 cw.slot.w, cw.slot.h, &sfull);
             if (smini.w > 0.0 && smini.h > 0.0 && sfull.w > 0.0 && sfull.h > 0.0)
                 tgt[i] = {mix(sfull.x, smini.x, p), mix(sfull.y, smini.y, p), mix(sfull.x + sfull.w, smini.x + smini.w, p),
@@ -3087,7 +3167,7 @@ static void drawOverview(PHLMONITOR rm, float p, float pl, int zoomTile) {
             else if (smini.w > 0.0 && smini.h > 0.0)
                 tgt[i] = {smini.x, smini.y, smini.x + smini.w, smini.y + smini.h};
         } else {
-            const Rect&  t    = tiles[cw.tile];
+            const Rect&  t    = seats[cw.tile];
             const double thrX = t.w * 0.02, thrY = t.h * 0.02;
             tgt[i].x0 = (tgt[i].x0 - t.x < thrX) ? t.x : tgt[i].x0;
             tgt[i].y0 = (tgt[i].y0 - t.y < thrY) ? t.y : tgt[i].y0;
@@ -3109,7 +3189,7 @@ static void drawOverview(PHLMONITOR rm, float p, float pl, int zoomTile) {
             bool   closing; // true = x1/y1 (left/top side of the seam)
         };
         auto solveAxis = [&](int tile, bool xAxis) {
-            const Rect&          t   = tiles[tile];
+            const Rect&          t   = seats[tile];
             const double         eps = std::max(t.w, t.h) * 0.03;
             const double         g   = DSN_WIN_GAP * (xAxis ? t.w : t.h);
             const double         lo  = xAxis ? t.x : t.y;
@@ -3456,6 +3536,36 @@ static void drawOverview(PHLMONITOR rm, float p, float pl, int zoomTile) {
         band(0.0, std::max(0.0, y0), std::max(0.0, x0), std::max(0.0, std::min(mh, y1) - std::max(0.0, y0)));
         band(std::min(mw, x1), std::max(0.0, y0), std::max(0.0, mw - x1),
              std::max(0.0, std::min(mh, y1) - std::max(0.0, y0)));  // right
+    }
+
+    // SHARED DESKS: with more than one screen, each desk on show wears the
+    // name of the screen showing it (part of the page: it slides with it).
+    if (p >= 0.6f) {
+        int screens = 0;
+        for (const auto& mon : g_pCompositor->m_monitors)
+            screens += mon && mon->m_enabled && !mon->m_name.starts_with("FALLBACK");
+        const double sc = rm->m_scale;
+        const float  ta = std::clamp((p - 0.6f) / 0.4f, 0.0f, 1.0f);
+        for (const auto& mon : g_pCompositor->m_monitors) {
+            if (screens < 2 || !mon || !mon->m_enabled || mon->m_name.starts_with("FALLBACK"))
+                continue;
+            const int t = tileFor(mon->activeWorkspaceID());
+            if (t < 0)
+                continue;
+            const auto it  = g_screenNames.find(screenRuleKey(mon));
+            const auto tex = wordTexture(it != g_screenNames.end() ? it->second : mon->m_name, CHyprColor(0.94, 0.93, 0.97, 1.0), (int)std::lround(10.0 * sc), false);
+            if (!tex || tex->m_size.x < 1)
+                continue;
+            const double padX = 8.0 * sc, padY = 4.0 * sc, in = 8.0 * sc;
+            const CBox   plate{tiles[t].x + in, tiles[t].y + in, tex->m_size.x + 2.0 * padX, tex->m_size.y + 2.0 * padY};
+            renderRect(plate, CHyprColor(0.0, 0.0, 0.0, 0.45 * ta), (int)std::lround(plate.h / 2.0));
+            CTexPassElement::SRenderData td;
+            td.tex     = tex;
+            td.box     = fitBox(g_emitFit, CBox{plate.x + padX, plate.y + padY, tex->m_size.x, tex->m_size.y});
+            td.a       = ta;
+            td.clipBox = stripClip;
+            g_pHyprRenderer->m_renderPass.add(makeUnique<CTexPassElement>(td));
+        }
     }
 
     g_emitFit   = {}; // the page words and the fade are this screen's own
@@ -3998,6 +4108,16 @@ static bool seatFloat(PHLWINDOW dw, const Vector2D& centre) {
 // that point the moment it was let go — nothing, grabbed by the middle; half
 // a window, grabbed by a corner.
 static Vector2D deskAt(PHLMONITOR m, const Rect& t, const Vector2D& c); // below, with the drop signatures
+// The screen the desk of tile `t` (one of `computeTiles(m)`'s) is on.
+static PHLMONITOR tileScreen(PHLMONITOR m, const Rect& t) {
+    Rect tiles[N_TILES];
+    if (computeTiles(m, tiles) == N_TILES)
+        for (int i = 0; i < N_TILES; ++i)
+            if (tiles[i].x == t.x && tiles[i].y == t.y)
+                if (const auto tm = tileMon(i))
+                    return tm;
+    return m;
+}
 //
 // …and kept ON the screen: a tile is a third of the desktop, so a pointer a
 // few pixels from its edge is a window half out of sight, and one dropped at
@@ -4007,7 +4127,7 @@ static Vector2D deskAt(PHLMONITOR m, const Rect& t, const Vector2D& c); // below
 // corner does when it does not.
 static Vector2D floatDropCentre(PHLMONITOR m, const Rect& t, const Vector2D& c, PHLWINDOW dw) {
     const CBox    fb = dw->getWindowMainSurfaceBox();
-    const SUsable u  = usableArea(m);
+    const SUsable u  = usableArea(tileScreen(m, t)); // (the desk's own screen: SHARED DESKS)
     Vector2D      tl = deskAt(m, t, c) - Vector2D{g_grabFracX * fb.w, g_grabFracY * fb.h};
     double top = 0.0, side = 0.0;
     cardExtents(dw, top, side); // its title bar stands above the surface box and must stay in reach too
@@ -4165,8 +4285,16 @@ static int quadrantSide(const CBox& b, const Vector2D& c) {
 // Draw-space point c mapped to desktop logical coords within tile t
 // (inverse of the tile mapping; same math as the drop handler).
 static Vector2D deskAt(PHLMONITOR m, const Rect& t, const Vector2D& c) {
-    const SUsable u = usableArea(m);
-    return {u.x + (c.x - t.x) * u.w / t.w, u.y + (c.y - t.y) * u.h / t.h};
+    // SHARED DESKS: the tile's desk may be on another screen — its usable
+    // area, through the tile's seat (kept inside it: the rest of the tile is
+    // not a place on that desk).
+    const auto    tm = tileScreen(m, t);
+    const SUsable u  = usableArea(tm);
+    const Rect    st = tileSeat(m, t, tm);
+    Vector2D      at{u.x + (c.x - st.x) * u.w / st.w, u.y + (c.y - st.y) * u.h / st.h};
+    if (tm != m)
+        at = Vector2D{std::clamp(at.x, u.x + 1.0, u.x + u.w - 1.0), std::clamp(at.y, u.y + 1.0, u.y + u.h - 1.0)};
+    return at;
 }
 
 // Translate the INTENT — "split `under` on `side`, as seen in the tiles" —
@@ -5015,13 +5143,15 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
             Rect      tiles[N_TILES];
             const int t = tileFor(ew->workspaceID());
             if (t >= 0 && computeTiles(m, tiles) == N_TILES && tiles[t].w > 0.0 && tiles[t].h > 0.0) {
-                const SUsable u = usableArea(m);
+                const auto    rtm = tileMon(t);
+                const SUsable u   = usableArea(rtm ? rtm : m);
+                const Rect    rst = tileSeat(m, tiles[t], rtm);
                 g_resizing     = true;
                 g_resizeWin    = ew;
                 g_resizeLast   = c;
                 g_resizeCorner = g_edgeCorner;
                 g_resizeMask   = g_edgeMask;
-                g_resizeScale  = {u.w / tiles[t].w, u.h / tiles[t].h};
+                g_resizeScale  = {u.w / rst.w, u.h / rst.h};
                 g_watchWin.reset(); // dwindle ratio pushes are not float leaks
                 trace("resize grab ws=%d corner=%d mask=(%.0f,%.0f) class=%s", (int)ew->workspaceID(), (int)g_resizeCorner, g_resizeMask.x, g_resizeMask.y, ew->fetchClass().c_str());
                 boostCaptures();
@@ -6464,6 +6594,124 @@ static void onSwipeEnd(IPointer::SSwipeEndEvent, Event::SCallbackInfo& info) {
     g_swipeEndAt   = Time::steadyNow(); // the settle grace runs from here
 }
 
+// ---- SHARED DESKS -----------------------------------------------------------
+// Max, 2026-11-12: *"if im on a screen and on that screen i call the overview,
+// go to another page or another screen and click on a window, that WS is called
+// to the current screen … so from the overview i always land on the WS i
+// click"*. Desks keep their PAGE (the block a screen's rules gave them) but
+// any screen can show any desk: picking one BRINGS IT HERE. If another screen
+// was showing it, that screen goes ONE DESK FURTHER, away from this one (the
+// screens stand side by side on the page's strip of desks; they never show
+// the same desk).
+//
+// Hyprland binds a desk to its rule's screen and sends every desk home when
+// ANY screen connects (`ensureWorkspacesOnAssignedMonitors`), so where the
+// user PUT a desk is remembered here (`g_deskPut`, by screen key) and given
+// back after a connect (`restoreDesks`). A desk that only left because its
+// screen went away is in no record: it goes home by Hyprland's own rule.
+static std::unordered_map<int64_t, std::string> g_deskPut; // desk -> the screen it was put on (when not its rule's)
+static void noteDeskPut(int64_t id, PHLMONITOR on) {
+    if (!on)
+        return;
+    const auto key = screenRuleKey(on);
+    if (Config::workspaceRuleMgr()->getBoundMonitorStringForWS(std::to_string(id)) == key)
+        g_deskPut.erase(id);
+    else
+        g_deskPut[id] = key;
+}
+// Whether a screen other than `a` and `b` is showing desk `id`.
+static bool shownElsewhere(int64_t id, PHLMONITOR a, PHLMONITOR b) {
+    for (const auto& mon : g_pCompositor->m_monitors)
+        if (mon && mon->m_enabled && mon != a && mon != b && mon->activeWorkspaceID() == id)
+            return true;
+    return false;
+}
+// Desk `ws` to screen `to`, its windows at rest there at once (no spring from
+// the other screen's geometry: the pictures taken next must be the real thing).
+static void deskToScreen(PHLWORKSPACE ws, PHLMONITOR to) {
+    if (!ws || !to || ws->m_monitor.lock() == to)
+        return;
+    g_pCompositor->moveWorkspaceToMonitor(ws, to, true);
+    g_layoutManager->recalculateMonitor(to);
+    for (const auto& w : g_pCompositor->m_windows)
+        if (w && w->m_isMapped && w->m_workspace == ws) {
+            w->m_realPosition->warp();
+            w->m_realSize->warp();
+        }
+    noteDeskPut(ws->m_id, to);
+}
+// The desk screen `from` goes to when `id`, which it shows, is taken by `to`:
+// one further along the page, away from `to`; if the page ends there, the
+// other way. -1: none free (every other desk of the page is on show).
+static int64_t deskFurther(int64_t id, PHLMONITOR from, PHLMONITOR to) {
+    const int64_t base = blockOf(id);
+    const int     away = from->m_position.x >= to->m_position.x ? 1 : -1;
+    for (const int dir : {away, -away})
+        for (int64_t n = id + dir; n > base && n <= base + N_TILES; n += dir)
+            if (!shownElsewhere(n, from, to))
+                return n;
+    return -1;
+}
+// Bring desk `id` to screen `to` and show it there. True when it is on show
+// there afterwards.
+static bool bringHere(int64_t id, PHLMONITOR to) {
+    if (!to || id < 1)
+        return false;
+    auto ws = g_pCompositor->getWorkspaceByID(id);
+    if (!ws)
+        ws = g_pCompositor->createNewWorkspace(id, to->m_id); // (an unknown desk is made on its rule's screen)
+    if (!ws)
+        return false;
+    const auto from = ws->m_monitor.lock();
+    if (from && from != to) {
+        const bool    shown   = from->m_activeWorkspace == ws;
+        const int64_t further = shown ? deskFurther(id, from, to) : -1;
+        const int64_t toWas   = to->activeWorkspaceID();
+        trace("bring %lld: %s -> %s (shown=%d, %s goes on to %lld)", (long long)id, from->m_name.c_str(), to->m_name.c_str(), (int)shown,
+              from->m_name.c_str(), (long long)further);
+        deskToScreen(ws, to); // (a desk on show: Hyprland puts another of that screen's up meanwhile)
+        if (to->m_activeWorkspace != ws)
+            to->changeWorkspace(ws, false, true);
+        if (shown && further >= 1) {
+            auto nws = g_pCompositor->getWorkspaceByID(further);
+            if (!nws)
+                nws = g_pCompositor->createNewWorkspace(further, from->m_id);
+            if (nws) {
+                deskToScreen(nws, from); // (it may be the desk `to` just left)
+                if (from->m_activeWorkspace != nws)
+                    from->changeWorkspace(nws, false, true, true);
+            }
+        }
+        (void)toWas;
+        return to->m_activeWorkspace == ws;
+    }
+    if (to->m_activeWorkspace != ws)
+        to->changeWorkspace(ws, false, true);
+    return to->m_activeWorkspace == ws;
+}
+// After a screen connected (Hyprland has sent every desk to its rule's
+// screen): the desks the user had put elsewhere go back where they were put.
+static void restoreDesks() {
+    for (auto it = g_deskPut.begin(); it != g_deskPut.end();) {
+        const auto ws = g_pCompositor->getWorkspaceByID(it->first);
+        if (!ws) { // emptied and gone: nothing is put anywhere
+            it = g_deskPut.erase(it);
+            continue;
+        }
+        PHLMONITOR want;
+        for (const auto& mon : g_pCompositor->m_monitors)
+            if (mon && mon->m_enabled && screenRuleKey(mon) == it->second)
+                want = mon;
+        if (want && ws->m_monitor.lock() != want) {
+            trace("restore desk %lld -> %s", (long long)it->first, want->m_name.c_str());
+            const auto key = it->second;
+            g_pCompositor->moveWorkspaceToMonitor(ws, want, true);
+            g_layoutManager->recalculateMonitor(want);
+        }
+        ++it;
+    }
+}
+
 // Jump to workspace `wsId` (1..9) and close the overview by zooming into that
 // workspace's tile. Switching workspace happens under the still-covering
 // overview; the close animation then flies into the chosen tile, so releasing
@@ -6481,10 +6729,15 @@ static void jumpTo(int wsId, bool startTheClose) {
     // that the close we start below is decided against the workspace we are
     // actually landing on — over the stage, `startClose` hands this moment to
     // waverunner, which stages whatever is focused by then.
-    if (g_pKeybindManager) {
-        const auto it = g_pKeybindManager->m_dispatchers.find("workspace");
-        if (it != g_pKeybindManager->m_dispatchers.end())
-            it->second(std::to_string(wsId));
+    // SHARED DESKS: the desk comes to THIS screen, wherever it was; one taken
+    // from a screen that showed it sends that screen one desk further. What
+    // moved changed size: photographed again before the close flies into it.
+    if (const auto d = g_captureMon.lock()) {
+        const auto ws    = g_pCompositor->getWorkspaceByID(wsId);
+        const bool moved = ws && ws->m_monitor.lock() != d;
+        bringHere(wsId, d);
+        if (moved)
+            captureWorkspaces(d, ALL_TILES);
     }
     // `jumpToWindow` passes false and closes itself, once it has focused the
     // exact window that was clicked — from here the focus is still the old one,
@@ -6652,6 +6905,23 @@ static void onKey(IKeyboard::SKeyEvent e, Event::SCallbackInfo& info) {
 
 static int luaToggle(lua_State*) {
     toggle();
+    return 0;
+}
+
+// `hl.plugin.waveview.bring(id)` — SHARED DESKS: desk `id` to the screen you
+// are on (Super+N). With the map up, it is the map's own pick.
+static int luaBring(lua_State* L) {
+    const int64_t id = (int64_t)lua_tointeger(L, 1);
+    if (id < 1)
+        return 0;
+    if (g_active) {
+        if (g_animTarget >= 0.5f)
+            jumpTo((int)id);
+        return 0;
+    }
+    if (g_spreadActive)
+        snapCloseSpread();
+    bringHere(id, Desktop::focusState()->monitor());
     return 0;
 }
 
@@ -7935,6 +8205,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     // happens at keypress (plugin loads after config eval):
     //   hl.bind(mainMod .. " + G", function() hl.plugin.waveview.toggle() end)
     HyprlandAPI::addLuaFunction(handle, "waveview", "toggle", luaToggle);
+    HyprlandAPI::addLuaFunction(handle, "waveview", "bring", luaBring);
     HyprlandAPI::addLuaFunction(handle, "waveview", "close", luaClose);
     HyprlandAPI::addLuaFunction(handle, "waveview", "stage_ready", luaStageReady);
     HyprlandAPI::addLuaFunction(handle, "waveview", "recapture", luaRecapture);
@@ -7957,7 +8228,12 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     g_moveListener   = Event::bus()->m_events.input.mouse.move.listen(onMouseMove);
     g_buttonListener = Event::bus()->m_events.input.mouse.button.listen(onMouseButton);
     g_axisListener   = Event::bus()->m_events.input.mouse.axis.listen(onMouseAxis);
-    g_monitorAddedListener = Event::bus()->m_events.monitor.added.listen([](PHLMONITOR) { learnScreenNames(); });
+    g_monitorAddedListener = Event::bus()->m_events.monitor.added.listen([](PHLMONITOR) {
+        learnScreenNames();
+        // Hyprland sends every desk to its rule's screen once the connect is
+        // through (queued at the top of CMonitor::onConnect): ours after it.
+        g_pEventLoopManager->doLater([] { restoreDesks(); });
+    });
     learnScreenNames();
     g_swipeBeginListener  = Event::bus()->m_events.gesture.swipe.begin.listen(onSwipeBegin);
     g_swipeUpdateListener = Event::bus()->m_events.gesture.swipe.update.listen(onSwipeUpdate);
