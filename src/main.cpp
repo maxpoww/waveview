@@ -50,6 +50,7 @@
 #include <hyprland/src/managers/eventLoop/EventLoopTimer.hpp>
 #include <hyprland/src/layout/LayoutManager.hpp>
 #include <hyprland/src/layout/target/Target.hpp>
+#include <hyprland/src/layout/space/Space.hpp>
 #include <hyprland/src/managers/CursorManager.hpp>
 #include <hyprland/src/managers/KeybindManager.hpp>
 #include <hyprland/src/managers/SeatManager.hpp>
@@ -1157,6 +1158,7 @@ static void jumpTo(int wsId, bool startTheClose = true);
 static void beginCloseZoom(); // put the close on its curve (see `startClose`)
 static void beginStageCloseZoom();   // the stage's way back: a short zoom
 static void jumpToWindow(PHLWINDOW w);
+static void drawPushOut(PHLMONITOR fm); // the desk swipe's (SHARED DESKS)
 static void updateHoverAt(PHLMONITOR m, const Vector2D& c);
 static void keepPointerOn(PHLMONITOR d); // a carried window stays on the map's screen (see `tickEdgeHold`)
 static void reassertOverviewCursor(); // undo the compositor's border icon (defined with the cursor owner)
@@ -5633,8 +5635,10 @@ static void drawMinFlies(PHLMONITOR m) {
 static void onRender(eRenderStage stage) {
     if (g_capturing || stage != eRenderStage::RENDER_POST_WINDOWS)
         return;
-    if (const auto fm = g_pHyprRenderer->m_renderData.pMonitor.lock())
+    if (const auto fm = g_pHyprRenderer->m_renderData.pMonitor.lock()) {
+        drawPushOut(fm);  // a pushed screen's outgoing desk (the desk swipe)
         drawMinFlies(fm); // under any overlay, above the desktop
+    }
     if (g_spreadActive && !g_active) {
         if (const auto m = g_pHyprRenderer->m_renderData.pMonitor.lock(); m && m == g_spreadMon.lock())
             onRenderSpread(m);
@@ -6395,6 +6399,16 @@ static void toggle() {
 }
 
 static bool g_cardAway = false; // this swipe sent waverunner's card away (see onSwipeBegin)
+// THE DESK SWIPE is ours (see it, with SHARED DESKS): these drive it.
+extern bool   g_ownSwipe;
+static void   deskSwipeBegin();
+static void   deskSwipeUpdate(double delta);
+static void   deskSwipeEnd();
+static bool   g_deskSwiping = false; // this gesture is walking the desks
+static double g_deskTravel  = 0.0;   // its sideways travel (the fingers')
+static bool   ownsSwipe(int fingers) {
+    return g_ownSwipe && (fingers == 3 || fingers == 4);
+}
 
 // A trackpad swipe begins: remember the finger count and reset the accumulator.
 // While the overview is open the whole gesture stream is consumed so the
@@ -6417,14 +6431,16 @@ static void onSwipeBegin(IPointer::SSwipeBeginEvent e, Event::SCallbackInfo& inf
     g_stageSwipe     = g_stageMode && (e.fingers == 3 || e.fingers == 4);
     g_stageSwipeDx   = 0.0;
     g_stageSwipeSent = 0.0;
-    if (g_active || g_stageMode || g_spreadActive)
-        info.cancelled = true;
+    if (g_active || g_stageMode || g_spreadActive || ownsSwipe(e.fingers))
+        info.cancelled = true; // (ours: Hyprland's own workspace swipe never starts)
+    g_deskSwiping = false;
+    g_deskTravel  = 0.0;
     // Out on the desktop a 3/4-finger swipe is about to slide the workspaces
     // (or open the overview): waverunner's card, which is a layer and would
     // stay put over the sliding windows, goes away at once (Max, 2026-10-08:
     // *"i want the card to hide instantly when i swipe through workspaces"*)
     // and comes back when the fingers have left and the slide has settled.
-    g_cardAway = !info.cancelled && (e.fingers == 3 || e.fingers == 4);
+    g_cardAway = !g_active && !g_stageMode && !g_spreadActive && (e.fingers == 3 || e.fingers == 4);
     if (g_cardAway)
         sendWaverunner("card away\n");
     trace("SWIPE begin f=%d active=%d spread=%d stage=%d consumed=%d", (int)e.fingers, (int)g_active, (int)g_spreadActive,
@@ -6450,6 +6466,9 @@ static bool decisiveVertical() {
 static constexpr double SWIPE_CLAIM_X = 40.0;
 
 // Whether this gesture has already been claimed by its horizontal owner.
+// Our own desk swipe takes the gesture at this much sideways travel: the
+// desks move from the first millimetres, as Hyprland's do.
+static constexpr double DESK_SWIPE_CLAIM = 4.0;
 static bool claimedSideways() {
     return std::abs(g_swipeAcc.x) >= SWIPE_CLAIM_X && std::abs(g_swipeAcc.x) > std::abs(g_swipeAcc.y);
 }
@@ -6521,13 +6540,38 @@ static void onSwipeUpdate(IPointer::SSwipeUpdateEvent e, Event::SCallbackInfo& i
         }
         return;
     }
+    if (ownsSwipe(g_swipeFingers)) {
+        info.cancelled = true;
+        // Walking the desks: the fingers' sideways travel, the way Hyprland
+        // counts it (its `workspace_swipe_invert`, on by default: the desks
+        // follow the fingers).
+        static auto PSWIPEINV = CConfigValue<Config::INTEGER>("gestures:workspace_swipe_invert");
+        if (g_deskSwiping) {
+            g_deskTravel += e.delta.x;
+            deskSwipeUpdate(*PSWIPEINV ? -g_deskTravel : g_deskTravel);
+            return;
+        }
+        if (!g_swipeFired && !g_active && !g_spreadActive) {
+            const Vector2D acc = g_swipeAcc + e.delta;
+            if (std::abs(acc.x) >= DESK_SWIPE_CLAIM && std::abs(acc.x) > std::abs(acc.y)) {
+                g_swipeAcc    = acc;
+                g_swipeFired  = true; // this gesture's one decision: the desks
+                g_deskSwiping = true;
+                g_deskTravel  = acc.x;
+                deskSwipeBegin();
+                deskSwipeUpdate(*PSWIPEINV ? -g_deskTravel : g_deskTravel);
+                return;
+            }
+        }
+    }
     if ((g_swipeFingers != 3 && g_swipeFingers != 4) || g_swipeFired)
         return;
     g_swipeAcc += e.delta;
     // The workspace swipe has it: the compositor is already sliding, and this
     // gesture is theirs to finish. Latched — NOT consumed, since they still need
     // the events — so a lift at the end cannot open the stage halfway between
-    // two workspaces.
+    // two workspaces. (Only when the swipe was handed back to Hyprland: ours
+    // is claimed above, from its first millimetres.)
     if (claimedSideways()) {
         g_swipeFired = true;
         return;
@@ -6573,8 +6617,12 @@ static void onSwipeUpdate(IPointer::SSwipeUpdateEvent e, Event::SCallbackInfo& i
 }
 
 static void onSwipeEnd(IPointer::SSwipeEndEvent, Event::SCallbackInfo& info) {
-    if (g_active || g_stageMode || g_spreadActive)
+    if (g_active || g_stageMode || g_spreadActive || ownsSwipe(g_swipeFingers))
         info.cancelled = true;
+    if (g_deskSwiping) {
+        g_deskSwiping = false;
+        deskSwipeEnd();
+    }
     trace("SWIPE end f=%d acc=(%.0f,%.0f) fired=%d active=%d spread=%d stage=%d stageSwipe=%d consumed=%d", g_swipeFingers,
           g_swipeAcc.x, g_swipeAcc.y, (int)g_swipeFired, (int)g_active, (int)g_spreadActive, (int)g_stageMode, (int)g_stageSwipe,
           (int)info.cancelled);
@@ -6632,9 +6680,24 @@ static void deskToScreen(PHLWORKSPACE ws, PHLMONITOR to) {
     if (!ws || !to || ws->m_monitor.lock() == to)
         return;
     g_pCompositor->moveWorkspaceToMonitor(ws, to, true);
+    // Laid out for its new screen NOW, on show there or not (Hyprland lays a
+    // hidden desk out only when it comes up: a desk sliding in under the
+    // fingers would still be at the other screen's place and size).
+    ws->m_space->recheckWorkArea();
+    ws->m_space->recalculate();
     g_layoutManager->recalculateMonitor(to);
+    const SUsable u = usableArea(to);
     for (const auto& w : g_pCompositor->m_windows)
         if (w && w->m_isMapped && w->m_workspace == ws) {
+            // A float keeps its size; it is kept within reach on the new
+            // screen (a smaller one cannot hold where it stood).
+            if (w->m_isFloating && !w->isFullscreen() && inLayoutSpace(w)) {
+                const CBox   b = w->getWindowMainSurfaceBox();
+                const double x = std::clamp(b.x, u.x, std::max(u.x, u.x + u.w - b.w));
+                const double y = std::clamp(b.y, u.y, std::max(u.y, u.y + u.h - b.h));
+                if (x != b.x || y != b.y)
+                    g_layoutManager->setTargetGeom(CBox{x, y, b.w, b.h}, w->layoutTarget());
+            }
             w->m_realPosition->warp();
             w->m_realSize->warp();
         }
@@ -6710,6 +6773,385 @@ static void restoreDesks() {
         }
         ++it;
     }
+}
+
+// ---- THE DESK SWIPE (SHARED DESKS) -------------------------------------------
+// The 3/4-finger sideways swipe is the plugin's now. Hyprland's own cannot walk
+// a page whose desks are another screen's by rule, or reach a desk another
+// screen holds (its `r±1` skips both), so this is its swipe re-told with the
+// page's rules — same distances, same thresholds, same offsets on the same
+// workspace animation, so it feels the same:
+//   • it walks the PAGE of the desk on show: from a desk with windows to the
+//     raw neighbour (one empty desk is reachable), from an empty one to the
+//     next desk with windows (Golem's one-empty swipe), never off the page;
+//   • a neighbour hidden on another screen is brought to this one as the swipe
+//     heads for it;
+//   • a neighbour ANOTHER SCREEN IS SHOWING is PUSHED: it comes here under the
+//     fingers while that screen slides one desk further, live, the two halves
+//     of one movement (Max, 2026-11-12: "ill see a double slide"). The desk
+//     really moves here at once (its windows take this screen's size while
+//     still off its edge); the other screen slides a PICTURE of it out
+//     (`g_pushOut`), in step with the real desk coming in beside it.
+//     Slid back or let go short, everything returns. At the page's last
+//     desk nothing moves: a wall.
+// `hl.plugin.waveview.own_swipe(false)` hands the swipe back to Hyprland.
+bool g_ownSwipe = true;
+struct SDeskSwipe {
+    bool            live = false;
+    PHLMONITORREF   mon;
+    PHLWORKSPACEREF begin;
+    double          delta = 0.0;
+    float           avgSpeed = 0.f;
+    int             speedPoints = 0, initialDir = 0;
+    int             dir = 0;       // the side made ready (0: none)
+    int64_t         targetId = -1; // the desk on that side (-1: none, the wall)…
+    PHLWORKSPACEREF target;        // …on `mon` now, if there is such a desk yet (an empty one is only
+                                   // made when the swipe lands on it: Hyprland drops empty hidden desks)
+    bool            pushed = false; // it was taken from a screen showing it…
+    PHLMONITORREF   other;          // …that one
+    PHLWORKSPACEREF further;        // …which shows this meanwhile
+};
+static SDeskSwipe g_ds;
+// The pushed screen's side: a picture of the desk it gave, drawn beside the
+// desk coming in for as long as that one is still sliding (its render offset
+// IS the clock, during the fingers and after them).
+struct SPushOut {
+    PHLMONITORREF            mon;
+    PHLWORKSPACEREF          in;     // the desk coming in there
+    int64_t                  gaveId = -1; // the desk it gave
+    SP<Render::IFramebuffer> fb;     // its picture
+    int                      dir = 0;
+    bool                     revert = false; // let go short: when the slide is back, the desk goes home
+    bool                     finishing = false;
+};
+static SPushOut g_pushOut;
+
+static void pushOutDrop() {
+    if (g_pushOut.fb)
+        g_pushOut.fb->release();
+    g_pushOut = {};
+}
+// The desk `ws` (on show on `o`) as a picture: its windows alone, no wallpaper.
+static SP<Render::IFramebuffer> deskPicture(PHLMONITOR o, PHLWORKSPACE ws) {
+    auto fb = g_pHyprRenderer->createFB("waveview-push");
+    fb->alloc(o->m_pixelSize.x, o->m_pixelSize.y, DRM_FORMAT_ABGR8888);
+    if (!fb->isAllocated())
+        return nullptr;
+    Render::GL::g_pHyprOpenGL->makeEGLCurrent();
+    const bool wasCapturing                  = g_capturing;
+    g_capturing                              = true;
+    g_pHyprRenderer->m_bBlockSurfaceFeedback = true;
+    CRegion fakeDamage{0, 0, INT16_MAX, INT16_MAX};
+    g_pHyprRenderer->beginRender(o, fakeDamage, Render::RENDER_MODE_FULL_FAKE, nullptr, fb);
+    glClearColor(0.0F, 0.0F, 0.0F, 0.0F);
+    glClear(GL_COLOR_BUFFER_BIT);
+    for (const auto& w : g_pCompositor->m_windows)
+        if (w && w->m_isMapped && !w->isHidden() && w->m_workspace == ws)
+            g_pHyprRenderer->renderWindow(w, o, Time::steadyNow(), true, Render::RENDER_PASS_ALL);
+    g_pHyprRenderer->m_renderData.blockScreenShader = true;
+    g_pHyprRenderer->endRender();
+    g_pHyprRenderer->m_bBlockSurfaceFeedback = false;
+    g_capturing                              = wasCapturing;
+    return fb;
+}
+// Give the pushed desk back to the screen it came from (a push undone).
+static void pushUndo(PHLMONITOR o, int64_t gaveId, PHLWORKSPACE in) {
+    if (!o || gaveId < 1)
+        return;
+    auto gave = g_pCompositor->getWorkspaceByID(gaveId);
+    if (!gave) // an empty desk: it went when its screen left it
+        gave = g_pCompositor->createNewWorkspace(gaveId, o->m_id);
+    if (!gave)
+        return;
+    trace("push undo: %d back to %s", (int)gave->m_id, o->m_name.c_str());
+    gave->m_renderOffset->setValueAndWarp(Vector2D{});
+    gave->m_forceRendering = false;
+    deskToScreen(gave, o);
+    if (o->m_activeWorkspace != gave)
+        o->changeWorkspace(gave, false, true, true);
+    gave->m_renderOffset->setValueAndWarp(Vector2D{});
+    gave->m_alpha->setValueAndWarp(1.f);
+    if (in) {
+        in->m_renderOffset->setValueAndWarp(Vector2D{});
+        in->m_forceRendering = false;
+    }
+    g_pHyprRenderer->damageMonitor(o);
+}
+// Drawn on the pushed screen, every frame while its incoming desk slides.
+static void drawPushOut(PHLMONITOR fm) {
+    if (g_pushOut.gaveId < 1 || g_pushOut.mon.lock() != fm)
+        return;
+    const auto in = g_pushOut.in.lock();
+    if (!in) {
+        pushOutDrop();
+        return;
+    }
+    const double W  = fm->m_size.x + *CConfigValue<Config::INTEGER>("general:gaps_workspaces");
+    const double ox = in->m_renderOffset->value().x - g_pushOut.dir * W; // beside the desk coming in
+    if (const auto tex = g_pushOut.fb ? g_pushOut.fb->getTexture() : nullptr) { // (an empty desk has no picture)
+        CTexPassElement::SRenderData td;
+        td.tex = tex;
+        td.box = CBox{ox * fm->m_scale, 0.0, fm->m_transformedSize.x, fm->m_transformedSize.y};
+        td.a   = 1.0f;
+        g_pHyprRenderer->m_renderPass.add(makeUnique<CTexPassElement>(td));
+    }
+    // The slide over (fingers gone, the desk at rest): the picture goes — and a
+    // push let go short gives the desk back. Outside the render pass.
+    if (!g_ds.live && !in->m_renderOffset->isBeingAnimated() && !g_pushOut.finishing) {
+        g_pushOut.finishing = true;
+        g_pEventLoopManager->doLater([] {
+            if (g_pushOut.revert)
+                pushUndo(g_pushOut.mon.lock(), g_pushOut.gaveId, g_pushOut.in.lock());
+            pushOutDrop();
+            damageAll();
+        });
+    } else if (!g_pushOut.finishing) {
+        g_pHyprRenderer->damageMonitor(fm);
+        g_pCompositor->scheduleFrameForMonitor(fm);
+    }
+}
+
+// The desk a swipe from `begin` heads for on side `dir`; -1: none (the wall).
+static int64_t deskSwipeTarget(PHLWORKSPACE begin, int dir) {
+    const int64_t base = blockOf(begin->m_id);
+    auto          on   = [&](int64_t n) { return n > base && n <= base + N_TILES; };
+    if (begin->getWindows() > 0)
+        return on(begin->m_id + dir) ? begin->m_id + dir : -1;
+    for (int64_t n = begin->m_id + dir; on(n); n += dir)
+        if (const auto ws = g_pCompositor->getWorkspaceByID(n); ws && ws->getWindows() > 0)
+            return n;
+    return -1;
+}
+// Undo what was made ready on the side the fingers have left.
+static void deskSwipeUnready() {
+    const auto t = g_ds.target.lock();
+    if (g_ds.pushed) {
+        pushUndo(g_ds.other.lock(), g_ds.targetId, g_ds.further.lock());
+        pushOutDrop();
+    } else if (t) {
+        t->m_renderOffset->setValueAndWarp(Vector2D{});
+        t->m_forceRendering = false;
+        t->m_alpha->setValueAndWarp(0.f);
+    }
+    g_ds.target.reset();
+    g_ds.targetId = -1;
+    g_ds.other.reset();
+    g_ds.further.reset();
+    g_ds.pushed = false;
+    g_ds.dir    = 0;
+}
+// Make side `dir` ready: its desk on this screen (brought, or pushed over).
+static void deskSwipeReady(int dir) {
+    deskSwipeUnready();
+    g_ds.dir         = dir;
+    const auto m     = g_ds.mon.lock();
+    const auto begin = g_ds.begin.lock();
+    if (!m || !begin)
+        return;
+    const int64_t id = deskSwipeTarget(begin, dir);
+    if (id < 1)
+        return;
+    const auto ws = g_pCompositor->getWorkspaceByID(id);
+    if (!ws) { // an empty desk nobody shows: made when the swipe lands on it
+        g_ds.targetId = id;
+        return;
+    }
+    const auto where = ws->m_monitor.lock();
+    if (where && where != m) {
+        if (where->m_activeWorkspace == ws) {
+            // PUSH: that screen goes one further the same way, or it is a wall.
+            const int64_t base = blockOf(id), fid = id + dir;
+            if (fid <= base || fid > base + N_TILES || shownElsewhere(fid, where, m))
+                return;
+            auto fws = g_pCompositor->getWorkspaceByID(fid);
+            if (!fws)
+                fws = g_pCompositor->createNewWorkspace(fid, where->m_id);
+            if (!fws)
+                return;
+            const bool empty = ws->getWindows() == 0; // (it goes the moment its screen leaves it)
+            auto       pic   = empty ? nullptr : deskPicture(where, ws);
+            deskToScreen(fws, where);
+            where->changeWorkspace(fws, false, true, true);
+            const double WO = where->m_size.x + *CConfigValue<Config::INTEGER>("general:gaps_workspaces");
+            fws->m_renderOffset->setValueAndWarp(Vector2D{dir * WO, 0.0});
+            fws->m_alpha->setValueAndWarp(1.f);
+            pushOutDrop();
+            g_pushOut     = SPushOut{where, fws, id, pic, dir, false, false};
+            g_ds.pushed   = true;
+            g_ds.other    = where;
+            g_ds.further  = fws;
+            g_ds.targetId = id;
+            trace("swipe PUSH: %lld from %s, which goes on to %lld", (long long)id, where->m_name.c_str(), (long long)fid);
+            if (empty)
+                return;
+        }
+        deskToScreen(ws, m);
+    }
+    g_ds.targetId = id;
+    g_ds.target   = ws;
+}
+static void deskSwipeBegin() {
+    if (g_ds.live || g_pSessionLockManager->isSessionLocked())
+        return;
+    const auto m = Desktop::focusState()->monitor();
+    if (!m || !m->m_activeWorkspace)
+        return;
+    if (g_pushOut.fb) { // a push still settling: its end now
+        if (g_pushOut.revert)
+            pushUndo(g_pushOut.mon.lock(), g_pushOut.gaveId, g_pushOut.in.lock());
+        pushOutDrop();
+    }
+    g_ds       = {};
+    g_ds.live  = true;
+    g_ds.mon   = m;
+    g_ds.begin = m->m_activeWorkspace;
+    if (m->m_activeWorkspace->m_hasFullscreenWindow)
+        for (auto const& ls : m->m_layerSurfaceLayers[2])
+            *ls->m_alpha = 1.f;
+    trace("desk swipe begin on %s from %d", m->m_name.c_str(), (int)m->activeWorkspaceID());
+}
+// `delta`: the fingers' whole travel so far (Hyprland's units).
+static void deskSwipeUpdate(double delta) {
+    const auto m     = g_ds.mon.lock();
+    const auto begin = g_ds.begin.lock();
+    if (!g_ds.live || !m || !begin)
+        return;
+    static auto PSWIPEDIST             = CConfigValue<Config::INTEGER>("gestures:workspace_swipe_distance");
+    static auto PSWIPEDIRLOCK          = CConfigValue<Config::INTEGER>("gestures:workspace_swipe_direction_lock");
+    static auto PSWIPEDIRLOCKTHRESHOLD = CConfigValue<Config::INTEGER>("gestures:workspace_swipe_direction_lock_threshold");
+    static auto PWORKSPACEGAP          = CConfigValue<Config::INTEGER>("general:gaps_workspaces");
+    const double DIST = std::max<int64_t>(1, *PSWIPEDIST);
+    const double XD   = m->m_size.x + *PWORKSPACEGAP;
+    const double d    = g_ds.delta - delta;
+    g_ds.delta        = std::clamp(delta, -DIST, DIST);
+    g_ds.avgSpeed     = (g_ds.avgSpeed * g_ds.speedPoints + std::abs(d)) / (g_ds.speedPoints + 1);
+    g_ds.speedPoints++;
+    begin->m_forceRendering = true;
+    if (*PSWIPEDIRLOCK) {
+        if (g_ds.initialDir != 0 && g_ds.initialDir != (g_ds.delta < 0 ? -1 : 1))
+            g_ds.delta = 0;
+        else if (g_ds.initialDir == 0 && std::abs(g_ds.delta) > *PSWIPEDIRLOCKTHRESHOLD)
+            g_ds.initialDir = g_ds.delta < 0 ? -1 : 1;
+    }
+    const int dir = g_ds.delta < 0 ? -1 : g_ds.delta > 0 ? 1 : 0;
+    if (dir != g_ds.dir) {
+        if (dir == 0)
+            deskSwipeUnready();
+        else
+            deskSwipeReady(dir);
+    }
+    const auto t = g_ds.target.lock();
+    if (g_ds.targetId < 1) { // nothing that way: the wall
+        g_ds.delta = 0;
+        begin->m_renderOffset->setValueAndWarp(Vector2D{});
+        g_pHyprRenderer->damageMonitor(m);
+        return;
+    }
+    const double off = (-g_ds.delta / DIST) * XD;
+    if (t) { // (an empty desk not made yet: only this one slides away, as Hyprland's swipe has it)
+        t->m_forceRendering = true;
+        t->m_alpha->setValueAndWarp(1.f);
+        t->m_renderOffset->setValueAndWarp(Vector2D{off + dir * XD, 0.0});
+        t->updateWindowDecos();
+    }
+    begin->m_renderOffset->setValueAndWarp(Vector2D{off, 0.0});
+    begin->updateWindowDecos();
+    g_pHyprRenderer->damageMonitor(m);
+    if (g_ds.pushed)
+        if (const auto o = g_ds.other.lock())
+            if (const auto f = g_ds.further.lock()) {
+                const double WO = o->m_size.x + *PWORKSPACEGAP;
+                f->m_renderOffset->setValueAndWarp(Vector2D{(-g_ds.delta / DIST) * WO + dir * WO, 0.0});
+                f->updateWindowDecos();
+                g_pHyprRenderer->damageMonitor(o);
+            }
+}
+static void deskSwipeEnd() {
+    const auto m     = g_ds.mon.lock();
+    const auto begin = g_ds.begin.lock();
+    if (!g_ds.live)
+        return;
+    g_ds.live = false;
+    if (!m || !begin) {
+        deskSwipeUnready();
+        return;
+    }
+    static auto PSWIPEPERC    = CConfigValue<Config::FLOAT>("gestures:workspace_swipe_cancel_ratio");
+    static auto PSWIPEDIST    = CConfigValue<Config::INTEGER>("gestures:workspace_swipe_distance");
+    static auto PSWIPEFORC    = CConfigValue<Config::INTEGER>("gestures:workspace_swipe_min_speed_to_force");
+    static auto PWORKSPACEGAP = CConfigValue<Config::INTEGER>("general:gaps_workspaces");
+    static auto PFOLLOWMOUSE  = CConfigValue<Config::INTEGER>("input:follow_mouse");
+    const double DIST = std::max<int64_t>(1, *PSWIPEDIST);
+    const double XD   = m->m_size.x + *PWORKSPACEGAP;
+    auto         t    = g_ds.target.lock();
+    const int    dir  = g_ds.dir;
+    const auto   o    = g_ds.other.lock();
+    const auto   f    = g_ds.further.lock();
+    const double WO   = o ? o->m_size.x + *PWORKSPACEGAP : 0.0;
+    PHLWORKSPACE switchedTo = begin;
+    const bool   shortOf    = (std::abs(g_ds.delta) < DIST * *PSWIPEPERC && (*PSWIPEFORC == 0 || g_ds.avgSpeed < *PSWIPEFORC)) || std::abs(g_ds.delta) < 2;
+    if (g_ds.targetId < 1 || shortOf) {
+        // back
+        if (g_ds.targetId >= 1 && std::abs(g_ds.delta) >= 2) {
+            if (t)
+                *t->m_renderOffset = Vector2D{dir * XD, 0.0};
+            *begin->m_renderOffset = Vector2D{};
+            if (g_ds.pushed && f) {
+                *f->m_renderOffset = Vector2D{dir * WO, 0.0};
+                g_pushOut.revert   = true; // the desk goes home when the slide is back (see drawPushOut)
+            }
+        } else {
+            begin->m_renderOffset->setValueAndWarp(Vector2D{});
+            deskSwipeUnready();
+        }
+        trace("desk swipe back (delta %.0f)", g_ds.delta);
+    } else {
+        const Vector2D mid = begin->m_renderOffset->value();
+        Vector2D       at  = t ? t->m_renderOffset->value() : Vector2D{mid.x + dir * XD, 0.0};
+        if (!t) { // the empty desk, made now (on its rule's screen: brought here)
+            t = g_pCompositor->createNewWorkspace(g_ds.targetId, m->m_id);
+            if (t)
+                deskToScreen(t, m);
+        }
+        if (!t) {
+            begin->m_renderOffset->setValueAndWarp(Vector2D{});
+            deskSwipeUnready();
+            begin->m_forceRendering = false;
+            return;
+        }
+        m->changeWorkspace(t);
+        t->m_renderOffset->setValue(at);
+        t->m_alpha->setValueAndWarp(1.f);
+        begin->m_renderOffset->setValue(mid);
+        *begin->m_renderOffset = Vector2D{-dir * XD, 0.0};
+        begin->m_alpha->setValueAndWarp(1.f);
+        if (g_ds.pushed && f) {
+            *f->m_renderOffset = Vector2D{};
+            if (o)
+                trace("desk swipe PUSHED %s on to %d", o->m_name.c_str(), (int)f->m_id);
+        }
+        g_pInputManager->unconstrainMouse();
+        switchedTo = t;
+        trace("desk swipe to %d", (int)t->m_id);
+    }
+    g_pHyprRenderer->damageMonitor(m);
+    if (o)
+        g_pHyprRenderer->damageMonitor(o);
+    if (t)
+        t->m_forceRendering = false;
+    begin->m_forceRendering = false;
+    // (hyprland-swipe-end-focus.patch: the desk arrived at has focused its own
+    // window; only the pointer's focus is brought up to date then.)
+    const auto focused = Desktop::focusState()->window();
+    if (*PFOLLOWMOUSE != 1 && focused && focused->m_workspace == switchedTo)
+        g_pInputManager->simulateMouseMovement();
+    else
+        g_pInputManager->refocus();
+    for (auto const& ls : m->m_layerSurfaceLayers[2])
+        *ls->m_alpha = switchedTo->m_hasFullscreenWindow && switchedTo->m_fullscreenMode == FSMODE_FULLSCREEN ? 0.f : 1.f;
+    g_ds.target.reset();
+    g_ds.targetId = -1;
+    g_ds.dir      = 0;
 }
 
 // Jump to workspace `wsId` (1..9) and close the overview by zooming into that
@@ -6905,6 +7347,27 @@ static void onKey(IKeyboard::SKeyEvent e, Event::SCallbackInfo& info) {
 
 static int luaToggle(lua_State*) {
     toggle();
+    return 0;
+}
+
+// `hl.plugin.waveview.own_swipe(bool)` — the desk swipe ours (default) or
+// handed back to Hyprland. `swipe_test("begin" | "update" | "end", travel)` —
+// the desk swipe driven by hand (a test cannot make a touchpad gesture).
+static int luaOwnSwipe(lua_State* L) {
+    g_ownSwipe = lua_toboolean(L, 1);
+    return 0;
+}
+static int luaSwipeTest(lua_State* L) {
+    const char* what = lua_tostring(L, 1);
+    if (!what)
+        return 0;
+    const std::string w = what;
+    if (w == "begin")
+        deskSwipeBegin();
+    else if (w == "update")
+        deskSwipeUpdate(lua_tonumber(L, 2));
+    else if (w == "end")
+        deskSwipeEnd();
     return 0;
 }
 
@@ -8206,6 +8669,8 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     //   hl.bind(mainMod .. " + G", function() hl.plugin.waveview.toggle() end)
     HyprlandAPI::addLuaFunction(handle, "waveview", "toggle", luaToggle);
     HyprlandAPI::addLuaFunction(handle, "waveview", "bring", luaBring);
+    HyprlandAPI::addLuaFunction(handle, "waveview", "own_swipe", luaOwnSwipe);
+    HyprlandAPI::addLuaFunction(handle, "waveview", "swipe_test", luaSwipeTest);
     HyprlandAPI::addLuaFunction(handle, "waveview", "close", luaClose);
     HyprlandAPI::addLuaFunction(handle, "waveview", "stage_ready", luaStageReady);
     HyprlandAPI::addLuaFunction(handle, "waveview", "recapture", luaRecapture);
