@@ -6772,6 +6772,20 @@ static bool bringHere(int64_t id, PHLMONITOR to) {
         to->changeWorkspace(ws, false, true);
     return to->m_activeWorkspace == ws;
 }
+// The record, read back from how things stand (the plugin just loaded: a
+// reload forgets it): a desk on a screen that is not its rule's, while its
+// rule's screen is connected, can only have been put there.
+static void seedDeskPut() {
+    for (const auto& ws : g_pCompositor->getWorkspaces()) {
+        const auto on = ws ? ws->m_monitor.lock() : nullptr;
+        if (!on || ws->m_isSpecialWorkspace || ws->m_id < 1)
+            continue;
+        const auto bound = Config::workspaceRuleMgr()->getBoundMonitorStringForWS(std::to_string(ws->m_id));
+        if (!bound.empty() && bound != screenRuleKey(on) && screenConnected(bound))
+            g_deskPut[ws->m_id] = screenRuleKey(on);
+    }
+    trace("desks put elsewhere, as found: %zu", g_deskPut.size());
+}
 // After a screen connected (Hyprland has sent every desk to its rule's
 // screen): the desks the user had put elsewhere go back where they were put.
 static void restoreDesks() {
@@ -8738,6 +8752,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     g_moveListener   = Event::bus()->m_events.input.mouse.move.listen(onMouseMove);
     g_buttonListener = Event::bus()->m_events.input.mouse.button.listen(onMouseButton);
     g_axisListener   = Event::bus()->m_events.input.mouse.axis.listen(onMouseAxis);
+    seedDeskPut();
     g_monitorAddedListener = Event::bus()->m_events.monitor.added.listen([](PHLMONITOR) {
         learnScreenNames();
         // Hyprland sends every desk to its rule's screen once the connect is
