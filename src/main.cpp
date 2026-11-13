@@ -8752,7 +8752,11 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     g_moveListener   = Event::bus()->m_events.input.mouse.move.listen(onMouseMove);
     g_buttonListener = Event::bus()->m_events.input.mouse.button.listen(onMouseButton);
     g_axisListener   = Event::bus()->m_events.input.mouse.axis.listen(onMouseAxis);
-    seedDeskPut();
+    // (A beat after loading: the load's own config reload is rebuilding the
+    // workspace rules right now, and with none every desk looks at home.)
+    static SP<CEventLoopTimer> seedTimer;
+    seedTimer = makeShared<CEventLoopTimer>(std::chrono::milliseconds(1500), [](SP<CEventLoopTimer>, void*) { seedDeskPut(); }, nullptr);
+    g_pEventLoopManager->addTimer(seedTimer);
     g_monitorAddedListener = Event::bus()->m_events.monitor.added.listen([](PHLMONITOR) {
         learnScreenNames();
         // Hyprland sends every desk to its rule's screen once the connect is
