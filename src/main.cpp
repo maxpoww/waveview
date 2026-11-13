@@ -6694,48 +6694,81 @@ static bool shownElsewhere(int64_t id, PHLMONITOR a, PHLMONITOR b) {
             return true;
     return false;
 }
-// A FLOAT'S PLACE AND SIZE ARE PER SCREEN (Max, 2026-11-13: "I call the desk
-// from the other monitor, the window is in a weird position, on a weird
-// size... position and size should be per monitor"). The screens differ in
-// size and scale, so one rectangle cannot be right on both. Where a float
-// stood on a screen is remembered when its desk leaves that screen (relative
-// to the screen's usable corner) and given back when the desk returns there.
-// On a screen it has never been on, it takes the same SHARE of the screen it
-// had on the one it comes from (a window that filled the laptop fills the TV).
-struct SFloatPlaces {
-    PHLWINDOWREF                          win;
-    std::unordered_map<std::string, CBox> at; // screen key -> box, relative to that screen's usable corner
+// A FLOAT LOOKS THE SAME ON EVERY SCREEN (Max, 2026-11-13: "we want the
+// windows to look the same position and size on different screens"). The
+// screens differ in size and scale, so a float brought to another screen
+// takes the same SHARE of it: the same fraction across, the same fraction
+// down, the same fraction of its width and height (a window that filled the
+// laptop fills the TV; one moved or resized on the TV comes back to the
+// laptop moved and resized the same). A first cut remembered a rectangle per
+// screen instead: a change made on one screen never reached the other, and
+// an old bad spot came back for ever.
+//
+// Only the round trip is remembered, so that there and back is exact (shares
+// round, and a terminal snaps its size to whole cells): a float that comes
+// back untouched gets the very rectangle it left with.
+struct SFloatTrip {
+    PHLWINDOWREF win;
+    std::string  home, away; // screen keys: where it came from, where it was put
+    CBox         atHome;     // its box on `home`, relative to that screen's usable corner
+    CBox         atAway;     // the box it was given on `away`, likewise
 };
-static std::vector<SFloatPlaces> g_floatPlaces;
-static SFloatPlaces&             floatPlaces(const PHLWINDOW& w) {
-    std::erase_if(g_floatPlaces, [](const SFloatPlaces& f) { return f.win.expired(); });
-    for (auto& f : g_floatPlaces)
+static std::vector<SFloatTrip> g_floatTrips;
+static SFloatTrip&             floatTrip(const PHLWINDOW& w) {
+    std::erase_if(g_floatTrips, [](const SFloatTrip& f) { return f.win.expired(); });
+    for (auto& f : g_floatTrips)
         if (f.win.lock() == w)
             return f;
-    g_floatPlaces.push_back({PHLWINDOWREF{w}, {}});
-    return g_floatPlaces.back();
+    g_floatTrips.push_back({PHLWINDOWREF{w}, {}, {}, {}, {}});
+    return g_floatTrips.back();
 }
 static bool movableFloat(const PHLWINDOW& w) {
     return w && w->m_isMapped && w->m_isFloating && !w->isFullscreen() && inLayoutSpace(w);
+}
+static CBox floatRel(const PHLWINDOW& w, const SUsable& u) {
+    const Vector2D pos = w->m_realPosition->goal(), size = w->m_realSize->goal();
+    return CBox{pos.x - u.x, pos.y - u.y, size.x, size.y};
+}
+// The box (global) float `w`, which stood at `rel` on screen `from`, takes on screen `to`.
+static CBox floatOnScreen(const PHLWINDOW& w, const CBox& rel, PHLMONITOR from, PHLMONITOR to) {
+    const SUsable     uf = usableArea(from), u = usableArea(to);
+    const std::string keyFrom = screenRuleKey(from), keyTo = screenRuleKey(to);
+    auto&             trip = floatTrip(w);
+    // (untouched since it was put here: a cell of slack on the size, the client rounds it)
+    const bool back = trip.away == keyFrom && trip.home == keyTo && std::abs(rel.x - trip.atAway.x) <= 2 && std::abs(rel.y - trip.atAway.y) <= 2 &&
+        std::abs(rel.w - trip.atAway.w) <= 32 && std::abs(rel.h - trip.atAway.h) <= 32;
+    CBox b;
+    if (back)
+        b = trip.atHome;
+    else {
+        const double sx = u.w / uf.w, sy = u.h / uf.h;
+        b = CBox{std::round(rel.x * sx), std::round(rel.y * sy), std::round(rel.w * sx), std::round(rel.h * sy)};
+    }
+    // (never larger than the screen, never off it)
+    b.w = std::clamp(b.w, 1.0, u.w);
+    b.h = std::clamp(b.h, 1.0, u.h);
+    b.x = std::clamp(b.x, 0.0, u.w - b.w);
+    b.y = std::clamp(b.y, 0.0, u.h - b.h);
+    trip.home   = keyFrom;
+    trip.atHome = rel;
+    trip.away   = keyTo;
+    trip.atAway = b;
+    return CBox{u.x + b.x, u.y + b.y, b.w, b.h};
 }
 // Desk `ws` to screen `to`, its windows at rest there at once (no spring from
 // the other screen's geometry: the pictures taken next must be the real thing).
 static void deskToScreen(PHLWORKSPACE ws, PHLMONITOR to) {
     if (!ws || !to || ws->m_monitor.lock() == to)
         return;
-    const auto        from    = ws->m_monitor.lock();
-    const SUsable     uf      = from ? usableArea(from) : SUsable{0, 0, 1, 1};
-    const std::string keyFrom = from ? screenRuleKey(from) : std::string{}, keyTo = screenRuleKey(to);
+    const auto from = ws->m_monitor.lock();
     // (before the move: Hyprland shifts the floats by the screens' offset)
     std::vector<std::pair<PHLWINDOW, CBox>> floats;
-    if (from)
+    if (from) {
+        const SUsable uf = usableArea(from);
         for (const auto& w : g_pCompositor->m_windows)
-            if (w && w->m_workspace == ws && movableFloat(w)) {
-                const Vector2D pos = w->m_realPosition->goal(), size = w->m_realSize->goal();
-                const CBox     rel{pos.x - uf.x, pos.y - uf.y, size.x, size.y};
-                floatPlaces(w).at[keyFrom] = rel;
-                floats.emplace_back(w, rel);
-            }
+            if (w && w->m_workspace == ws && movableFloat(w))
+                floats.emplace_back(w, floatRel(w, uf));
+    }
     g_pCompositor->moveWorkspaceToMonitor(ws, to, true);
     // Laid out for its new screen NOW, on show there or not (Hyprland lays a
     // hidden desk out only when it comes up: a desk sliding in under the
@@ -6743,26 +6776,9 @@ static void deskToScreen(PHLWORKSPACE ws, PHLMONITOR to) {
     ws->m_space->recheckWorkArea();
     ws->m_space->recalculate();
     g_layoutManager->recalculateMonitor(to);
-    const SUsable u = usableArea(to);
-    for (const auto& [w, rel] : floats) {
-        if (w->m_workspace != ws || !movableFloat(w))
-            continue;
-        auto&      places = floatPlaces(w).at;
-        const auto known  = places.find(keyTo);
-        CBox       b;
-        if (known != places.end())
-            b = known->second; // where it stood on this screen
-        else {
-            const double sx = u.w / uf.w, sy = u.h / uf.h;
-            b = CBox{std::round(rel.x * sx), std::round(rel.y * sy), std::round(rel.w * sx), std::round(rel.h * sy)};
-        }
-        // (the screen may have changed since: never larger than it, never off it)
-        b.w = std::clamp(b.w, 1.0, u.w);
-        b.h = std::clamp(b.h, 1.0, u.h);
-        b.x = u.x + std::clamp(b.x, 0.0, u.w - b.w);
-        b.y = u.y + std::clamp(b.y, 0.0, u.h - b.h);
-        g_layoutManager->setTargetGeom(b, w->layoutTarget());
-    }
+    for (const auto& [w, rel] : floats)
+        if (w->m_workspace == ws && movableFloat(w))
+            g_layoutManager->setTargetGeom(floatOnScreen(w, rel, from, to), w->layoutTarget());
     for (const auto& w : g_pCompositor->m_windows)
         if (w && w->m_isMapped && w->m_workspace == ws) {
             w->m_realPosition->warp();
@@ -8889,7 +8905,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     g_pEventLoopManager->addTimer(g_dockWatchTimer);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "2.33"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "2.34"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
@@ -8978,7 +8994,7 @@ APICALL EXPORT void PLUGIN_EXIT() {
     g_ds = {};
     pushOutDrop();
     g_dragCarry = {};
-    g_floatPlaces.clear();
+    g_floatTrips.clear();
     if (g_resizeDragSent) {
         g_resizeDragSent = false;
         sendWaverunner("resize-drag-off\n");
