@@ -265,8 +265,11 @@ struct SFit {
     double k = 1.0, ox = 0.0, oy = 0.0;
 };
 static SFit g_emitFit; // set while drawOverview draws a remote page: every box it emits goes through it
-static CBox fitBox(const SFit& f, const CBox& b) {
-    return f.on ? CBox{b.x * f.k + f.ox, b.y * f.k + f.oy, b.w * f.k, b.h * f.k} : b;
+// …and moved by this while a page slides in (see THE SLIDE); zero otherwise.
+static Vector2D g_emitShift;
+static CBox     fitBox(const SFit& f, const CBox& b) {
+    const CBox r = f.on ? CBox{b.x * f.k + f.ox, b.y * f.k + f.oy, b.w * f.k, b.h * f.k} : b;
+    return CBox{r.x + g_emitShift.x, r.y + g_emitShift.y, r.w, r.h};
 }
 static Vector2D fitPoint(const SFit& f, const Vector2D& p) {
     return f.on ? Vector2D{p.x * f.k + f.ox, p.y * f.k + f.oy} : p;
@@ -286,6 +289,21 @@ static SP<Render::IFramebuffer> g_bgFB;
 // overview showed the wallpaper in its full light (Max, 2026-10-18: "the
 // darkness on the BG does not apply on overview").
 static float g_veil = 0.0f;
+
+// THE SLIDE (Max, 2026-11-12: "the animations are not great, i want to see the
+// slidings between screens"). Turning to another screen's page slides: the
+// page going away (photographed as it was last drawn, `g_slideFb`) leaves by
+// one side while the new one, wallpaper and all, comes in from the other, as
+// the screens stand (the TV right of the laptop: its page comes in from the
+// right). The same spring as the vertical flip. The words stay; their
+// underline travels.
+static SP<Render::IFramebuffer> g_slideFb;
+static float                    g_slideProg     = 1.0f; // 0..1 through the slide (1 = none)
+static int                      g_slideDir      = 0;    // +1: the new page lies right (comes in from the right)
+static int64_t                  g_slideFromBase = -1;   // the page it slides away from (its word's underline)
+static bool                     g_snapshotting  = false; // drawing the page going away into `g_slideFb`
+static float                    g_lastDrawP = 1.0f, g_lastDrawPl = 1.0f; // the zoom and blend last drawn
+static bool                     snapshotForSlide(PHLMONITOR d);
 
 // One cropped thumbnail per live window: just that window's pixels, sliced out of
 // its workspace snapshot. Drawn as an individually rounded, shrunk rect floating
@@ -1778,6 +1796,11 @@ static void captureWorkspaces(PHLMONITOR m, uint32_t mask = ALL_TILES) {
 // render pass was cleared at this frame's beginRender, so no queued element
 // still references these textures.
 static void freeCaptures() {
+    if (g_slideFb) {
+        g_slideFb->release();
+        g_slideFb.reset();
+    }
+    g_slideProg = 1.0f;
     for (auto& fb : g_fbs) {
         if (fb)
             fb->release();
@@ -2576,10 +2599,21 @@ static int pageIndex(int64_t base) {
 // per-tile photographs and the vertical page start over. Its workspaces are
 // photographed on the screen they are on (`g_layMon`). `force`: again, though
 // it is the page shown (its screen changed under it).
-static void showPage(int64_t base, bool force = false) {
+static void showPage(int64_t base, bool force = false, bool slide = false) {
     const auto d = g_captureMon.lock();
     if (!d || (base == g_base && !force))
         return;
+    // Slid only when asked (a turn), with the map at rest, between two pages
+    // that both stand somewhere; anything else (a close going home, a page
+    // emptied from elsewhere, a screen gone) keeps the quick fade.
+    const int from = pageIndex(g_base), to = pageIndex(base);
+    g_slideProg    = 1.0f; // a slide still running ends here (a new one may start)
+    const bool slid = slide && from >= 0 && to >= 0 && from != to && g_anim >= 0.999f && g_animTarget >= 0.5f && snapshotForSlide(d);
+    if (slid) {
+        g_slideDir      = to > from ? 1 : -1;
+        g_slideFromBase = g_base;
+        g_slideProg     = 0.0f;
+    }
     const int  at  = pageIndex(base);
     PHLMONITOR lay = at >= 0 ? g_pages[at].lay.lock() : nullptr;
     if (!lay)
@@ -2595,7 +2629,7 @@ static void showPage(int64_t base, bool force = false) {
     g_scrollProg = 1.0f;
     const int t  = tileFor(lay->activeWorkspaceID());
     g_zoomTile   = t >= 0 ? t : 0;
-    g_pageShownAt = Time::steadyNow();
+    g_pageShownAt = slid ? Time::steady_tp{} : Time::steadyNow(); // a slide is its own entrance
     captureWorkspaces(lay, ALL_TILES);
     damageAll();
 }
@@ -2711,6 +2745,7 @@ static void drawPageWords(PHLMONITOR m, float p) {
     renderRect(CBox{(mw - total) / 2.0 - padX * 1.5, baseY - th / 2.0 - padY, total + padX * 3.0, th + padY * 2.0},
                CHyprColor(0.0, 0.0, 0.0, 0.30 * a), (int)std::lround(th / 2.0 + padY));
     double x = (mw - total) / 2.0;
+    CBox   onBox, fromBox;
     for (const auto& w : ws) {
         const CBox box{x, baseY - w.tex->m_size.y / 2.0, w.tex->m_size.x, w.tex->m_size.y};
         CTexPassElement::SRenderData td;
@@ -2719,9 +2754,20 @@ static void drawPageWords(PHLMONITOR m, float p) {
         td.a   = a;
         g_pHyprRenderer->m_renderPass.add(makeUnique<CTexPassElement>(td));
         if (w.on)
-            renderRect(CBox{box.x, box.y + box.h + 2.0 * sc, box.w, std::max(1.0, std::round(1.5 * sc))}, CHyprColor(0.94, 0.93, 0.97, 0.9 * a));
+            onBox = box;
+        if (w.base == g_slideFromBase)
+            fromBox = box;
         g_pageWords.push_back({CBox{box.x - gap / 2.0, box.y - padY, box.w + gap, box.h + padY * 2.0}, w.base});
         x += w.tex->m_size.x + gap;
+    }
+    // The underline: under the page shown, travelling there with the slide.
+    if (onBox.w > 0.0) {
+        CBox u = onBox;
+        if (g_slideProg < 1.0f && fromBox.w > 0.0) {
+            const double e = springToward1(g_slideProg);
+            u              = CBox{mix(fromBox.x, onBox.x, e), onBox.y, mix(fromBox.w, onBox.w, e), onBox.h};
+        }
+        renderRect(CBox{u.x, u.y + u.h + 2.0 * sc, u.w, std::max(1.0, std::round(1.5 * sc))}, CHyprColor(0.94, 0.93, 0.97, 0.9 * a));
     }
 }
 
@@ -2734,7 +2780,7 @@ static void drawBackdrop(PHLMONITOR m, float a) {
         return;
     CTexPassElement::SRenderData td;
     td.tex = bg;
-    td.box = CBox{0.0, 0.0, m->m_transformedSize.x, m->m_transformedSize.y};
+    td.box = CBox{g_emitShift.x, g_emitShift.y, m->m_transformedSize.x, m->m_transformedSize.y};
     td.a   = a;
     const double ta = bg->m_size.x / bg->m_size.y, ba = td.box.w / std::max(1.0, td.box.h);
     if (std::abs(ta - ba) <= 0.01 * ta) {
@@ -2817,8 +2863,29 @@ static void drawOverview(PHLMONITOR rm, float p, float pl, int zoomTile) {
         return;
     const SFit fit = pageFit();
     struct SFitOff {
-        ~SFitOff() { g_emitFit = {}; }
+        ~SFitOff() {
+            g_emitFit   = {};
+            g_emitShift = {};
+        }
     } fitOff;
+    if (!g_snapshotting) {
+        g_lastDrawP  = p;
+        g_lastDrawPl = pl;
+    }
+    // THE SLIDE: the page going away leaves by one side, this one (everything
+    // it draws, through `g_emitShift`) comes in from the other.
+    const bool   sliding = !g_snapshotting && g_slideProg < 1.0f && g_slideDir != 0 && g_slideFb && g_slideFb->isAllocated();
+    const double slideW  = rm->m_transformedSize.x;
+    const double slideE  = sliding ? (double)springToward1(g_slideProg) : 1.0;
+    if (sliding) {
+        CTexPassElement::SRenderData od;
+        od.tex = g_slideFb->getTexture();
+        od.box = CBox{-g_slideDir * slideE * slideW, 0.0, slideW, rm->m_transformedSize.y};
+        od.a   = 1.0f;
+        if (od.tex)
+            g_pHyprRenderer->m_renderPass.add(makeUnique<CTexPassElement>(od));
+        g_emitShift = Vector2D{g_slideDir * (1.0 - slideE) * slideW, 0.0};
+    }
 
     // Zoom transform: scale about zoomTile's top-left so at p=0 that tile becomes
     // the full monitor; mix an arbitrary rest-rect toward its zoomed rect by p.
@@ -2844,12 +2911,17 @@ static void drawOverview(PHLMONITOR rm, float p, float pl, int zoomTile) {
     // zoom (p→0 = a workspace filling the whole monitor, bar strip included).
     // Another screen's page also keeps inside its own fitted screen, so its
     // second vertical page never shows under the first.
+    const Vector2D slideShift = g_emitShift;
+    g_emitShift               = {}; // the clip is worked out at rest, then moved with the page
     const double clipTop = topInset(rm) * p;
     CBox         stripClip{0.0, clipTop, rm->m_transformedSize.x, rm->m_transformedSize.y - clipTop};
     if (fit.on) {
         const double lTop = topInset(m) * p;
         stripClip         = stripClip.intersection(fitBox(fit, CBox{0.0, lTop, m->m_transformedSize.x, m->m_transformedSize.y - lTop}));
     }
+    const CBox restClip = stripClip; // (the ghost's: it keeps to the hand, not to the sliding page)
+    stripClip.x += slideShift.x;
+    g_emitShift = slideShift;
     g_emitFit = fit;
     // `uvTL/uvBR`: the content's sub-rect within the texture (a card's, or the
     // whole thing) — see CapWin::uv.
@@ -3268,8 +3340,14 @@ static void drawOverview(PHLMONITOR rm, float p, float pl, int zoomTile) {
         drawTex(tex, box, wround, fadeIn, cw.uvTL, cw.uvBR);
     }
 
-    // The dragged window rides on top, following the cursor.
-    if (dragW) {
+    // The dragged window rides on top, following the cursor. (Not on a page
+    // photographed to slide away: the hand keeps it, it does not leave.)
+    // The pointer is not on a sliding page: the ghost keeps to the hand.
+    const Vector2D heldShift = g_emitShift;
+    const CBox     heldClip  = stripClip;
+    g_emitShift              = {};
+    stripClip                = restClip;
+    if (dragW && !g_snapshotting) {
         bool ghosted = false;
         for (auto& cw : g_wins) {
             if (cw.win.lock() != dragW)
@@ -3299,6 +3377,8 @@ static void drawOverview(PHLMONITOR rm, float p, float pl, int zoomTile) {
                 drawTex(tex, b, round, 1.0f, g_dragCarry.uvTL, g_dragCarry.uvBR);
             }
     }
+    g_emitShift = heldShift;
+    stripClip   = heldClip;
 
     // ── THE STAGE'S DIM, PAINTED OVER THE MAP ────────────────────────────────
     //
@@ -3351,9 +3431,41 @@ static void drawOverview(PHLMONITOR rm, float p, float pl, int zoomTile) {
              std::max(0.0, std::min(mh, y1) - std::max(0.0, y0)));  // right
     }
 
-    g_emitFit = {}; // the page words and the fade are this screen's own
+    g_emitFit   = {}; // the page words and the fade are this screen's own
+    g_emitShift = {};
+    if (g_snapshotting)
+        return; // the page alone: the words stay on screen while it slides away
     drawPageFade(rm);
     drawPageWords(rm, p);
+}
+
+// Photograph the page shown, as it was last drawn (without the words or a
+// carried window), for it to slide away (see THE SLIDE). Outside a render pass.
+static bool snapshotForSlide(PHLMONITOR d) {
+    if (!d || !g_bgFB || g_capturing)
+        return false;
+    const CBox monbox{0.0, 0.0, d->m_pixelSize.x, d->m_pixelSize.y};
+    if (!g_slideFb)
+        g_slideFb = g_pHyprRenderer->createFB("waveview-slide");
+    if (g_slideFb->m_size != monbox.size()) {
+        g_slideFb->release();
+        g_slideFb->alloc(monbox.w, monbox.h, DRM_FORMAT_ABGR8888);
+    }
+    if (!g_slideFb->isAllocated())
+        return false;
+    Render::GL::g_pHyprOpenGL->makeEGLCurrent();
+    g_capturing   = true; // our render hook must not paint the map into it a second time
+    g_snapshotting = true;
+    CRegion fakeDamage{0, 0, INT16_MAX, INT16_MAX};
+    g_pHyprRenderer->beginRender(d, fakeDamage, Render::RENDER_MODE_FULL_FAKE, nullptr, g_slideFb);
+    glClearColor(0.0F, 0.0F, 0.0F, 1.0F);
+    glClear(GL_COLOR_BUFFER_BIT);
+    drawOverview(d, g_lastDrawP, g_lastDrawPl, g_zoomTile);
+    g_pHyprRenderer->m_renderData.blockScreenShader = true;
+    g_pHyprRenderer->endRender();
+    g_snapshotting = false;
+    g_capturing    = false;
+    return true;
 }
 
 // While the overview is open, re-capture thumbnails on a timer so they stay live.
@@ -3398,7 +3510,7 @@ static void onLiveTimer(SP<CEventLoopTimer> self, void*) {
     // overview never captures at all — the tiles are about to be freed, and
     // a capture firing in the tick between touchdown and disengage blocked
     // the loop at the exact frame of the hand-off (the blink race).
-    if (g_scrollProg < 1.0f || g_anim != g_animTarget || g_animTarget < 0.5f || g_openBlend < 1.0f || !g_minFlies.empty()) {
+    if (g_scrollProg < 1.0f || g_slideProg < 1.0f || g_anim != g_animTarget || g_animTarget < 0.5f || g_openBlend < 1.0f || !g_minFlies.empty()) {
         self->updateTimeout(std::chrono::milliseconds(50));
         return;
     }
@@ -4527,7 +4639,7 @@ static void turnPage(int64_t base, int half) {
             carryDragged(dw);
     }
     if (sideways) {
-        showPage(base);
+        showPage(base, false, true);
         if (half != g_page) { // straight onto that half: the page's fade is the entrance
             const auto m = ovLay();
             g_page       = half;
@@ -4595,7 +4707,7 @@ static bool tickEdgeHold() {
         g_edgeHoldSince = now;
         return false;
     }
-    if (e == EDGE_NONE || now - g_edgeHoldSince < EDGE_HOLD || g_scrollProg < 1.0f)
+    if (e == EDGE_NONE || now - g_edgeHoldSince < EDGE_HOLD || g_scrollProg < 1.0f || g_slideProg < 1.0f)
         return false;
     g_edgeHoldSince = now; // held on: the next turn after another full hold
     const int to    = edgeLeadsTo(e);
@@ -5453,6 +5565,12 @@ static void onRender(eRenderStage stage) {
     } else if (g_scroll != g_scrollTarget) {
         g_scroll = g_scrollTarget;
         g_pHyprRenderer->damageMonitor(m);
+    }
+    // The slide between screens' pages: the same glide.
+    if (g_slideProg < 1.0f) {
+        g_slideProg = std::min(1.0f, g_slideProg + dt / MOTION_SECONDS);
+        g_pHyprRenderer->damageMonitor(m);
+        g_pCompositor->scheduleFrameForMonitor(m);
     }
 
     // Fully closed: LINGER two frames, then disengage. The overlay at rest
@@ -7877,7 +7995,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     g_pEventLoopManager->addTimer(g_dockWatchTimer);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "2.28"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "2.29"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
