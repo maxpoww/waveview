@@ -295,10 +295,14 @@ static float g_veil = 0.0f;
 // page going away (photographed as it was last drawn, `g_slideFb`) leaves by
 // one side while the new one, wallpaper and all, comes in from the other, as
 // the screens stand (the TV right of the laptop: its page comes in from the
-// right). The same spring as the vertical flip. The words stay; their
-// underline travels.
+// right). Max, the same day: *"make the slidings look as the overview call,
+// same speed, aceleration the only diference on the animation is the
+// direction"* — so the slide AND the vertical flip ride the opening's own
+// clock and curve (`OPEN_SECONDS`, `springOpen`: they follow its dial), with
+// the opening's 60 Hz smear. The words stay; their underline travels.
 static SP<Render::IFramebuffer> g_slideFb;
 static float                    g_slideProg     = 1.0f; // 0..1 through the slide (1 = none)
+static double                   g_slidePrevE    = 0.0;  // its eased position on the last frame (the 60 Hz smear)
 static int                      g_slideDir      = 0;    // +1: the new page lies right (comes in from the right)
 static int64_t                  g_slideFromBase = -1;   // the page it slides away from (its word's underline)
 static bool                     g_snapshotting  = false; // drawing the page going away into `g_slideFb`
@@ -957,7 +961,7 @@ static float invSpringCurve(float p, const SSpringTable& t = g_springTable) {
 // A progress running TOWARD 1 (an opening) and one running TOWARD 0 (a
 // closing) each ride the curve forward in their own direction of travel —
 // never the curve backwards (that is an ease-in: all motion at the end).
-static float springToward1(float a) {
+[[maybe_unused]] static float springToward1(float a) { // (the slides moved to the opening's curve; kept as the pair of springToward0)
     return springCurve(a);
 }
 static float springToward0(float a) {
@@ -2613,6 +2617,7 @@ static void showPage(int64_t base, bool force = false, bool slide = false) {
         g_slideDir      = to > from ? 1 : -1;
         g_slideFromBase = g_base;
         g_slideProg     = 0.0f;
+        g_slidePrevE    = 0.0;
     }
     const int  at  = pageIndex(base);
     PHLMONITOR lay = at >= 0 ? g_pages[at].lay.lock() : nullptr;
@@ -2764,7 +2769,7 @@ static void drawPageWords(PHLMONITOR m, float p) {
     if (onBox.w > 0.0) {
         CBox u = onBox;
         if (g_slideProg < 1.0f && fromBox.w > 0.0) {
-            const double e = springToward1(g_slideProg);
+            const double e = springOpen(g_slideProg);
             u              = CBox{mix(fromBox.x, onBox.x, e), onBox.y, mix(fromBox.w, onBox.w, e), onBox.h};
         }
         renderRect(CBox{u.x, u.y + u.h + 2.0 * sc, u.w, std::max(1.0, std::round(1.5 * sc))}, CHyprColor(0.94, 0.93, 0.97, 0.9 * a));
@@ -2876,15 +2881,34 @@ static void drawOverview(PHLMONITOR rm, float p, float pl, int zoomTile) {
     // it draws, through `g_emitShift`) comes in from the other.
     const bool   sliding = !g_snapshotting && g_slideProg < 1.0f && g_slideDir != 0 && g_slideFb && g_slideFb->isAllocated();
     const double slideW  = rm->m_transformedSize.x;
-    const double slideE  = sliding ? (double)springToward1(g_slideProg) : 1.0;
+    const double slideE  = sliding ? (double)springOpen(g_slideProg) : 1.0;
+    const double slideH  = rm->m_transformedSize.y;
+    // Where this page stood on the last frame, relative to where it stands
+    // now — the 60 Hz smear of everything it draws spans that (see
+    // `drawMotionGhosts`; at 100 Hz and up nothing is smeared).
+    const double shiftNow = sliding ? g_slideDir * (1.0 - slideE) * slideW : 0.0;
+    const double shiftWas = sliding ? g_slideDir * (1.0 - g_slidePrevE) * slideW : 0.0;
     if (sliding) {
-        CTexPassElement::SRenderData od;
-        od.tex = g_slideFb->getTexture();
-        od.box = CBox{-g_slideDir * slideE * slideW, 0.0, slideW, rm->m_transformedSize.y};
-        od.a   = 1.0f;
-        if (od.tex)
+        const auto oldTex  = g_slideFb->getTexture();
+        auto       drawOld = [&](const CBox& b, float a) {
+            CTexPassElement::SRenderData od;
+            od.tex = oldTex;
+            od.box = b;
+            od.a   = a;
             g_pHyprRenderer->m_renderPass.add(makeUnique<CTexPassElement>(od));
-        g_emitShift = Vector2D{g_slideDir * (1.0 - slideE) * slideW, 0.0};
+        };
+        if (oldTex) {
+            const CBox oldNow{-g_slideDir * slideE * slideW, 0.0, slideW, slideH};
+            drawMotionGhosts(rm, CBox{-g_slideDir * g_slidePrevE * slideW, 0.0, slideW, slideH}, oldNow, 1.0f, drawOld);
+            drawOld(oldNow, 1.0f);
+        }
+        // The page's wallpaper smears with it (drawn below, at `g_emitShift`).
+        drawMotionGhosts(rm, CBox{shiftWas, 0.0, slideW, slideH}, CBox{shiftNow, 0.0, slideW, slideH}, 1.0f, [&](const CBox& b, float a) {
+            g_emitShift = Vector2D{b.x, 0.0};
+            drawBackdrop(rm, a);
+        });
+        g_emitShift   = Vector2D{shiftNow, 0.0};
+        g_slidePrevE  = slideE;
     }
 
     // Zoom transform: scale about zoomTile's top-left so at p=0 that tile becomes
@@ -3335,7 +3359,10 @@ static void drawOverview(PHLMONITOR rm, float p, float pl, int zoomTile) {
             const double k   = swb.w > 0.0 ? box.w / swb.w : 0.0;
             wround = (int)std::lround(mix(w->rounding() * k, DSN_WIN_ROUND * m->m_scale, p));
         }
-        drawMotionGhosts(rm, cw.blurPrev, box, fadeIn, [&](const CBox& b, float a) { drawTex(tex, b, wround, a, cw.uvTL, cw.uvBR); });
+        CBox was = cw.blurPrev; // last frame's box, seen from where the sliding page stands now
+        if (was.w > 0.0)
+            was.x += (shiftWas - shiftNow) / (fit.on ? fit.k : 1.0);
+        drawMotionGhosts(rm, was, box, fadeIn, [&](const CBox& b, float a) { drawTex(tex, b, wround, a, cw.uvTL, cw.uvBR); });
         cw.blurPrev = box;
         drawTex(tex, box, wround, fadeIn, cw.uvTL, cw.uvBR);
     }
@@ -5555,8 +5582,8 @@ static void onRender(eRenderStage stage) {
     // max-velocity kick on frame one. While it moves, hover retargets under
     // the stationary cursor and frames keep coming.
     if (g_scrollProg < 1.0f) {
-        g_scrollProg = std::min(1.0f, g_scrollProg + dt / MOTION_SECONDS);
-        g_scroll     = mix(g_scrollFrom, g_scrollTarget, springToward1(g_scrollProg));
+        g_scrollProg = std::min(1.0f, g_scrollProg + dt / OPEN_SECONDS); // the opening's own clock and curve (Max: the slides
+        g_scroll     = mix(g_scrollFrom, g_scrollTarget, springOpen(g_scrollProg)); // move as the overview opens; only the direction differs)
         if (m == g_captureMon.lock())
             if (const auto lm = ovLay())
                 updateHoverAt(lm, cursorDrawSpace(lm));
@@ -5568,7 +5595,7 @@ static void onRender(eRenderStage stage) {
     }
     // The slide between screens' pages: the same glide.
     if (g_slideProg < 1.0f) {
-        g_slideProg = std::min(1.0f, g_slideProg + dt / MOTION_SECONDS);
+        g_slideProg = std::min(1.0f, g_slideProg + dt / OPEN_SECONDS); // as the vertical flip: the opening's clock
         g_pHyprRenderer->damageMonitor(m);
         g_pCompositor->scheduleFrameForMonitor(m);
     }
@@ -7995,7 +8022,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     g_pEventLoopManager->addTimer(g_dockWatchTimer);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "2.29"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "2.30"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
