@@ -6944,8 +6944,11 @@ static void restoreDesks() {
 //     really moves here at once (its windows take this screen's size while
 //     still off its edge); the other screen slides a PICTURE of it out
 //     (`g_pushOut`), in step with the real desk coming in beside it.
-//     Slid back or let go short, everything returns. At the page's last
-//     desk nothing moves: a wall.
+//     Slid back or let go short, everything returns. When that screen has
+//     no desk further on (the page ends there), the two screens TRADE desks,
+//     the same double slide (Max, 2026-11-13: "i want double swipe to both
+//     sides"): this screen's desk really goes there at once, and a picture
+//     of it slides out here.
 // `hl.plugin.waveview.own_swipe(false)` hands the swipe back to Hyprland.
 bool g_ownSwipe = true;
 struct SDeskSwipe {
@@ -6959,6 +6962,8 @@ struct SDeskSwipe {
     int64_t         targetId = -1; // the desk on that side (-1: none, the wall)…
     PHLWORKSPACEREF target;        // …on `mon` now, if there is such a desk yet (an empty one is only
                                    // made when the swipe lands on it: Hyprland drops empty hidden desks)
+    int64_t         beginId = -1;
+    bool            swap = false;   // a push where the other screen takes `begin` (the page ends past it)
     bool            pushed = false; // it was taken from a screen showing it…
     PHLMONITORREF   other;          // …that one
     PHLWORKSPACEREF further;        // …which shows this meanwhile
@@ -6977,11 +6982,14 @@ struct SPushOut {
     bool                     finishing = false;
 };
 static SPushOut g_pushOut;
+static SPushOut g_pushOut2; // a trade's other half: this screen's own desk, sliding out as a picture
 
 static void pushOutDrop() {
-    if (g_pushOut.fb)
-        g_pushOut.fb->release();
-    g_pushOut = {};
+    for (auto* po : {&g_pushOut, &g_pushOut2}) {
+        if (po->fb)
+            po->fb->release();
+        *po = {};
+    }
 }
 // The desk `ws` (on show on `o`) as a picture: its windows alone, no wallpaper.
 static SP<Render::IFramebuffer> deskPicture(PHLMONITOR o, PHLWORKSPACE ws) {
@@ -7029,37 +7037,46 @@ static void pushUndo(PHLMONITOR o, int64_t gaveId, PHLWORKSPACE in) {
     }
     g_pHyprRenderer->damageMonitor(o);
 }
+// A push's end: one let go short gives its desks back; the pictures go.
+static void pushSettle() {
+    if (g_pushOut.revert) {
+        pushUndo(g_pushOut.mon.lock(), g_pushOut.gaveId, g_pushOut.in.lock());
+        if (g_pushOut2.gaveId >= 1)
+            pushUndo(g_pushOut2.mon.lock(), g_pushOut2.gaveId, g_pushOut2.in.lock());
+    }
+    pushOutDrop();
+}
 // Drawn on the pushed screen, every frame while its incoming desk slides.
 static void drawPushOut(PHLMONITOR fm) {
-    if (g_pushOut.gaveId < 1 || g_pushOut.mon.lock() != fm)
-        return;
-    const auto in = g_pushOut.in.lock();
-    if (!in) {
-        pushOutDrop();
-        return;
-    }
-    const double W  = fm->m_size.x + *CConfigValue<Config::INTEGER>("general:gaps_workspaces");
-    const double ox = in->m_renderOffset->value().x - g_pushOut.dir * W; // beside the desk coming in
-    if (const auto tex = g_pushOut.fb ? g_pushOut.fb->getTexture() : nullptr) { // (an empty desk has no picture)
-        CTexPassElement::SRenderData td;
-        td.tex = tex;
-        td.box = CBox{ox * fm->m_scale, 0.0, fm->m_transformedSize.x, fm->m_transformedSize.y};
-        td.a   = 1.0f;
-        g_pHyprRenderer->m_renderPass.add(makeUnique<CTexPassElement>(td));
-    }
-    // The slide over (fingers gone, the desk at rest): the picture goes — and a
-    // push let go short gives the desk back. Outside the render pass.
-    if (!g_ds.live && !in->m_renderOffset->isBeingAnimated() && !g_pushOut.finishing) {
-        g_pushOut.finishing = true;
-        g_pEventLoopManager->doLater([] {
-            if (g_pushOut.revert)
-                pushUndo(g_pushOut.mon.lock(), g_pushOut.gaveId, g_pushOut.in.lock());
+    for (auto* po : {&g_pushOut, &g_pushOut2}) {
+        if (po->gaveId < 1 || po->mon.lock() != fm)
+            continue;
+        const auto in = po->in.lock();
+        if (!in) {
             pushOutDrop();
-            damageAll();
-        });
-    } else if (!g_pushOut.finishing) {
-        g_pHyprRenderer->damageMonitor(fm);
-        g_pCompositor->scheduleFrameForMonitor(fm);
+            return;
+        }
+        const double W  = fm->m_size.x + *CConfigValue<Config::INTEGER>("general:gaps_workspaces");
+        const double ox = in->m_renderOffset->value().x - po->dir * W; // beside the desk coming in
+        if (const auto tex = po->fb ? po->fb->getTexture() : nullptr) { // (an empty desk has no picture)
+            CTexPassElement::SRenderData td;
+            td.tex = tex;
+            td.box = CBox{ox * fm->m_scale, 0.0, fm->m_transformedSize.x, fm->m_transformedSize.y};
+            td.a   = 1.0f;
+            g_pHyprRenderer->m_renderPass.add(makeUnique<CTexPassElement>(td));
+        }
+        // The slide over (fingers gone, the desk at rest): the pictures go — and a
+        // push let go short gives the desks back. Outside the render pass.
+        if (!g_ds.live && !in->m_renderOffset->isBeingAnimated() && !g_pushOut.finishing) {
+            g_pushOut.finishing = true;
+            g_pEventLoopManager->doLater([] {
+                pushSettle();
+                damageAll();
+            });
+        } else if (!g_pushOut.finishing) {
+            g_pHyprRenderer->damageMonitor(fm);
+            g_pCompositor->scheduleFrameForMonitor(fm);
+        }
     }
 }
 
@@ -7079,6 +7096,11 @@ static void deskSwipeUnready() {
     const auto t = g_ds.target.lock();
     if (g_ds.pushed) {
         pushUndo(g_ds.other.lock(), g_ds.targetId, g_ds.further.lock());
+        if (g_ds.swap) { // …and this screen's own desk comes home
+            pushUndo(g_ds.mon.lock(), g_ds.beginId, t);
+            g_ds.begin = g_pCompositor->getWorkspaceByID(g_ds.beginId);
+            g_ds.swap  = false;
+        }
         pushOutDrop();
     } else if (t) {
         t->m_renderOffset->setValueAndWarp(Vector2D{});
@@ -7113,8 +7135,52 @@ static void deskSwipeReady(int dir) {
         if (where->m_activeWorkspace == ws) {
             // PUSH: that screen goes one further the same way, or it is a wall.
             const int64_t base = blockOf(id), fid = id + dir;
-            if (fid <= base || fid > base + N_TILES || shownElsewhere(fid, where, m))
+            if (fid <= base || fid > base + N_TILES || shownElsewhere(fid, where, m)) {
+                // No desk further on for that screen: the two TRADE. Both
+                // desks really change screens now; each screen slides a
+                // picture of the one it gave out beside the one coming in.
+                const int64_t bid  = begin->m_id;
+                auto          picG = ws->getWindows() > 0 ? deskPicture(where, ws) : nullptr;
+                auto          picB = begin->getWindows() > 0 ? deskPicture(m, begin) : nullptr;
+                auto          put  = [](int64_t n, PHLMONITOR on) { // (an empty desk goes the moment its screen leaves it: made again)
+                    auto d = g_pCompositor->getWorkspaceByID(n);
+                    if (!d)
+                        d = g_pCompositor->createNewWorkspace(n, on->m_id);
+                    if (d) {
+                        deskToScreen(d, on);
+                        if (on->m_activeWorkspace != d)
+                            on->changeWorkspace(d, false, true, true);
+                    }
+                    return d;
+                };
+                deskToScreen(ws, m); // (on show there: Hyprland puts another of that screen's up meanwhile)
+                const auto t = put(id, m);
+                const auto b = put(bid, where);
+                if (!t || !b || m->m_activeWorkspace != t || where->m_activeWorkspace != b) {
+                    trace("swipe TRADE failed (%lld <-> %lld)", (long long)id, (long long)bid);
+                    put(id, where);
+                    g_ds.begin = put(bid, m);
+                    return;
+                }
+                const double XM = m->m_size.x + *CConfigValue<Config::INTEGER>("general:gaps_workspaces");
+                const double XO = where->m_size.x + *CConfigValue<Config::INTEGER>("general:gaps_workspaces");
+                t->m_renderOffset->setValueAndWarp(Vector2D{dir * XM, 0.0});
+                t->m_alpha->setValueAndWarp(1.f);
+                b->m_renderOffset->setValueAndWarp(Vector2D{dir * XO, 0.0});
+                b->m_alpha->setValueAndWarp(1.f);
+                pushOutDrop();
+                g_pushOut     = SPushOut{where, b, id, picG, dir, false, false};
+                g_pushOut2    = SPushOut{m, t, bid, picB, dir, false, false};
+                g_ds.begin    = b;
+                g_ds.swap     = true;
+                g_ds.pushed   = true;
+                g_ds.other    = where;
+                g_ds.further  = b;
+                g_ds.targetId = id;
+                g_ds.target   = t;
+                trace("swipe TRADE: %lld from %s, which takes %lld", (long long)id, where->m_name.c_str(), (long long)bid);
                 return;
+            }
             auto fws = g_pCompositor->getWorkspaceByID(fid);
             if (!fws)
                 fws = g_pCompositor->createNewWorkspace(fid, where->m_id);
@@ -7148,15 +7214,13 @@ static void deskSwipeBegin() {
     const auto m = Desktop::focusState()->monitor();
     if (!m || !m->m_activeWorkspace)
         return;
-    if (g_pushOut.fb) { // a push still settling: its end now
-        if (g_pushOut.revert)
-            pushUndo(g_pushOut.mon.lock(), g_pushOut.gaveId, g_pushOut.in.lock());
-        pushOutDrop();
-    }
-    g_ds       = {};
-    g_ds.live  = true;
-    g_ds.mon   = m;
-    g_ds.begin = m->m_activeWorkspace;
+    if (g_pushOut.gaveId >= 1) // a push still settling: its end now
+        pushSettle();
+    g_ds         = {};
+    g_ds.live    = true;
+    g_ds.mon     = m;
+    g_ds.begin   = m->m_activeWorkspace;
+    g_ds.beginId = m->m_activeWorkspace->m_id;
     if (m->m_activeWorkspace->m_hasFullscreenWindow)
         for (auto const& ls : m->m_layerSurfaceLayers[2])
             *ls->m_alpha = 1.f;
@@ -7206,8 +7270,10 @@ static void deskSwipeUpdate(double delta) {
         t->m_renderOffset->setValueAndWarp(Vector2D{off + dir * XD, 0.0});
         t->updateWindowDecos();
     }
-    begin->m_renderOffset->setValueAndWarp(Vector2D{off, 0.0});
-    begin->updateWindowDecos();
+    if (!g_ds.swap) { // (traded away, it is the other screen's incoming desk: below)
+        begin->m_renderOffset->setValueAndWarp(Vector2D{off, 0.0});
+        begin->updateWindowDecos();
+    }
     g_pHyprRenderer->damageMonitor(m);
     if (g_ds.pushed)
         if (const auto o = g_ds.other.lock())
@@ -7247,7 +7313,8 @@ static void deskSwipeEnd() {
         if (g_ds.targetId >= 1 && std::abs(g_ds.delta) >= 2) {
             if (t)
                 *t->m_renderOffset = Vector2D{dir * XD, 0.0};
-            *begin->m_renderOffset = Vector2D{};
+            if (!g_ds.swap)
+                *begin->m_renderOffset = Vector2D{};
             if (g_ds.pushed && f) {
                 *f->m_renderOffset = Vector2D{dir * WO, 0.0};
                 g_pushOut.revert   = true; // the desk goes home when the slide is back (see drawPushOut)
@@ -7271,12 +7338,18 @@ static void deskSwipeEnd() {
             begin->m_forceRendering = false;
             return;
         }
-        m->changeWorkspace(t);
-        t->m_renderOffset->setValue(at);
-        t->m_alpha->setValueAndWarp(1.f);
-        begin->m_renderOffset->setValue(mid);
-        *begin->m_renderOffset = Vector2D{-dir * XD, 0.0};
-        begin->m_alpha->setValueAndWarp(1.f);
+        if (g_ds.swap) { // (on show here since the trade was made ready: only the slide and the focus are left)
+            *t->m_renderOffset = Vector2D{};
+            if (const auto last = t->getLastFocusedWindow(); last && last->m_isMapped && last->m_workspace == t)
+                Desktop::focusState()->fullWindowFocus(last, Desktop::FOCUS_REASON_DESKTOP_STATE_CHANGE);
+        } else {
+            m->changeWorkspace(t);
+            t->m_renderOffset->setValue(at);
+            t->m_alpha->setValueAndWarp(1.f);
+            begin->m_renderOffset->setValue(mid);
+            *begin->m_renderOffset = Vector2D{-dir * XD, 0.0};
+            begin->m_alpha->setValueAndWarp(1.f);
+        }
         if (g_ds.pushed && f) {
             *f->m_renderOffset = Vector2D{};
             if (o)
@@ -7304,6 +7377,7 @@ static void deskSwipeEnd() {
     g_ds.target.reset();
     g_ds.targetId = -1;
     g_ds.dir      = 0;
+    g_ds.swap     = false;
 }
 
 // Jump to workspace `wsId` (1..9) and close the overview by zooming into that
@@ -8954,7 +9028,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     g_pEventLoopManager->addTimer(g_dockWatchTimer);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "2.35"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "2.36"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
