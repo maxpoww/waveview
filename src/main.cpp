@@ -6141,8 +6141,27 @@ static bool        g_interactSent = false;
 
 static void noteInteraction(bool pointer) {
     const auto w = Desktop::focusState()->window();
-    if (!w)
+    if (!w) {
+        // A SCREEN WITH NO WINDOW (Super+` walks the screens and commits on
+        // use, 2026-11-15): a key, a click or a scroll there is still the
+        // owner using that screen. Once per visit of the screen, as for a
+        // window; the daemon reads it as the screen's, with no window to
+        // credit (v2.37).
+        const auto mon = Desktop::focusState()->monitor();
+        if (!mon)
+            return;
+        if (pointer && g_pCompositor->getMonitorFromCursor() != mon)
+            return; // aimed at another screen
+        if (mon.get() != g_interactEpisode) {
+            g_interactEpisode = mon.get();
+            g_interactSent    = false;
+        }
+        if (g_interactSent)
+            return;
+        g_interactSent = true;
+        sendWaverunner("interacted\n");
         return;
+    }
     if (pointer) {
         const auto c = g_pInputManager->getMouseCoordsInternal();
         const auto p = w->m_realPosition->value();
@@ -9028,7 +9047,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     g_pEventLoopManager->addTimer(g_dockWatchTimer);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "2.36"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "2.37"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
