@@ -510,6 +510,18 @@ static int          g_pressTile = -1;        // empty tile a press landed on (re
 // disappears") or carried by the bare pointer ("stuck to the pointer")
 // (Max, 2026-11-18, a window dragged from a desk the screen was not showing).
 static bool         g_buttonHeld = false;
+// True while our render hook runs (inside the compositor's frame). Nothing
+// that can begin a drag, land a commit or turn a page may run then: those
+// photograph workspaces (captureWorkspaces), and a capture nested in a frame
+// clears and re-targets the render state under the frame being drawn — the
+// title bar's pass element then read a dead monitor: Hyprland SEGV
+// (2026-11-18, a press held as the opening zoom landed, whose warp began a
+// drag from inside the frame). The live timer and real motion do that work.
+static bool         g_inFrame = false;
+// Left presses swallowed while a gesture was in flight (a second pointing
+// device): each one's release is swallowed too, and the button stays owned
+// for the gesture's own release (one BTN_LEFT, two hands — 2026-11-18).
+static int          g_extraPresses = 0;
 // A press that releases within this radius (draw-space px) is a click (jump to
 // the window), not a drag (move it to another workspace).
 static constexpr double CLICK_SLOP = 12.0;
@@ -1172,6 +1184,9 @@ static void updateHoverAt(PHLMONITOR m, const Vector2D& c);
 static void keepPointerOn(PHLMONITOR d); // a carried window stays on the map's screen (see `tickEdgeHold`)
 static void reassertOverviewCursor(); // undo the compositor's border icon (defined with the cursor owner)
 static void closeOverview();
+static void cancelGesture(); // a held drag or live resize let go, as Escape does (see its definition)
+static PHLWINDOW windowByAddr(const std::string& addrStr);
+static void healLostDrag(); // the live timer's: a drag the compositor dropped behind our back (see its definition)
 static void beginRealDrag(PHLWINDOW dw, bool capture = true);
 static void endRealDrag(std::optional<Vector2D> at, PHLWINDOW splitTarget = nullptr);
 static void checkFloatWatch();
@@ -3704,6 +3719,7 @@ static void onLiveTimer(SP<CEventLoopTimer> self, void*) {
             keepClientsPainting(m); // no photograph, but the clients must keep painting or nothing ever changes
         if (!boosting)
             g_dirtyTiles = 0;
+        healLostDrag(); // a key Hyprland handled may have dropped our drag
         maybeCommit(m); // the dwell can expire with the cursor at rest
         if (mask || (g_dragWin.lock() && g_dragMoved))
             damageAll();
@@ -4273,6 +4289,12 @@ static void endRealDrag(std::optional<Vector2D> at, PHLWINDOW splitTarget) {
 
     const Vector2D dest  = at.value_or(g_dragHomeCenter);
     const Vector2D saved = g_pInputManager->getMouseCoordsInternal();
+    // The window in hand: ours, or — when a path already let go of g_dragWin —
+    // the compositor's own target, so a float is never ended where it is
+    // parked (at -20000: "disappears", 2026-11-18).
+    PHLWINDOW held = g_dragWin.lock();
+    if (!held)
+        held = g_layoutManager->dragController()->target()->window();
     g_pCompositor->warpCursorTo(dest, true);
     if (splitTarget)
         Desktop::focusState()->fullWindowFocus(splitTarget, Desktop::FOCUS_REASON_DESKTOP_STATE_CHANGE);
@@ -4280,7 +4302,7 @@ static void endRealDrag(std::optional<Vector2D> at, PHLWINDOW splitTarget) {
     // duration, and now that captures run live through the settle, the
     // landing spring would visibly fly it in from offscreen ("laggy").
     // Re-seated at the drop point, the spring is short and reads as a drop.
-    if (const auto dw = g_dragWin.lock(); dw && inLayoutSpace(dw)) { // setTargetGeom derefs target->space() unchecked
+    if (const auto dw = held; dw && inLayoutSpace(dw) && g_layoutManager->dragController()->target()) { // setTargetGeom derefs target->space() unchecked
         const CBox wb = dw->getWindowMainSurfaceBox();
         g_layoutManager->setTargetGeom(CBox{dest.x - wb.w / 2.0, dest.y - wb.h / 2.0, wb.w, wb.h}, dw->layoutTarget());
     }
@@ -4296,7 +4318,7 @@ static void endRealDrag(std::optional<Vector2D> at, PHLWINDOW splitTarget) {
     if (const auto dw2 = g_dragWin.lock())
         trace("end at=(%.0f,%.0f) ws=%d float=%d", dest.x, dest.y, (int)dw2->workspaceID(),
               (int)dw2->m_isFloating);
-    restoreFloatState(g_dragWin.lock());
+    restoreFloatState(held);
     g_pCompositor->warpCursorTo(saved, true);
 }
 
@@ -4460,9 +4482,12 @@ static bool landAt(PHLMONITOR m, const Vector2D& c, PHLWINDOW dw, const LiveComm
         trace("land float ws=%d at=(%.0f,%.0f) owes=%d", (int)dw->workspaceID(), here.x, here.y, (int)(wsFor(sig.tile) != from));
         return true;
     }
-    if (dw->workspaceID() == wsFor(sig.tile))
-        endRealDrag(desk, under);
-    else {
+    if (dw->workspaceID() == wsFor(sig.tile)) {
+        if (g_dragReal)
+            endRealDrag(desk, under);
+        else if (under)
+            placeAt(dw, desk, under); // the drag was folded (a key Hyprland handled): the aimed split, placed outright
+    } else {
         endRealDrag(std::nullopt);
         auto ws = g_pCompositor->getWorkspaceByID(wsFor(sig.tile));
         if (!ws)
@@ -4515,6 +4540,41 @@ static void regrab(PHLWINDOW dw) {
     damageAll();
 }
 
+// Hyprland ends ITS drag on any key it handles itself, behind our back
+// (KeybindManager::onKeyEvent → ensureMouseBindState → MBIND_INVALID):
+// Super alone, Super+R's tour, a media key. g_dragReal then names a drag
+// the compositor no longer holds; the float stays parked at -20000, and
+// the drag-end window-placed told waverunner's window memory THAT as the
+// app's place (2026-11-18). Fold it like a dead target: back from the park,
+// our flag down. Returns true when it folded.
+static bool foldLostDrag() {
+    if (!g_dragReal || g_layoutManager->dragController()->target())
+        return false;
+    const SBusyScope busy;
+    trace("drag LOST to the compositor (a key it handled): folded");
+    g_dragReal = false;
+    if (const auto dw = g_dragWin.lock(); dw && dw->m_isFloating && inLayoutSpace(dw)) {
+        const CBox wb = dw->getWindowMainSurfaceBox();
+        g_layoutManager->setTargetGeom(CBox{g_dragHomeCenter.x - wb.w / 2.0, g_dragHomeCenter.y - wb.h / 2.0, wb.w, wb.h}, dw->layoutTarget());
+    }
+    restoreFloatState(g_dragWin.lock());
+    return true;
+}
+
+// From the live timer only (outside every compositor call): a drag lost to
+// a key Hyprland handled is folded, and — still held — taken hold of again
+// from where the window now really is. A lost drag is only ever the
+// uncommitted state (a commit ends the real drag itself).
+static void healLostDrag() {
+    const auto dw = g_dragWin.lock();
+    if (!foldLostDrag() || !dw || !g_buttonHeld || !g_dragMoved)
+        return;
+    const SBusyScope busy;
+    g_commit = {};
+    trace("drag TAKEN AGAIN after the compositor dropped it");
+    beginRealDrag(dw, false);
+}
+
 // Dwell logic, fed by every drag motion AND the live timer (the dwell can
 // expire with the cursor at rest). Commit when the signature has been
 // stable for DWELL and differs from what's already placed.
@@ -4522,6 +4582,9 @@ static void maybeCommit(PHLMONITOR m) {
     const auto dw = g_dragWin.lock();
     if (!dw || !g_dragMoved)
         return;
+    // (A drag the compositor dropped behind our back is healed by the live
+    // timer — `healLostDrag` — never from here: this also runs from motion,
+    // and a synthetic motion can arrive INSIDE Hyprland's own dragEnd.)
     // Hovering the committed window's OWN slot means "stay put" — the
     // insert it would preview is the one already made (signatureAt skips
     // dw, so this reads as an empty-area signature and would re-commit).
@@ -4953,7 +5016,7 @@ static void updateHoverAt(PHLMONITOR m, const Vector2D& c) {
     // this block must never refire mid-gesture (it would poison g_origFloating
     // and nest a second controller drag; the busy scopes make that impossible,
     // this is the structural belt on top).
-    if ((g_dragWin.lock() || g_pressTile >= 0) && !g_dragMoved && !g_dragReal && (c - g_pressPos).size() > CLICK_SLOP) {
+    if (!g_inFrame && (g_dragWin.lock() || g_pressTile >= 0) && !g_dragMoved && !g_dragReal && (c - g_pressPos).size() > CLICK_SLOP) {
         if (!g_buttonHeld) {
             // The press is over (its release is being handled): this motion
             // is the machinery's, never the hand's.
@@ -4987,8 +5050,10 @@ static void updateHoverAt(PHLMONITOR m, const Vector2D& c) {
 
     if (g_dragWin.lock()) {
         g_dragCursor = c;
-        maybeCommit(m);
-        tickEdgeHold(); // held against an edge: the page that lies that way
+        if (!g_inFrame) { // (inside a frame the live timer does both — see g_inFrame)
+            maybeCommit(m);
+            tickEdgeHold(); // held against an edge: the page that lies that way
+        }
         // AFTER the commit, and every motion: each commit ends and re-begins
         // the compositor's drag, and its dragEnd unsets the "grabbing"
         // override it set — leaving the plain arrow with nothing to restore
@@ -5202,6 +5267,23 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
     if (pressed) {
         if (g_resizing)
             return; // already mid-resize (stray second press)
+        // A second left press while a gesture is in flight — another pointing
+        // device (the touchpad while the mouse drags): never a new gesture.
+        // It overwrote the press on record mid-drag, its release then closed
+        // the map with the held window still parked at -20000 (2026-11-18).
+        if (g_dragWin.lock() || g_dragReal || g_pressTile >= 0) {
+            ++g_extraPresses;
+            trace("SECOND press during a gesture: swallowed (%d)", g_extraPresses);
+            return;
+        }
+        // The hand is aiming: the opening's warp (still owed while the zoom
+        // lands) must not move the pointer out from under a press.
+        if (g_warpPending) {
+            trace("open warp: CANCELLED (a press)");
+            g_warpPending = false;
+            g_warpWin.reset();
+            endWarpHide();
+        }
         // Border press: the pointer sits on a resize zone — this gesture
         // resizes. The interior grab below moves.
         if (const auto ew = g_edgeWin.lock(); ew && !ew->isFullscreen() && inLayoutSpace(ew) && !g_dragWin.lock()) {
@@ -5263,7 +5345,16 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
         return;
     }
 
+    // The release of a swallowed second press is not the gesture's: swallow
+    // it, and keep the button owned for the gesture's own release.
+    if (g_extraPresses > 0) {
+        --g_extraPresses;
+        ownInput(g_ownedButtons, e.button, true);
+        trace("release of a SECOND press: swallowed");
+        return;
+    }
     g_buttonHeld = false; // first: nothing below may begin a drag (see g_buttonHeld)
+    foldLostDrag();       // a key Hyprland handled may have ended our drag: the drop below starts from the truth
     // Released mid-resize: sizes applied live are final — settle and re-read
     // the zone (the border may have moved out from under the pointer).
     if (g_resizing) {
@@ -5700,6 +5791,11 @@ static void drawMinFlies(PHLMONITOR m) {
 static void onRender(eRenderStage stage) {
     if (g_capturing || stage != eRenderStage::RENDER_POST_WINDOWS)
         return;
+    struct SFrameScope {
+        bool prev;
+        SFrameScope() : prev(g_inFrame) { g_inFrame = true; }
+        ~SFrameScope() { g_inFrame = prev; }
+    } const frameScope; // see g_inFrame
     if (const auto fm = g_pHyprRenderer->m_renderData.pMonitor.lock()) {
         drawPushOut(fm);  // a pushed screen's outgoing desk (the desk swipe)
         drawMinFlies(fm); // under any overlay, above the desktop
@@ -5825,6 +5921,18 @@ static void onRender(eRenderStage stage) {
             return;
         }
         trace("close DISENGAGE");
+        // The last net: whatever way the map closed, no real compositor drag
+        // or resize may outlive it (a window parked at -20000 for good, and
+        // g_dragReal stuck set: no drag could ever begin again).
+        // (DISENGAGE runs INSIDE a frame: the cancel — captures, workspace
+        // changes, cursor warps — is deferred out of it; see g_inFrame.)
+        if (g_dragReal || g_resizing) {
+            trace("close NET: a gesture outlived the map (dragReal=%d resizing=%d)", (int)g_dragReal, (int)g_resizing);
+            g_pEventLoopManager->doLater([] {
+                if (g_dragReal || g_resizing)
+                    cancelGesture();
+            });
+        }
         g_layMon.reset();
         repinAfterMap(false); // a net: every close comes through `startClose`, which has done it
         g_ovPick.reset();
@@ -5840,8 +5948,9 @@ static void onRender(eRenderStage stage) {
         g_resizing = false;
         g_resizeWin.reset();
         resetEdgeCursor();
-        g_pressTile  = -1;
-        g_buttonHeld = false; // a release still to come is not ours (see g_ownedButtons)
+        g_pressTile     = -1;
+        g_buttonHeld    = false; // a release still to come is not ours (see g_ownedButtons)
+        g_extraPresses  = 0;
         if (g_liveTimer)
             g_liveTimer->updateTimeout(std::chrono::milliseconds(450)); // one last tick: the deferred VRAM free
         damageAll();
@@ -6027,6 +6136,19 @@ static void checkPlaceDrag() {
     }
     if (g_placeDragAddr.empty())
         return;
+    // Never report a window put down while it is parked off-screen (a drag of
+    // the map's that the compositor ended behind our back): waverunner's window
+    // memory would take -20000,-20000 as that app's place, and its next windows
+    // would open there. It is reported once it is really put down — in the
+    // map, at the RELEASE: each live commit ends a compositor drag too, and a
+    // re-grab parks the window again before the daemon may have read it.
+    if (g_active && g_dragWin.lock() && g_buttonHeld)
+        return;
+    if (const auto w = windowByAddr(g_placeDragAddr)) {
+        const CBox wb = w->getWindowMainSurfaceBox();
+        if (wb.x < -10000.0 || wb.y < -10000.0)
+            return;
+    }
     sendWaverunner("window-placed " + g_placeDragAddr + "\n");
     g_placeDragAddr.clear();
 }
@@ -6301,6 +6423,12 @@ static void beginStageCloseZoom() {
 // Call it with the pick's focus already applied: waverunner stages whatever the
 // map left focused.
 static void startClose() {
+    // Every close comes through here, outside a frame: no gesture may ride
+    // a close (closeOverview and jumpTo cancel first; this is the net).
+    if (g_dragReal || g_resizing || g_dragWin.lock() || g_pressTile >= 0) {
+        trace("close CANCELS a gesture in flight (dragReal=%d resizing=%d pressTile=%d)", (int)g_dragReal, (int)g_resizing, g_pressTile);
+        cancelGesture();
+    }
     // The close zooms into the workspace this screen shows, so that page has
     // to be the one up: after turning to another page and leaving without a
     // pick, or after picking on another connected screen's page (the pick
@@ -6329,6 +6457,27 @@ static void startClose() {
     beginCloseZoom();
 }
 
+// A gesture in flight is cancelled — the held window back where it came
+// from (a live commit undone, the screens reshown), a live resize settled,
+// no drag left dangling in the compositor — before the map closes or jumps.
+// Escape always did this; a JUMP while a window was held (a digit, Super+N
+// = bring(), with the window over the gap between two desks, where it sits
+// in a real compositor drag) closed the map without it: the window stayed
+// parked at -20000,-20000 and g_dragReal stayed set, so no drag could ever
+// begin again until the plugin was reloaded (found 2026-11-18, hunting the
+// family of v2.38's ghost drag).
+static void cancelGesture() {
+    endRealResize();   // sizes applied live are final; just settle
+    resetEdgeCursor(); // the desktop must not inherit a resize pointer
+    restoreOriginal(); // never leave a real drag dangling; a commit is undone (and the screens reshown)
+    g_dragWin.reset();
+    g_dragMoved  = false;
+    g_dragCarry  = {};
+    g_pressTile     = -1;    // a press on record would outlive a reopen mid-close
+    g_buttonHeld    = false; // …and its release, if it comes, is not ours
+    g_extraPresses  = 0;
+}
+
 static void closeOverview() {
     if (g_animTarget < 0.5f)
         return;
@@ -6339,12 +6488,7 @@ static void closeOverview() {
     g_shapeWantSet = false; // no dwelled shape may land after the close
     g_warpWin.reset();
     endWarpHide();
-    endRealResize();   // sizes applied live are final; just settle
-    resetEdgeCursor(); // the desktop must not inherit a resize pointer
-    restoreOriginal(); // never leave a real drag dangling; a commit is undone (and the screens reshown)
-    g_dragWin.reset();
-    g_dragMoved  = false;
-    g_dragCarry  = {};
+    cancelGesture();
     // Escape / gesture / toggle: nothing was picked, so the stage comes back on
     // whatever is focused — which is where it already was.
     startClose();
@@ -6387,6 +6531,14 @@ static void toggle() {
     if (!opening) {
         closeOverview(); // one close path: drag/resize/cursor cleanup included
         return;
+    }
+    // Reopened (perhaps mid-close, before DISENGAGE): a press of the last
+    // visit whose release went elsewhere is not on record any more — left
+    // there, every later press read as a SECOND press and was swallowed.
+    if (!g_dragReal && !g_resizing) {
+        g_pressTile     = -1;
+        g_buttonHeld    = false;
+        g_extraPresses  = 0;
     }
     // Reopened mid-close: pick the zoom up from the POSITION it shows, mapped
     // onto the open's cut, so it turns around in place.
@@ -7429,6 +7581,12 @@ static void jumpTo(int wsId, bool startTheClose) {
     const int t = tileFor(wsId);
     if (t < 0)
         return;
+    // A window still held (a digit or Super+N mid-drag): let go of it first,
+    // exactly as Escape does — see `cancelGesture`.
+    if (g_dragReal || g_dragWin.lock() || g_resizing || g_pressTile >= 0) {
+        trace("jump CANCELS a gesture in flight (dragReal=%d resizing=%d pressTile=%d)", (int)g_dragReal, (int)g_resizing, g_pressTile);
+        cancelGesture();
+    }
 
     g_zoomTile = t; // close animation pivots on (zooms into) the chosen tile
 
@@ -9067,7 +9225,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     g_pEventLoopManager->addTimer(g_dockWatchTimer);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "2.38"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "2.39"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
