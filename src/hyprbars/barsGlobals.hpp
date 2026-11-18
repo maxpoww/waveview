@@ -91,3 +91,20 @@ struct SGolemBarsState {
 inline bool g_barsShuttingDown = false;
 
 inline UP<SGolemBarsState> g_pBarsState;
+
+/// THE OWNER'S CHOICE OF BARS (Controls → Tiles, Max 2026-11-18: *"barra de
+/// titulo = dos togles: on/off en flotante y en auto arrange (tiling) |
+/// botones: izquierda/derecha … y también en botones quiero: colores
+/// (semáforo) = on/off"*). Held by waverunner (`settings.json`), told with
+/// `hl.plugin.waveview.bars(floating, tiled, right, colors)`; as made: bars
+/// on the floating windows only, the three discs at the left, in colour.
+/// The plugin asks for it as it loads (`title-bars` to waverunner), so a
+/// reload never leaves the owner's choice behind.
+struct SGolemBarOptions {
+    bool floating = true;  // a bar on the floating windows
+    bool tiled    = false; // a bar on the windows in the layout too
+    bool right    = false; // the three discs at the RIGHT, the pin and the card at the left
+    bool colors   = true;  // the discs red, orange, green; off, grey in the bar's own ink
+    bool operator==(const SGolemBarOptions&) const = default;
+};
+inline SGolemBarOptions g_barOptions;

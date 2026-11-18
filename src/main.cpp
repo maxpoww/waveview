@@ -9101,6 +9101,20 @@ static int luaCard(lua_State* L) {
     return 0;
 }
 
+// `hl.plugin.waveview.bars(floating, tiled, right, colors)` — waverunner tells
+// us the owner's choice of title bars (Controls → Tiles): a bar on the
+// floating windows, on the windows in the layout, the three discs at the
+// right, in colour. Asked for as the bars start (`title-bars`).
+static int luaBars(lua_State* L) {
+    Bars::setOptions(SGolemBarOptions{
+        .floating = lua_toboolean(L, 1) != 0,
+        .tiled    = lua_toboolean(L, 2) != 0,
+        .right    = lua_toboolean(L, 3) != 0,
+        .colors   = lua_toboolean(L, 4) != 0,
+    });
+    return 0;
+}
+
 APICALL EXPORT std::string PLUGIN_API_VERSION() {
     return HYPRLAND_API_VERSION;
 }
@@ -9139,6 +9153,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     HyprlandAPI::addLuaFunction(handle, "waveview", "restore_min", luaRestoreMin);
     HyprlandAPI::addLuaFunction(handle, "waveview", "set_stage", luaSetStage);
     HyprlandAPI::addLuaFunction(handle, "waveview", "card", luaCard);
+    HyprlandAPI::addLuaFunction(handle, "waveview", "bars", luaBars);
     HyprlandAPI::addLuaFunction(handle, "waveview", "capture_deck", luaCaptureDeck);
     HyprlandAPI::addLuaFunction(handle, "waveview", "capture_desks", luaCaptureDesks);
     g_renderListener = Event::bus()->m_events.render.stage.listen([](eRenderStage s) { onRender(s); });
@@ -9225,7 +9240,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     g_pEventLoopManager->addTimer(g_dockWatchTimer);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "2.39"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "2.40"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {

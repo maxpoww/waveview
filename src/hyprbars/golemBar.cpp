@@ -134,6 +134,24 @@ static bool windowIsFirefox(PHLWINDOW w) {
     return w && (w->m_class == "firefox" || w->m_initialClass == "firefox" || w->m_class == "seam" || w->m_initialClass == "seam");
 }
 
+// THE BAR IS PART OF ITS WINDOW for "which window is under the pointer".
+// A floating window's box always counts its reserved strip; a TILED one's
+// counts only its own surface unless asked (`USE_PROP_TILED`): without it a
+// point on a tile's bar belonged to no window, and the bar never heard the
+// hand — a lone tile, drawn smaller in its slot, could not be pressed at all
+// (rig, 2026-11-18, the first bars on tiles).
+static constexpr uint16_t GOLEM_BAR_HIT = Desktop::View::USE_PROP_TILED;
+
+// WHO WEARS A BAR: as made, the floating windows only; the owner may take them
+// off the floats and put them on the windows in the layout too (Controls →
+// Tiles, `g_barOptions`). Never the browser (its own controls) nor the window
+// on the stage, whatever the choice.
+static bool barWanted(PHLWINDOW w) {
+    if (!w || windowStaged(w) || windowIsFirefox(w))
+        return false;
+    return w->m_isFloating ? g_barOptions.floating : g_barOptions.tiled;
+}
+
 // THE STRAIGHT SEAM (Max, 2026-09-26: *"make the bottom of the bar straight…
 // i want the top of the window to be square only when there is a bar. but not
 // on floating with no bars, or non floating windows, etc."*).
@@ -178,7 +196,7 @@ CGolemBar::CGolemBar(PHLWINDOW pWindow) : IHyprWindowDecoration(pWindow) {
     if (PMONITOR)
         PMONITOR->m_scheduledRecalc = true;
 
-    m_hidden = !pWindow->m_isFloating || windowStaged(pWindow) || windowIsFirefox(pWindow);
+    m_hidden = !barWanted(pWindow);
     syncSquareTop();
     if (windowIsFirefox(pWindow)) {
         writeFirefoxFloatSignal(m_ffFloatSignal, pWindow->m_isFloating && !windowStaged(pWindow));
@@ -454,7 +472,7 @@ void CGolemBar::syncHidden() {
     if (windowIsFirefox(PWINDOW))
         writeFirefoxFloatSignal(m_ffFloatSignal, PWINDOW->m_isFloating && !windowStaged(PWINDOW));
 
-    const bool WANT = !PWINDOW->m_isFloating || windowStaged(PWINDOW) || windowIsFirefox(PWINDOW);
+    const bool WANT = !barWanted(PWINDOW);
     if (WANT == m_hidden)
         return;
 
@@ -520,7 +538,7 @@ bool CGolemBar::inputIsValid() {
         return false;
 
     const auto WINDOWATCURSOR = g_pCompositor->vectorToWindowUnified(g_pInputManager->getMouseCoordsInternal(),
-                                                                     Desktop::View::RESERVED_EXTENTS | Desktop::View::INPUT_EXTENTS | Desktop::View::ALLOW_FLOATING);
+                                                                     Desktop::View::RESERVED_EXTENTS | Desktop::View::INPUT_EXTENTS | Desktop::View::ALLOW_FLOATING | GOLEM_BAR_HIT);
 
     auto       focusState = Desktop::focusState();
     auto       window     = focusState->window();
@@ -927,7 +945,7 @@ CGolemBar::eBarHover CGolemBar::hoverZone() {
     // content would claim the hand while the pointer is somewhere else
     // entirely, and nothing under the pointer would ever release it.
     const auto WINDOWATCURSOR = g_pCompositor->vectorToWindowUnified(g_pInputManager->getMouseCoordsInternal(),
-                                                                     Desktop::View::RESERVED_EXTENTS | Desktop::View::INPUT_EXTENTS | Desktop::View::ALLOW_FLOATING);
+                                                                     Desktop::View::RESERVED_EXTENTS | Desktop::View::INPUT_EXTENTS | Desktop::View::ALLOW_FLOATING | GOLEM_BAR_HIT);
     if (WINDOWATCURSOR != m_pWindow)
         return HOVER_NONE;
 
@@ -946,7 +964,7 @@ CGolemBar::eBarHover CGolemBar::hoverZone() {
 
     // One map for the hand, the lift and the press — see `golemBarZone`.
     const int  NAVMASK = navMask();
-    const auto HOVER   = golemBarZone(COORDS, g_pBarsState->buttons.size(), assignedBoxGlobal().w, GOLEM_BAR_HEIGHT, borderBelow(), NAVMASK);
+    const auto HOVER   = golemBarZone(COORDS, g_pBarsState->buttons.size(), assignedBoxGlobal().w, GOLEM_BAR_HEIGHT, borderBelow(), NAVMASK, pinShown());
     if (HOVER.kind == SGolemBarZone::NAV && !((NAVMASK >> HOVER.button) & 1))
         return HOVER_DEAD;
     switch (HOVER.kind) {
@@ -1075,7 +1093,7 @@ void CGolemBar::handleDownEvent(Event::SCallbackInfo& info, uint32_t button) {
     // on another window covering this bar's strip is that window's, not a
     // reason to raise this one (or hit its orange button).
     if (g_pCompositor->vectorToWindowUnified(g_pInputManager->getMouseCoordsInternal(),
-                                             Desktop::View::RESERVED_EXTENTS | Desktop::View::INPUT_EXTENTS | Desktop::View::ALLOW_FLOATING) != PWINDOW)
+                                             Desktop::View::RESERVED_EXTENTS | Desktop::View::INPUT_EXTENTS | Desktop::View::ALLOW_FLOATING | GOLEM_BAR_HIT) != PWINDOW)
         return;
 
     if (Desktop::focusState()->window() != PWINDOW)
@@ -1093,7 +1111,7 @@ void CGolemBar::handleDownEvent(Event::SCallbackInfo& info, uint32_t button) {
 
     m_bDragPending      = true;
     {
-        const auto ZONE     = golemBarZone(COORDS, g_pBarsState->buttons.size(), assignedBoxGlobal().w, GOLEM_BAR_HEIGHT, borderBelow(), navMask()).kind;
+        const auto ZONE     = golemBarZone(COORDS, g_pBarsState->buttons.size(), assignedBoxGlobal().w, GOLEM_BAR_HEIGHT, borderBelow(), navMask(), pinShown()).kind;
         m_bResizeFromCorner = ZONE == SGolemBarZone::CORNER_LEFT || ZONE == SGolemBarZone::CORNER_RIGHT;
     }
     // The hand closes ON THE PRESS, not when motion starts: taking hold is
@@ -1127,7 +1145,7 @@ void CGolemBar::handleUpEvent(Event::SCallbackInfo& info, uint32_t button, bool 
         m_navDown      = -1;
         damageEntire();
         const int  MASK = navMask();
-        const auto ZONE = golemBarZone(cursorRelativeToBar(), g_pBarsState->buttons.size(), assignedBoxGlobal().w, GOLEM_BAR_HEIGHT, borderBelow(), MASK);
+        const auto ZONE = golemBarZone(cursorRelativeToBar(), g_pBarsState->buttons.size(), assignedBoxGlobal().w, GOLEM_BAR_HEIGHT, borderBelow(), MASK, pinShown());
         if (const auto PWINDOW = m_pWindow.lock(); valid && PWINDOW && ZONE.kind == SGolemBarZone::NAV && ZONE.button == DOWN && golemNavCan(MASK, DOWN)) {
             if (DOWN == 2)
                 Config::Actions::pass(HL_MODIFIER_CTRL | HL_MODIFIER_ALT | HL_MODIFIER_SHIFT, 28, PWINDOW);
@@ -1178,7 +1196,7 @@ void CGolemBar::handleMovement() {
 bool CGolemBar::doButtonPress(Vector2D COORDS) {
     // A press anywhere in a button's spot is that button's — the same spot
     // the hand and the hover lift answer to (`golemBarZone`).
-    const auto ZONE = golemBarZone(COORDS, g_pBarsState->buttons.size(), assignedBoxGlobal().w, GOLEM_BAR_HEIGHT, borderBelow(), navMask());
+    const auto ZONE = golemBarZone(COORDS, g_pBarsState->buttons.size(), assignedBoxGlobal().w, GOLEM_BAR_HEIGHT, borderBelow(), navMask(), pinShown());
     const auto PWINDOW = m_pWindow.lock();
     // The card button: waverunner owns the card and which windows it is on
     // for; it answers with `hl.plugin.waveview.card(addr, on)`, which is what
@@ -1222,7 +1240,10 @@ bool CGolemBar::doButtonPress(Vector2D COORDS) {
         // where the rule promised pseudo (2026-09-13). The press has
         // already focused this window, which is the one the verb acts
         // on.
-        case GOLEM_BAR_TILE: sendWaverunner("window-mode tiled\n"); break;
+        // On a window IN the layout (its bar is the owner's choice, Controls →
+        // Tiles) the same disc takes it out: the one button of the row that
+        // swaps the two ways a window can stand.
+        case GOLEM_BAR_TILE: sendWaverunner(PWINDOW->m_isFloating ? "window-mode tiled\n" : "window-mode floating\n"); break;
         // Minimize to the dock — the plugin's own machinery (main.cpp):
         // it owns the card capture, the fly animation and the
         // special-workspace park, and tells the daemon when the card
@@ -1283,7 +1304,8 @@ size_t CGolemBar::getVisibleButtonCount(const Vector2D& bufferSize, const float 
 /// by the half pixel that `scaledButtonSize` (25.6 at Golem's scale) leaves.
 static CBox golemDiscBox(const CBox& barBox, size_t i, float border, float scale) {
     const auto scaledButtonSize = GOLEM_BUTTON_SIZE * scale;
-    CBox       box = {barBox.x + golemButtonX(i, scale), barBox.y + golemButtonY(barBox.h, border * scale, scaledButtonSize), scaledButtonSize, scaledButtonSize};
+    const auto x                = golemSideX(golemButtonX(golemButtonSlot(i, g_pBarsState->buttons.size()), scale), scaledButtonSize, barBox.w);
+    CBox       box = {barBox.x + x, barBox.y + golemButtonY(barBox.h, border * scale, scaledButtonSize), scaledButtonSize, scaledButtonSize};
     box.round();
     return box;
 }
@@ -1292,7 +1314,8 @@ static CBox golemDiscBox(const CBox& barBox, size_t i, float border, float scale
 /// centred on the discs' line like them, rounded the same way.
 static CBox golemNavBox(const CBox& barBox, int i, float border, float scale) {
     const auto size = GOLEM_NAV_BOX * scale;
-    CBox       box  = {barBox.x + golemNavX(g_pBarsState->buttons.size(), i, scale), barBox.y + golemButtonY(barBox.h, border * scale, size), size, size};
+    const auto x    = golemSideX(golemNavX(g_pBarsState->buttons.size(), golemNavSlot(i), scale), size, barBox.w);
+    CBox       box  = {barBox.x + x, barBox.y + golemButtonY(barBox.h, border * scale, size), size, size};
     box.round();
     return box;
 }
@@ -1470,6 +1493,22 @@ void CGolemBar::navChanged() {
     damageEntire();
 }
 
+bool CGolemBar::pinShown() {
+    const auto W = m_pWindow.lock();
+    return W && W->m_isFloating; // the compositor pins floating windows only
+}
+
+void CGolemBar::optionsChanged() {
+    // Off the event loop (`hl.plugin.waveview.bars`), not the render pass:
+    // `syncHidden` is safe from either, and schedules what it must.
+    syncHidden();
+    m_iButtonHoverState = 0; // the next motion says what is under the hand on the new side
+    m_cardHover         = false;
+    m_pinHover          = false;
+    m_navHover          = -1;
+    damageEntire();
+}
+
 // One `<key> <back 0|1> <forward 0|1>` file into `into`, when it is a new
 // one (inode or mtime changed since `id`); whether what it says changed.
 static bool readNavFile(const std::string& path, std::pair<ino_t, int64_t>& id, std::unordered_map<std::string, int>& into) {
@@ -1566,13 +1605,17 @@ void CGolemBar::renderBarButtons(CBox* barBox, const float scale, const float a)
         // worse target (Max, 2026-09-15: *"the buttons stay 100% opacity"*).
         // `GOLEM_FLOAT_ALPHA` tints the frame's colour, never these; `a` is the
         // window's own fade, which they do follow.
+        const bool MONO  = !g_barOptions.colors;
         auto       color = button.bgcol;
         color.a *= a;
+        if (MONO)
+            color = CHyprColor{m_lastInk.r, m_lastInk.g, m_lastInk.b, m_lastInk.a * (((m_iButtonHoverState >> i) & 1u) ? GOLEM_BUTTON_MONO_HOVER : GOLEM_BUTTON_MONO_FILL) * a};
 
         // Hover lifts the disc toward white — the same answer at the same
         // strength on all three, so the row reads as one control set. State
         // comes from `m_iButtonHoverState`, written on the motion path.
-        if ((m_iButtonHoverState >> i) & 1u) {
+        // (Without colours the disc deepens in the ink instead, above.)
+        if (!MONO && ((m_iButtonHoverState >> i) & 1u)) {
             color.r += (1.0 - color.r) * GOLEM_BUTTON_HOVER_LIFT;
             color.g += (1.0 - color.g) * GOLEM_BUTTON_HOVER_LIFT;
             color.b += (1.0 - color.b) * GOLEM_BUTTON_HOVER_LIFT;
@@ -1599,7 +1642,7 @@ void CGolemBar::renderBarButtons(CBox* barBox, const float scale, const float a)
         // back over the inside.
         if (button.glyph == GOLEM_GLYPH_TEXT)
             continue;
-        auto ink = button.fgcol;
+        auto ink = MONO ? CHyprColor{m_lastInk.r, m_lastInk.g, m_lastInk.b, m_lastInk.a * GOLEM_BUTTON_MONO_INK} : button.fgcol;
         ink.a *= a;
         const double w      = buttonBox.w; // whole pixels
         double       span   = std::round(w * GOLEM_GLYPH_SPAN);
@@ -1607,7 +1650,15 @@ void CGolemBar::renderBarButtons(CBox* barBox, const float scale, const float a)
             span += 1.0; // same parity as the disc → equal whole margins
         const double stroke = std::max(1.0, std::round(GOLEM_GLYPH_STROKE * scale));
         const double sx     = buttonBox.x + (w - span) / 2.0;
-        if (button.glyph == GOLEM_GLYPH_SQUARE) {
+        if (button.glyph == GOLEM_GLYPH_SQUARE && MONO) {
+            // A see-through disc cannot cut the inside back out: the outline
+            // as its four sides.
+            const double sy = buttonBox.y + (w - span) / 2.0;
+            g_pHyprOpenGL->renderRect(CBox{sx, sy, span, stroke}, ink, {});
+            g_pHyprOpenGL->renderRect(CBox{sx, sy + span - stroke, span, stroke}, ink, {});
+            g_pHyprOpenGL->renderRect(CBox{sx, sy + stroke, stroke, span - 2.0 * stroke}, ink, {});
+            g_pHyprOpenGL->renderRect(CBox{sx + span - stroke, sy + stroke, stroke, span - 2.0 * stroke}, ink, {});
+        } else if (button.glyph == GOLEM_GLYPH_SQUARE) {
             const double sy = buttonBox.y + (w - span) / 2.0;
             // Slightly rounded corners (GOLEM_GLYPH_SQUARE_R); the inner cut-out's
             // radius is the outer's less the stroke, so the outline stays even.
@@ -1628,7 +1679,7 @@ void CGolemBar::renderBarButtons(CBox* barBox, const float scale, const float a)
     if (barBox->w < GOLEM_CARD_MIN_BAR * scale)
         return;
     const auto scaledSize = GOLEM_CARD_SIZE * scale;
-    CBox       box = {barBox->x + golemCardX(barBox->w, scale), barBox->y + golemButtonY(barBox->h, BORDER * scale, scaledSize), scaledSize, scaledSize};
+    CBox       box = {barBox->x + golemSideX(golemCardX(barBox->w, scale), scaledSize, barBox->w), barBox->y + golemButtonY(barBox->h, BORDER * scale, scaledSize), scaledSize, scaledSize};
     box.round();
     // THE GLYPH ALONE, like the webapps' arrows: grey while the card is off,
     // the bar's full ink — black on a light bar, white on a dark one — while
@@ -1667,9 +1718,9 @@ void CGolemBar::renderBarButtons(CBox* barBox, const float scale, const float a)
     // is pinned. Its glyph is a PUSHPIN standing up: cap, body, flange,
     // needle — four rectangles on one axis, each of the box's parity so the
     // axis is the box's centre to the pixel.
-    if (barBox->w < GOLEM_PIN_MIN_BAR * scale)
+    if (barBox->w < GOLEM_PIN_MIN_BAR * scale || !pinShown())
         return;
-    CBox pbox = {barBox->x + golemPinX(barBox->w, scale), barBox->y + golemButtonY(barBox->h, BORDER * scale, scaledSize), scaledSize, scaledSize};
+    CBox pbox = {barBox->x + golemSideX(golemPinX(barBox->w, scale), scaledSize, barBox->w), barBox->y + golemButtonY(barBox->h, BORDER * scale, scaledSize), scaledSize, scaledSize};
     pbox.round();
     const auto PWINDOW = m_pWindow.lock();
     CHyprColor pink    = m_lastInk;
@@ -1764,26 +1815,46 @@ void CGolemBar::renderBarButtonsText(CBox* barBox, const float scale, const floa
 
         if (button.icon.empty())
             continue;
-        auto glyph = std::ranges::find_if(button.glyphs, [scale](const SGolemGlyphTex& g) { return std::abs(g.scale - scale) < 0.001F; });
-        if (glyph == button.glyphs.end())
-            glyph = button.glyphs.insert(button.glyphs.end(), SGolemGlyphTex{.scale = scale});
-        if (!glyph->tex || glyph->tex->m_texID == 0) {
-            glyph->tex         = g_pHyprRenderer->renderText(button.icon, button.fgcol, std::round(GOLEM_BUTTON_SIZE * GOLEM_BUTTON_GLYPH * scale), false, GOLEM_BAR_FONT, scaledButtonSize);
-            glyph->inkOffset   = {};
-            glyph->inkMeasured = measureInkOffset(glyph->tex, glyph->inkOffset);
+        // Without colours the × is set in the bar's own ink, this bar's
+        // texture (the shared one is in the red disc's).
+        SP<Render::ITexture> tex;
+        Vector2D             inkOffset;
+        float                glyphA = 1.F;
+        if (!g_barOptions.colors) {
+            if (!m_monoTex || m_monoTex->m_texID == 0 || m_monoInk != m_lastInk || m_monoScale != scale) {
+                m_monoTex       = g_pHyprRenderer->renderText(button.icon, CHyprColor{m_lastInk.r, m_lastInk.g, m_lastInk.b, 1.F},
+                                                              std::round(GOLEM_BUTTON_SIZE * GOLEM_BUTTON_GLYPH * scale), false, GOLEM_BAR_FONT, scaledButtonSize);
+                m_monoInkOffset = {};
+                measureInkOffset(m_monoTex, m_monoInkOffset);
+                m_monoInk   = m_lastInk;
+                m_monoScale = scale;
+            }
+            tex       = m_monoTex;
+            inkOffset = m_monoInkOffset;
+            glyphA    = m_lastInk.a * GOLEM_BUTTON_MONO_INK;
+        } else {
+            auto glyph = std::ranges::find_if(button.glyphs, [scale](const SGolemGlyphTex& g) { return std::abs(g.scale - scale) < 0.001F; });
+            if (glyph == button.glyphs.end())
+                glyph = button.glyphs.insert(button.glyphs.end(), SGolemGlyphTex{.scale = scale});
+            if (!glyph->tex || glyph->tex->m_texID == 0) {
+                glyph->tex         = g_pHyprRenderer->renderText(button.icon, button.fgcol, std::round(GOLEM_BUTTON_SIZE * GOLEM_BUTTON_GLYPH * scale), false, GOLEM_BAR_FONT, scaledButtonSize);
+                glyph->inkOffset   = {};
+                glyph->inkMeasured = measureInkOffset(glyph->tex, glyph->inkOffset);
+            }
+            tex       = glyph->tex;
+            inkOffset = glyph->inkOffset;
         }
 
-        if (!glyph->tex || glyph->tex->m_texID == 0)
+        if (!tex || tex->m_texID == 0)
             continue;
 
         // Centred on the disc AS DRAWN (`golemDiscBox`, rounded) — and by its
         // INK, not its texture: the offset measured above moves the texture
         // so the glyph's own centre lands on the disc's centre (see
         // `SGolemGlyphTex::inkOffset`).
-        const auto& tex   = glyph->tex;
         const CBox  disc  = golemDiscBox(*barBox, i, BORDER, scale);
-        const auto  iconX = disc.x + disc.w / 2.0 - tex->m_size.x / 2.0 - glyph->inkOffset.x;
-        const auto  iconY = disc.y + disc.h / 2.0 - tex->m_size.y / 2.0 - glyph->inkOffset.y;
+        const auto  iconX = disc.x + disc.w / 2.0 - tex->m_size.x / 2.0 - inkOffset.x;
+        const auto  iconY = disc.y + disc.h / 2.0 - tex->m_size.y / 2.0 - inkOffset.y;
         CBox        pos   = {std::round(iconX), std::round(iconY), tex->m_size.x, tex->m_size.y};
 
         // Never DIMMED: `decoration:dim_inactive` tints every texture drawn
@@ -1792,7 +1863,7 @@ void CGolemBar::renderBarButtonsText(CBox* barBox, const float scale, const floa
         // rects, untinted — stayed bright. The buttons are targets at full
         // strength (Max, 2026-09-25: *"the title bars buttons should not be
         // dimmed"*), same rule as their opacity above.
-        g_pHyprOpenGL->renderTexture(tex, pos, {.a = a, .allowDim = false});
+        g_pHyprOpenGL->renderTexture(tex, pos, {.a = a * glyphA, .allowDim = false});
     }
 
     // Back and forward (webapps, Golem Files): Seam's buttons — both always,
@@ -2212,7 +2283,7 @@ void CGolemBar::damageOnButtonHover() {
         const auto COORDS = cursorRelativeToBar();
         // The whole column lights its disc (`golemButtonColumn`), so the lift
         // answers the hand as it arrives, not only once it is on the disc.
-        const auto ZONE = golemBarZone(COORDS, g_pBarsState->buttons.size(), assignedBoxGlobal().w, GOLEM_BAR_HEIGHT, borderBelow(), navMask());
+        const auto ZONE = golemBarZone(COORDS, g_pBarsState->buttons.size(), assignedBoxGlobal().w, GOLEM_BAR_HEIGHT, borderBelow(), navMask(), pinShown());
         if (ZONE.kind == SGolemBarZone::BUTTON)
             mask = 1u << ZONE.button;
         card = ZONE.kind == SGolemBarZone::CARD;

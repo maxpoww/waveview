@@ -152,6 +152,27 @@ inline float golemButtonX(size_t i, float scale) {
     return (GOLEM_BUTTONS_LEFT + i * (GOLEM_BUTTON_SIZE + GOLEM_BUTTON_PADDING)) * scale;
 }
 
+/// THE SIDE THE DISCS ARE ON (Max, 2026-11-18: *"botones: izquierda/derecha
+/// (esto cambia los botones de cerrar, min, max, de lado con los de pin y
+/// card)"*). Every spot on the bar is laid out as made — the discs from the
+/// left, the card and the pin from the right — and turned into the bar's own
+/// x HERE: the same place, or its mirror image (`g_barOptions.right`). The
+/// boxes drawn go through this and `golemBarZone` mirrors the pointer, so a
+/// button cannot be drawn on one side and pressed on the other. `x`, `w` and
+/// `barWidth` in one space (scaled for the draw, logical for the hit-test).
+inline double golemSideX(double x, double w, double barWidth) {
+    return g_barOptions.right ? barWidth - x - w : x;
+}
+
+/// Which spot of the row the `i`th disc takes. At the left, as made: close,
+/// minimize, back into the layout (macOS's order). At the right the row reads
+/// – □ ×, the order every desktop with its buttons there has taught the hand,
+/// close still in the corner. Its own inverse: the disc in spot `s` is
+/// `golemButtonSlot(s, count)`.
+inline size_t golemButtonSlot(size_t i, size_t count) {
+    return g_barOptions.right && count == 3 && i > 0 ? 3 - i : i;
+}
+
 /// Which button's COLUMN a bar-local logical point falls in, or -1.
 ///
 /// The button end of the bar is ONE exclusive zone (Max, 2026-09-26: *"i want
@@ -344,6 +365,13 @@ inline bool golemNavCan(int navMask, int i) {
 inline float golemNavX(size_t count, int i, float scale) {
     return (golemButtonX(count, 1.F) - GOLEM_BUTTON_PADDING + GOLEM_NAV_LEAD + i * (GOLEM_NAV_BOX + GOLEM_NAV_SPACE)) * scale;
 }
+/// Which spot back and forward take. They go with the discs; at the right of
+/// the bar the spots run from the discs LEFTWARD, so the two swap — back stays
+/// left of forward, where its arrow points. Translate keeps the far spot. Its
+/// own inverse.
+inline int golemNavSlot(int i) {
+    return g_barOptions.right && i < 2 ? 1 - i : i;
+}
 
 /// What a bar-local logical point is ON: a button (by index), one of the two
 /// corner resize grips, the strip, or nothing. THE one map for the hand, the
@@ -361,9 +389,24 @@ struct SGolemBarZone {
     enum eKind : uint8_t { NONE = 0, STRIP, BUTTON, CORNER_LEFT, CORNER_RIGHT, CARD, NAV, PIN } kind = NONE;
     int button = -1; // for BUTTON; for NAV, 0 = back, 1 = forward, 2 = translate
 };
-inline SGolemBarZone golemBarZone(const Vector2D& p, size_t count, double barWidth, double barHeight, float border, int navMask = 0) {
+/// `pin`: the window can be pinned (a floating one) — a window in the layout
+/// has no pin button. With the discs at the RIGHT (`g_barOptions.right`) the
+/// map is the same one, read on the pointer's mirror image (`golemSideX`);
+/// only the two corner grips are then named for the side they really are on.
+inline SGolemBarZone golemBarZoneAsMade(const Vector2D& p, size_t count, double barWidth, double barHeight, float border, int navMask, bool pin);
+inline SGolemBarZone golemBarZone(const Vector2D& p, size_t count, double barWidth, double barHeight, float border, int navMask = 0, bool pin = true) {
     if (p.x < 0 || p.y < 0 || p.x >= barWidth || p.y >= barHeight)
         return {};
+    if (!g_barOptions.right)
+        return golemBarZoneAsMade(p, count, barWidth, barHeight, border, navMask, pin);
+    auto zone = golemBarZoneAsMade({std::clamp(barWidth - p.x, 0.0, std::nextafter(barWidth, 0.0)), p.y}, count, barWidth, barHeight, border, navMask, pin);
+    if (zone.kind == SGolemBarZone::CORNER_LEFT)
+        zone.kind = SGolemBarZone::CORNER_RIGHT;
+    else if (zone.kind == SGolemBarZone::CORNER_RIGHT)
+        zone.kind = SGolemBarZone::CORNER_LEFT;
+    return zone;
+}
+inline SGolemBarZone golemBarZoneAsMade(const Vector2D& p, size_t count, double barWidth, double barHeight, float border, int navMask, bool pin) {
     // The card button's disc (one px generous), ahead of the grip it shares
     // the corner with.
     if (barWidth >= GOLEM_CARD_MIN_BAR) {
@@ -376,7 +419,7 @@ inline SGolemBarZone golemBarZone(const Vector2D& p, size_t count, double barWid
         return {SGolemBarZone::CORNER_RIGHT, -1};
     // The pin button: a full-height column, its glyph plus half the gap on
     // either side.
-    if (barWidth >= GOLEM_PIN_MIN_BAR) {
+    if (pin && barWidth >= GOLEM_PIN_MIN_BAR) {
         const double x0 = golemPinX(barWidth, 1.F) - GOLEM_BUTTON_PADDING / 2.0;
         if (p.x >= x0 && p.x < x0 + GOLEM_CARD_SIZE + GOLEM_BUTTON_PADDING)
             return {SGolemBarZone::PIN, -1};
@@ -389,7 +432,7 @@ inline SGolemBarZone golemBarZone(const Vector2D& p, size_t count, double barWid
             return {SGolemBarZone::CORNER_LEFT, -1};
     }
     if (col >= 0)
-        return {SGolemBarZone::BUTTON, col};
+        return {SGolemBarZone::BUTTON, static_cast<int>(golemButtonSlot(static_cast<size_t>(col), count))};
     // Back and forward: full-height columns, the square plus half the space
     // on either side — BOTH whenever the window has them (`GOLEM_NAV_SHOWN`),
     // a disabled one included: its spot is a dead button, not the strip.
@@ -398,7 +441,7 @@ inline SGolemBarZone golemBarZone(const Vector2D& p, size_t count, double barWid
         for (int i = 0; i < golemNavCount(navMask); ++i) {
             const double x0 = golemNavX(count, i, 1.F) - half;
             if (p.x >= x0 && p.x < x0 + GOLEM_NAV_BOX + GOLEM_NAV_SPACE)
-                return {SGolemBarZone::NAV, i};
+                return {SGolemBarZone::NAV, golemNavSlot(i)};
         }
     }
     return {SGolemBarZone::STRIP, -1};
@@ -451,6 +494,13 @@ inline constexpr float GOLEM_BUTTON_HOVER_LIFT = 0.44F; // 0.22 → 0.24 → 0.4
 /// the disk at hover at 1.03"*). The glyph keeps its whole-pixel geometry on
 /// the same centre; only the disc breathes.
 inline constexpr double GOLEM_BUTTON_HOVER_SCALE = 1.03;
+/// THE ROW WITHOUT COLOURS (Max, 2026-11-18: *"colores (semáforo) = on/off"*,
+/// `g_barOptions.colors` off): the three discs in the bar's own ink — dark on
+/// a light bar, light on a dark one, as the arrows and the pin are — at this
+/// much of it, deeper under the hand; their glyphs in the ink itself.
+inline constexpr float GOLEM_BUTTON_MONO_FILL  = 0.14F;
+inline constexpr float GOLEM_BUTTON_MONO_HOVER = 0.28F;
+inline constexpr float GOLEM_BUTTON_MONO_INK   = 0.85F;
 
 /// The cursor-hint settle timer's lifecycle — called from `Bars::init` and
 /// `Bars::shutdown`. Defined in golemBar.cpp beside the state it re-asserts.
@@ -523,6 +573,9 @@ class CGolemBar : public IHyprWindowDecoration {
     void         setCard(bool on);
     /// Seam said a webapp's history changed (see `navMask`).
     void         navChanged();
+    /// The owner's choice of bars changed (`g_barOptions`): shown or not on
+    /// this window, and the row drawn again on its side, in its colours.
+    void         optionsChanged();
     PHLWINDOW    window() { return m_pWindow.lock(); }
 
     WP<CGolemBar> m_self;
@@ -531,8 +584,9 @@ class CGolemBar : public IHyprWindowDecoration {
     PHLWINDOWREF         m_pWindow;
     CBox                 m_bAssignedBox;
 
-    /// The bar is only for windows OUT of the layout. Upstream drove this from
-    /// a `hyprbars:no_bar` window rule; Golem asks the window itself.
+    /// Hidden unless the window wears a bar (`barWanted`: as made, the floating
+    /// windows; the owner's choice, `g_barOptions`). Upstream drove this from a
+    /// `hyprbars:no_bar` window rule; Golem asks the window itself.
     bool                 m_hidden         = true;
 
     /// The centred title texture, and the state it was rendered from: the
@@ -677,10 +731,19 @@ class CGolemBar : public IHyprWindowDecoration {
     /// Back and forward (webapps only — `hasNav`): which one is under the
     /// pointer (-1 = neither), and their glyphs in this bar's ink.
     bool                 hasNav();
+    /// The window can be pinned — it floats — so its bar has the pin button.
+    bool                 pinShown();
     int                  navMask(); // bit 0 back, bit 1 forward can be used; GOLEM_NAV_SHOWN the pair is there
     int                  m_navDown = -1; // the nav button held down (it acts on the release over itself)
     int                  m_navHover = -1;
     SP<Render::ITexture> m_navTex[3]; // back, forward, translate
+    /// The × of the row WITHOUT COLOURS (`g_barOptions.colors` off), set in the
+    /// bar's own ink — the shared one is in the red disc's — and where its ink
+    /// sits in it; re-made when the ink flips or the scale changes.
+    SP<Render::ITexture> m_monoTex;
+    CHyprColor           m_monoInk;
+    float                m_monoScale = 0.F;
+    Vector2D             m_monoInkOffset;
     CHyprColor           m_navInk;
     float                m_navScale = 0.F;
 

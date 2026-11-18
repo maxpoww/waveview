@@ -37,6 +37,10 @@ tag above is what to diff against when checking for them.
   with a `hyprbars:no_bar` window rule; here the bar hides itself whenever its
   window is not floating (`syncHidden`), which is the same mechanism with the
   rule replaced by the one condition Golem actually wants.
+  Since 2026-11-18 the owner chooses (Controls → Tiles, `g_barOptions`, told
+  through `hl.plugin.waveview.bars`): bars on the floating windows, on the
+  tiled ones, the three discs at the left or the right, in colour or grey.
+  Still no config values — the shell holds the choice.
 * **The look is constants, not config** (`golemBar.hpp`): height, colour, text,
   font, padding. The seventeen config values, both button parsers and the three
   window-rule effects are gone.

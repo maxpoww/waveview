@@ -53,6 +53,19 @@ namespace Bars {
         }
     }
 
+    void setOptions(const SGolemBarOptions& o) {
+        if (o == g_barOptions)
+            return;
+        g_barOptions = o;
+        for (auto& w : g_pCompositor->m_windows) {
+            if (!w)
+                continue;
+            for (auto& d : w->m_windowDecorations)
+                if (auto* bar = dynamic_cast<CGolemBar*>(d.get()))
+                    bar->optionsChanged();
+        }
+    }
+
     void settleFocus(PHLWINDOW window) {
         if (!window)
             return;
@@ -99,6 +112,10 @@ namespace Bars {
         golemBarSampleTimerInit();
         golemNavWatchInit();
         golemResizeHandInit();
+        // The owner's choice of bars lives with waverunner: ask for it, so a
+        // plugin loaded (or reloaded) after the shell started wears it too.
+        // No shell yet, no harm: it tells us as it starts.
+        sendWaverunner("title-bars\n");
 
         // GOLEM'S TRAFFIC LIGHTS (Max, 2026-09-15: *"three colors, macOS style
         // but different colors, that make sense"*): the familiar three-disc

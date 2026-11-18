@@ -10,6 +10,8 @@
 
 #include <string>
 
+#include "barsGlobals.hpp"
+
 /// One line to the waverunner daemon's socket (defined in `../main.cpp`).
 /// A button on the bar is a GOLEM action — "back into the layout" has to go
 /// through the daemon's own mode machinery, not the compositor's float toggle,
@@ -34,6 +36,10 @@ namespace Bars {
     /// The card is on (or off) for the window at `addr` ("0x…"; "*" = every
     /// window): its bar's card button shows it. Called for waverunner.
     void setCard(const std::string& addr, bool on);
+
+    /// The owner's choice of bars (`g_barOptions`): which windows wear one,
+    /// the side the discs are on, in colour or not. Called for waverunner.
+    void setOptions(const SGolemBarOptions& options);
 
     /// One entry per bar holding a sticky input flag (drag pending/active, a
     /// cancelled press), for waveview's `debug_state` dump.
