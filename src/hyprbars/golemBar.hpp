@@ -502,6 +502,11 @@ inline constexpr float GOLEM_BUTTON_MONO_FILL  = 0.14F;
 inline constexpr float GOLEM_BUTTON_MONO_HOVER = 0.28F;
 inline constexpr float GOLEM_BUTTON_MONO_INK   = 0.85F;
 
+/// Whether `w` wears a bar now (the bar's own decision, `barWanted`, asked
+/// without waiting for its next frame): floats and/or tiles as the owner
+/// chose, never the browser nor the window on the stage.
+bool golemBarWanted(PHLWINDOW w);
+
 /// The cursor-hint settle timer's lifecycle — called from `Bars::init` and
 /// `Bars::shutdown`. Defined in golemBar.cpp beside the state it re-asserts.
 void golemBarCursorTimerInit();

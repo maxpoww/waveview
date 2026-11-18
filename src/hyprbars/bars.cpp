@@ -66,6 +66,15 @@ namespace Bars {
         }
     }
 
+    bool barShown(PHLWINDOW window) {
+        if (!window)
+            return false;
+        for (auto& d : window->m_windowDecorations)
+            if (dynamic_cast<CGolemBar*>(d.get()))
+                return golemBarWanted(window);
+        return false;
+    }
+
     void settleFocus(PHLWINDOW window) {
         if (!window)
             return;

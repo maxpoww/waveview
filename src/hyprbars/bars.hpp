@@ -41,6 +41,10 @@ namespace Bars {
     /// the side the discs are on, in colour or not. Called for waverunner.
     void setOptions(const SGolemBarOptions& options);
 
+    /// The window wears its bar (its own decoration, and the owner's choice
+    /// puts one on it): the spread's cards stand that much taller.
+    bool barShown(PHLWINDOW window);
+
     /// One entry per bar holding a sticky input flag (drag pending/active, a
     /// cancelled press), for waveview's `debug_state` dump.
     std::string debugState();

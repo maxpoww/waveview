@@ -1992,7 +1992,10 @@ static Rect spreadHome(PHLWINDOW w) {
 }
 
 // How far a spread CARD extends past the surface box: Golem's bar above a
-// float, the border all around; a fullscreen window is bare. The card is the
+// window that wears one (`Bars::barShown`: the floats as made, the tiles too
+// when the owner chose so — it had been "every float", which also stood the
+// bare browser's card 25 px too tall), the border all around; a fullscreen
+// window is bare. The card is the
 // window AS IT LOOKS on the desktop (Max, 2026-09-16: "the windows [should]
 // have the bar on [the spread]; the bars should vanish only on the
 // overview") — the 3x3's minis stay bare surface crops.
@@ -2003,7 +2006,7 @@ static void cardExtents(PHLWINDOW w, double& top, double& side) {
         return;
     }
     side = (double)w->getRealBorderSize();
-    top  = side + (w->m_isFloating ? (double)GOLEM_BAR_HEIGHT : 0.0);
+    top  = side + (Bars::barShown(w) ? (double)GOLEM_BAR_HEIGHT : 0.0);
 }
 
 // The level-1 spread's unit of layout, capture and hit-testing: the whole

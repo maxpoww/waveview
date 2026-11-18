@@ -151,6 +151,9 @@ static bool barWanted(PHLWINDOW w) {
         return false;
     return w->m_isFloating ? g_barOptions.floating : g_barOptions.tiled;
 }
+bool golemBarWanted(PHLWINDOW w) {
+    return barWanted(w);
+}
 
 // THE STRAIGHT SEAM (Max, 2026-09-26: *"make the bottom of the bar straight…
 // i want the top of the window to be square only when there is a bar. but not
