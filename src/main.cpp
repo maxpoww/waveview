@@ -502,6 +502,14 @@ static Vector2D     g_dragCursor;            // current cursor in draw space (wh
 static Vector2D     g_pressPos;              // cursor at button-press (draw space) — to tell a click from a drag
 static bool         g_dragMoved = false;     // cursor left the CLICK_SLOP radius since press → treat as a drag, not a click
 static int          g_pressTile = -1;        // empty tile a press landed on (release within slop → jump), or -1
+// The left button is down on the map, from the press to its release. A drag
+// can only BEGIN while it is: the release's own clean-up (the screen shown
+// again, the window focused) moves the pointer in software with the press
+// still on record, and that motion began a second, real compositor drag
+// with no button to ever end it — the window parked off-screen ("it
+// disappears") or carried by the bare pointer ("stuck to the pointer")
+// (Max, 2026-11-18, a window dragged from a desk the screen was not showing).
+static bool         g_buttonHeld = false;
 // A press that releases within this radius (draw-space px) is a click (jump to
 // the window), not a drag (move it to another workspace).
 static constexpr double CLICK_SLOP = 12.0;
@@ -4554,6 +4562,9 @@ static void maybeCommit(PHLMONITOR m) {
 // Every screen shows again what it showed when the gesture began (see
 // `g_origShown`). A workspace that went with nothing on it is made again.
 static void reshowOrigin() {
+    // Showing a desk again warps and re-focuses under the pointer: the
+    // machinery's motion, which must not feed back into the drag logic.
+    const SBusyScope busy;
     for (const auto& [ref, id] : g_origShown) {
         const auto mon = ref.lock();
         if (!mon || !mon->m_enabled || id < 1 || mon->activeWorkspaceID() == id)
@@ -4943,6 +4954,12 @@ static void updateHoverAt(PHLMONITOR m, const Vector2D& c) {
     // and nest a second controller drag; the busy scopes make that impossible,
     // this is the structural belt on top).
     if ((g_dragWin.lock() || g_pressTile >= 0) && !g_dragMoved && !g_dragReal && (c - g_pressPos).size() > CLICK_SLOP) {
+        if (!g_buttonHeld) {
+            // The press is over (its release is being handled): this motion
+            // is the machinery's, never the hand's.
+            trace("drag begin REFUSED: no button held (ws=%d)", g_dragWin.lock() ? (int)g_dragWin.lock()->workspaceID() : -1);
+            return;
+        }
         g_dragMoved = true;
         // The grab is real from frame one: the compositor pulls the window
         // out of the layout NOW, so the siblings re-tile live (the
@@ -5211,9 +5228,10 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
                 turnPage(word, 0); // (its release finds no gesture and only re-hovers)
             return;
         }
-        g_pressPos  = c;
-        g_dragMoved = false;
-        g_pressTile = -1;
+        g_pressPos   = c;
+        g_buttonHeld = true;
+        g_dragMoved  = false;
+        g_pressTile  = -1;
         g_dragCarry = {};
         g_origShown.clear();
         g_watchWin.reset(); // a fresh gesture takes over: the grab's own
@@ -5245,6 +5263,7 @@ static void onMouseButton(IPointer::SButtonEvent e, Event::SCallbackInfo& info) 
         return;
     }
 
+    g_buttonHeld = false; // first: nothing below may begin a drag (see g_buttonHeld)
     // Released mid-resize: sizes applied live are final — settle and re-read
     // the zone (the border may have moved out from under the pointer).
     if (g_resizing) {
@@ -5821,7 +5840,8 @@ static void onRender(eRenderStage stage) {
         g_resizing = false;
         g_resizeWin.reset();
         resetEdgeCursor();
-        g_pressTile = -1;
+        g_pressTile  = -1;
+        g_buttonHeld = false; // a release still to come is not ours (see g_ownedButtons)
         if (g_liveTimer)
             g_liveTimer->updateTimeout(std::chrono::milliseconds(450)); // one last tick: the deferred VRAM free
         damageAll();
@@ -9047,7 +9067,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     g_pEventLoopManager->addTimer(g_dockWatchTimer);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "2.37"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "2.38"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
