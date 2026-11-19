@@ -4410,6 +4410,31 @@ static LiveCommit signatureAt(PHLMONITOR m, const Vector2D& c, PHLWINDOW dw) {
             break;
         }
     }
+    // No window under the cursor (a gap between tiles, the margin around a
+    // desk's lone framed tile): a TILED window still goes beside the tile
+    // nearest the spot, on the side facing it. Without one the drop reached
+    // the layout with no aim at all — the map is not the desk, so Hyprland
+    // read the cursor's place over the MAP, or the desk's last-used window,
+    // and always put it right of that one: dropped above or below a lone
+    // framed window, it went to its right (2026-11-19).
+    if (!s.under && !g_origFloating) {
+        double best = -1.0;
+        for (const auto& cw : g_wins) {
+            if (cw.tile != s.tile || cw.screen.w <= 0.0 || cw.screen.h <= 0.0)
+                continue;
+            const auto w2 = cw.win.lock();
+            if (!w2 || w2 == dw || w2->m_isFloating || w2->isFullscreen())
+                continue;
+            const double dx = std::max({cw.screen.x - c.x, 0.0, c.x - (cw.screen.x + cw.screen.w)});
+            const double dy = std::max({cw.screen.y - c.y, 0.0, c.y - (cw.screen.y + cw.screen.h)});
+            const double d  = dx * dx + dy * dy;
+            if (best < 0.0 || d < best) {
+                best    = d;
+                s.under = cw.win;
+                s.side  = quadrantSide(cw.screen, c);
+            }
+        }
+    }
     return s;
 }
 
@@ -9261,7 +9286,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     g_pEventLoopManager->addTimer(g_dockWatchTimer);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "2.41"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "2.42"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
