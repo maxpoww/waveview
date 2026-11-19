@@ -41,6 +41,10 @@ namespace Bars {
     /// the side the discs are on, in colour or not. Called for waverunner.
     void setOptions(const SGolemBarOptions& options);
 
+    /// The owner's windows are square (or round again): every corner the
+    /// plugin draws follows (`g_golemSquare`). Called for waverunner.
+    void setSquare(bool square);
+
     /// The window wears its bar (its own decoration, and the owner's choice
     /// puts one on it): the spread's cards stand that much taller.
     bool barShown(PHLWINDOW window);

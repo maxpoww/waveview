@@ -75,6 +75,19 @@ namespace Bars {
         return false;
     }
 
+    void setSquare(bool square) {
+        if (square == g_golemSquare)
+            return;
+        g_golemSquare = square;
+        for (auto& w : g_pCompositor->m_windows) {
+            if (!w)
+                continue;
+            for (auto& d : w->m_windowDecorations)
+                if (auto* bar = dynamic_cast<CGolemBar*>(d.get()))
+                    bar->optionsChanged();
+        }
+    }
+
     void settleFocus(PHLWINDOW window) {
         if (!window)
             return;

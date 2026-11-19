@@ -108,3 +108,12 @@ struct SGolemBarOptions {
     bool operator==(const SGolemBarOptions&) const = default;
 };
 inline SGolemBarOptions g_barOptions;
+
+/// THE OWNER'S WINDOWS ARE SQUARE (Controls → Rounded corners, the app windows
+/// or every part off; Max, 2026-11-18: "cuando untoggle round corners, los
+/// botones de la barra de titulo siguen siendo redondos"): every corner the
+/// plugin draws of its own goes square with them — the bar's discs, the □,
+/// the arrows' hover square, the overview's and the spread's cards, the
+/// minimize's flight. Told with `hl.plugin.waveview.corners(square)`, with the
+/// bars' choice when the bars ask (`title-bars`) and at every change.
+inline bool g_golemSquare = false;

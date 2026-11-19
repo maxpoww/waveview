@@ -1637,7 +1637,8 @@ void CGolemBar::renderBarButtons(CBox* barBox, const float scale, const float a)
             discDraw.w += grow;
             discDraw.h += grow;
         }
-        g_pHyprOpenGL->renderRect(discDraw, color, {.round = static_cast<int>(std::ceil(discDraw.w / 2.0)), .roundingPower = 2.F});
+        // (Square with the owner's windows: `g_golemSquare`.)
+        g_pHyprOpenGL->renderRect(discDraw, color, {.round = g_golemSquare ? 0 : static_cast<int>(std::ceil(discDraw.w / 2.0)), .roundingPower = 2.F});
 
         // DRAWN glyphs (see `eGolemGlyph`): rectangles on the disc, in the
         // disc's parity so they centre exactly. The square is an outline: its
@@ -1665,7 +1666,7 @@ void CGolemBar::renderBarButtons(CBox* barBox, const float scale, const float a)
             const double sy = buttonBox.y + (w - span) / 2.0;
             // Slightly rounded corners (GOLEM_GLYPH_SQUARE_R); the inner cut-out's
             // radius is the outer's less the stroke, so the outline stays even.
-            const int    rOut = static_cast<int>(std::round(GOLEM_GLYPH_SQUARE_R * scale));
+            const int    rOut = g_golemSquare ? 0 : static_cast<int>(std::round(GOLEM_GLYPH_SQUARE_R * scale));
             const int    rIn  = std::max(0, rOut - static_cast<int>(stroke));
             g_pHyprOpenGL->renderRect(CBox{sx, sy, span, span}, ink, {.round = rOut, .roundingPower = 2.F});
             if (span > 2.0 * stroke)
@@ -1891,7 +1892,7 @@ void CGolemBar::renderBarButtonsText(CBox* barBox, const float scale, const floa
         if (CAN && (m_navHover == i || ON)) {
             const float fill = m_navDown == i ? GOLEM_NAV_ACTIVE_FILL : GOLEM_NAV_HOVER_FILL;
             g_pHyprOpenGL->renderRect(box, CHyprColor{m_lastInk.r, m_lastInk.g, m_lastInk.b, m_lastInk.a * fill * a},
-                                      {.round = static_cast<int>(std::round(GOLEM_NAV_RADIUS * scale)), .roundingPower = 2.F});
+                                      {.round = g_golemSquare ? 0 : static_cast<int>(std::round(GOLEM_NAV_RADIUS * scale)), .roundingPower = 2.F});
         }
         const auto& tex = m_navTex[i];
         if (!tex || tex->m_texID == 0)
@@ -1943,8 +1944,9 @@ void CGolemBar::renderPass(PHLMONITOR pMonitor, const float& a) {
     color.a *= a;
 
     // The window's rounding plus its border, since the bar sits outside the
-    // frame and has to curve around it.
-    const auto ROUNDING = PWINDOW->rounding() + PWINDOW->getRealBorderSize();
+    // frame and has to curve around it — and NONE for a square window: the
+    // border alone left a 3 px curve on a bar over a square frame.
+    const auto ROUNDING = PWINDOW->rounding() > 0 ? PWINDOW->rounding() + PWINDOW->getRealBorderSize() : 0.0;
     // The -2 is upstream's: without it the corners read badly against the gaps.
     const int  scaledRounding = ROUNDING > 0 ? static_cast<int>(std::round(ROUNDING * pMonitor->m_scale - 2)) : 0;
 
@@ -2225,7 +2227,7 @@ CBox CGolemBar::cardBoxGlobal() {
 // is not drawn, so damage and occlusion stop at the strip.
 double CGolemBar::notchDepth() {
     const auto PWINDOW = m_pWindow.lock();
-    return PWINDOW && !windowSquareTop(PWINDOW) ? PWINDOW->rounding() + PWINDOW->getRealBorderSize() : 0.0;
+    return PWINDOW && !windowSquareTop(PWINDOW) && PWINDOW->rounding() > 0 ? PWINDOW->rounding() + PWINDOW->getRealBorderSize() : 0.0;
 }
 
 Vector2D CGolemBar::cursorRelativeToBar() {

@@ -279,6 +279,10 @@ static Vector2D unfitPoint(const SFit& f, const Vector2D& p) {
     return f.on ? Vector2D{(p.x - f.ox) / f.k, (p.y - f.oy) / f.k} : p;
 }
 static int fitRound(const SFit& f, int round) {
+    // Every corner the overview and the spread draw goes through here: square
+    // while the owner's windows are (Controls → Rounded corners).
+    if (g_golemSquare)
+        return 0;
     return f.on ? (int)std::lround(round * f.k) : round;
 }
 
@@ -5755,7 +5759,7 @@ static void drawMinFlies(PHLMONITOR m) {
         if (const auto tex = f.fb ? f.fb->getTexture() : nullptr) {
             CTexPassElement::SRenderData td;
             td.tex   = tex;
-            td.round = (int)std::lround(DSN_WIN_ROUND * m->m_scale * p); // corners grow as it becomes a "tile"
+            td.round = g_golemSquare ? 0 : (int)std::lround(DSN_WIN_ROUND * m->m_scale * p); // corners grow as it becomes a "tile"
             drawMotionGhosts(m, f.blurPrev, box, 1.0f, [&](const CBox& b, float a) {
                 CTexPassElement::SRenderData g = td;
                 g.box                          = b;
@@ -9118,6 +9122,19 @@ static int luaBars(lua_State* L) {
     return 0;
 }
 
+// `hl.plugin.waveview.corners(square)` — waverunner tells us the owner's
+// windows are square (Controls → Rounded corners), or round again: the bars'
+// buttons, the overview's and the spread's cards and the minimize's flight
+// follow. Sent with the bars' choice when the bars ask, and at every change.
+static int luaCorners(lua_State* L) {
+    Bars::setSquare(lua_toboolean(L, 1) != 0);
+    // An overview or a spread up now is drawn again at its next frame.
+    for (auto& m : g_pCompositor->m_monitors)
+        if (m)
+            g_pHyprRenderer->damageMonitor(m);
+    return 0;
+}
+
 APICALL EXPORT std::string PLUGIN_API_VERSION() {
     return HYPRLAND_API_VERSION;
 }
@@ -9157,6 +9174,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     HyprlandAPI::addLuaFunction(handle, "waveview", "set_stage", luaSetStage);
     HyprlandAPI::addLuaFunction(handle, "waveview", "card", luaCard);
     HyprlandAPI::addLuaFunction(handle, "waveview", "bars", luaBars);
+    HyprlandAPI::addLuaFunction(handle, "waveview", "corners", luaCorners);
     HyprlandAPI::addLuaFunction(handle, "waveview", "capture_deck", luaCaptureDeck);
     HyprlandAPI::addLuaFunction(handle, "waveview", "capture_desks", luaCaptureDesks);
     g_renderListener = Event::bus()->m_events.render.stage.listen([](eRenderStage s) { onRender(s); });
@@ -9243,7 +9261,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     g_pEventLoopManager->addTimer(g_dockWatchTimer);
     // Bump on every behavior change: crash reports print this, and it's the
     // only way to tell a stale loaded .so from the freshly built one.
-    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "2.40"};
+    return {"waveview", "Live 3x3 workspace overview (Rust brain + C++ shim)", "max", "2.41"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
